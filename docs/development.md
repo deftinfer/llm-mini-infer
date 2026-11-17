@@ -141,7 +141,7 @@ These are maintainer notes. Do them in this order:
 
 ## CI and style
 
-`.github/workflows/ci.yml` runs on pushes to main, pull requests and dispatches (`gh workflow run ci.yml --ref <branch>`). A change to documentation only starts no job. Its jobs: ruff, the Helm chart (`helm lint`, `helm template`, kubeconform), the CPU suite in three parallel shards (by directory, each in two workers; a test whose servers leave the runner's memory no room for a second worker's takes the `serial` mark and runs after them, as `ci.yml` describes), `tools/`'s tests, and every fuzz suite on two seeds of 500 examples. The fuzz job runs only when `llm_mini_infer/`, `tests/`, the lock or `ci.yml` change beyond comments and docstrings (`.github/scripts/ci_changes.py`).
+`.github/workflows/ci.yml` runs on pushes to main, pull requests and dispatches (`gh workflow run ci.yml --ref <branch>`). A push to main that changes documentation only starts no job, and a pull request starts every job. Its jobs: ruff, the Helm chart (`helm lint`, `helm template`, kubeconform), the CPU suite in three parallel shards (by directory, each in two workers; a test whose servers leave the runner's memory no room for a second worker's takes the `serial` mark and runs after them, as `ci.yml` describes), `tools/`'s tests, and every fuzz suite on two seeds of 500 examples. The fuzz job runs only when `llm_mini_infer/`, `tests/`, the lock or `ci.yml` change beyond comments and docstrings (`.github/scripts/ci_changes.py`). The job `required` passes when every other job passed, and the fuzz job also when it was skipped. It is the check that main requires before a pull request merges.
 
 ## Tools
 

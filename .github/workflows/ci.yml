@@ -2,10 +2,13 @@
 # suite, tools/'s own test (fetch_tools) and a short fuzz smoke. The image is image.yml's; the GPU tests run from the GPU
 # tests' image (tests/gpu-image.Dockerfile) on a GPU host, not here.
 #
-#   push to main, a pull request   every job; a change to docs only (docs/, *.md) runs none, and the fuzz smoke runs
-#                                  only when llm_mini_infer/, tests/, the lock or this file change beyond comments and
-#                                  docstrings (the changes job, .github/scripts/ci_changes.py)
+#   push to main                   every job; a change to docs only (docs/, *.md) runs none
+#   a pull request                 every job, for a change to docs too: the `required` job is the check that main
+#                                  requires, and a path filter would leave it pending
 #   workflow_dispatch              every job, on any branch
+#
+# On a push or a pull request, the fuzz smoke runs only when llm_mini_infer/, tests/, the lock or this file change
+# beyond comments and docstrings (the changes job, .github/scripts/ci_changes.py).
 name: ci
 
 on:
@@ -15,9 +18,6 @@ on:
       - "docs/**"
       - "**/*.md"
   pull_request:
-    paths-ignore:
-      - "docs/**"
-      - "**/*.md"
   workflow_dispatch:
 
 permissions:
@@ -234,3 +234,24 @@ jobs:
           name: fuzz
           path: results/fuzz/
           if-no-files-found: ignore
+
+  # The one check that main requires. It runs after a failure too (always()), so it always reports. It passes when every
+  # other job passed, and the fuzz smoke also when it was skipped for a change without code; it fails otherwise.
+  required:
+    needs: [lint, chart, tests, tools, changes, fuzz]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: every job passed (the fuzz smoke may be skipped)
+        env:
+          LINT: ${{ needs.lint.result }}
+          CHART: ${{ needs.chart.result }}
+          TESTS: ${{ needs.tests.result }}
+          TOOLS: ${{ needs.tools.result }}
+          CHANGES: ${{ needs.changes.result }}
+          FUZZ: ${{ needs.fuzz.result }}
+        run: |
+          echo "lint $LINT, chart $CHART, tests $TESTS, tools $TOOLS, changes $CHANGES, fuzz $FUZZ"
+          for result in "$LINT" "$CHART" "$TESTS" "$TOOLS" "$CHANGES"; do [ "$result" = success ] || exit 1; done
+          [ "$FUZZ" = success ] || [ "$FUZZ" = skipped ]

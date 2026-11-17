@@ -4,6 +4,7 @@ chart, the CPU suite, tools/'s tests, the fuzz smoke)."""
 from __future__ import annotations
 
 import re
+import subprocess
 
 import yaml
 
@@ -27,16 +28,39 @@ def test_every_action_is_pinned_by_commit() -> None:
 
 def test_ci_runs_on_main_pull_requests_and_dispatch_and_only_reads() -> None:
     wf = load("ci.yml")
-    docs = ["docs/**", "**/*.md"]
-    assert wf["on"] == {"push": {"branches": ["main"], "paths-ignore": docs}, "pull_request": {"paths-ignore": docs},
+    # every pull request runs every job: a path filter would leave the required check pending
+    assert wf["on"] == {"push": {"branches": ["main"], "paths-ignore": ["docs/**", "**/*.md"]}, "pull_request": None,
                         "workflow_dispatch": None}
     assert wf["permissions"] == {"contents": "read"}
-    assert set(wf["jobs"]) == {"lint", "chart", "tests", "tools", "changes", "fuzz"}
+    assert set(wf["jobs"]) == {"lint", "chart", "tests", "tools", "changes", "fuzz", "required"}
     fuzz = wf["jobs"]["fuzz"]
     assert fuzz["needs"] == "changes" and fuzz["if"] == "needs.changes.outputs.fuzz == 'true'"
-    for job in wf["jobs"].values():
+    for name, job in wf["jobs"].items():
+        if name == "required":  # it checks out nothing (test_the_required_check_waits_for_every_job)
+            continue
         checkout = next(s for s in job["steps"] if s.get("uses", "").startswith("actions/checkout@"))
         assert checkout["with"]["persist-credentials"] is False
+
+
+def test_the_required_check_waits_for_every_job() -> None:
+    """main's ruleset requires the check `required`: it needs every other job and runs after a failure too. It passes
+    only when every other job passed, and the fuzz smoke also when it was skipped (a change without code)."""
+    jobs = load("ci.yml")["jobs"]
+    job = jobs["required"]
+    assert set(job["needs"]) == set(jobs) - {"required"}
+    assert job["if"] == "always()"
+    assert not any("uses" in s for s in job["steps"])  # no checkout, no action: only the results
+    (step,) = job["steps"]
+    assert step["env"] == {name.upper(): f"${{{{ needs.{name}.result }}}}" for name in job["needs"]}
+
+    def passes(**results: str) -> bool:
+        env = {name.upper(): results.get(name, "success") for name in job["needs"]}
+        return subprocess.run(["/bin/sh", "-c", step["run"]], env=env, capture_output=True).returncode == 0
+
+    assert passes() and passes(fuzz="skipped")
+    for name in job["needs"]:
+        for result in ("failure", "cancelled", *(() if name == "fuzz" else ("skipped",))):
+            assert not passes(**{name: result}), (name, result)
 
 
 def test_ci_runs_the_checks() -> None:
@@ -65,7 +89,7 @@ def test_ci_runs_the_checks() -> None:
                for name, job in jobs.items()}
     results = RESULTS.relative_to(ROOT).as_posix()
     assert uploads == {"lint": [], "chart": [], "tests": [f"{results}/fuzz/failures/"], "tools": [], "changes": [],
-                       "fuzz": [f"{results}/fuzz/"]}
+                       "fuzz": [f"{results}/fuzz/"], "required": []}
 
 
 def test_ci_shards_the_cpu_suite_over_all_of_tests() -> None:
