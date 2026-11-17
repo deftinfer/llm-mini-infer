@@ -1,0 +1,21 @@
+name: New issue
+description: Report a problem or ask for a change.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Search the open issues and read the [docs](https://github.com/deftinfer/llm-mini-infer/tree/main/docs) first.
+
+        Report a security problem through private vulnerability reporting, as [SECURITY.md](https://github.com/deftinfer/llm-mini-infer/blob/main/SECURITY.md) says. Never report it in an issue.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What is wrong or missing, and why it matters, in two or three sentences.
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: Details
+      description: "For a problem: the version, the GPU, the settings, the steps, and what you expected against what happened. For a change: what you propose. Remove API keys and tokens."

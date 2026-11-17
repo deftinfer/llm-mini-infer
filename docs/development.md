@@ -30,7 +30,7 @@ bench/             benchmarks (bench/README.md)
 deploy/            the image (Dockerfile), its configuration, docker compose, the Helm chart
 tools/             pinned command-line tools (fetch_tools.py) ([Tools](#tools))
 docs/              architecture.md, operations.md, development.md, vllm-compatibility.md, benchmarks.md
-.github/           CI (workflows/ci.yml, scripts/), the image (workflows/image.yml), the issue forms (ISSUE_TEMPLATE/)
+.github/           CI (workflows/ci.yml, scripts/), the image (workflows/image.yml), the issue form (ISSUE_TEMPLATE/)
 results/           every tool's output (git-ignored)
 README.md, CHANGELOG.md, SECURITY.md, CONTRIBUTING.md, LICENSE   the root files
 ```
