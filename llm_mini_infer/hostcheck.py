@@ -1074,21 +1074,32 @@ def verdict(key: str, value: float, host: dict[str, Any] | None = None) -> str:
     return "ok" if value <= ref * HOST_MARGINS[key] else "SLOW"
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     from . import synthetic  # the defaults in the help
 
     ap = argparse.ArgumentParser(prog="llm-mini-infer hostcheck", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--config", default=os.environ.get("LLM_MINI_INFER_CONFIG", "/etc/llm-mini-infer/config.yaml"))
-    ap.add_argument("--port", type=int, default=18900, help="the check's own server (default %(default)s; not the "
-                    "service's port)")
-    ap.add_argument("--starts", type=int, default=2)
-    ap.add_argument("--no-server", action="store_true", help="only the GPU, the host and cpubench")
+    ap.add_argument("--config", default=os.environ.get("LLM_MINI_INFER_CONFIG", "/etc/llm-mini-infer/config.yaml"),
+                help="the YAML configuration file (default: %(default)s; LLM_MINI_INFER_CONFIG overrides it)")
+    ap.add_argument("--port", type=int, default=18900, help="TCP port for the hostcheck server (default: %(default)s; "
+                    "independent of the service's port)")
+    ap.add_argument("--starts", type=int, default=2,
+                help="number of server starts to measure (default %(default)s)")
+    ap.add_argument("--no-server", action="store_true",
+                help="skip server startup and load tests; run only GPU, host and CPU benchmarks")
     ap.add_argument("--out", type=Path, help="the JSON report (default: /cache/hostcheck/<time>.json, else "
                     "./hostcheck/<time>.json)")
-    ap.add_argument("--set", action="append", default=[], metavar="GROUP.KEY=VALUE")
-    ap.add_argument("--duration", type=float, help="seconds measured per load (Gemma 4: per rate, 120; Qwen: GPU "
-                    "idle per concurrency, 20)")
+    ap.add_argument("--set", action="append", default=[], metavar="GROUP.KEY=VALUE",
+                help="override a configuration value; repeat for multiple overrides (default: none)")
+    ap.add_argument(
+        "--duration",
+        type=float,
+        help=(
+            "measurement duration per load in seconds "
+            "(default: model-specific; Gemma 4: 120 per rate, "
+            "Qwen: 20 per GPU-idle concurrency)"
+        ),
+    )
     g = ap.add_argument_group("Gemma 4: the open loop")
     g.add_argument("--inputs", type=Path, help="the mounted mode: a folder with frames/ (.jpg or .jpeg images), "
                    "prompt.md or prompt.txt (the system prompt), schema.json (the json_schema), optionally user.txt "
@@ -1112,9 +1123,17 @@ def main(argv: list[str] | None = None) -> int:
     q = ap.add_argument_group("Qwen3.8: the closed loops")
     q.add_argument("--requests", type=int, default=150, help="measured TTFT requests at concurrency 1 (default "
                    "%(default)s)")
-    q.add_argument("--warmup", type=int, default=50)
-    q.add_argument("--levels", default="1,8,32")
+    q.add_argument("--warmup", type=int, default=50,
+               help="unmeasured warm-up requests before the TTFT measurement (default %(default)s)")
+    q.add_argument("--levels", default="1,8,32",
+               help="comma-separated concurrency levels for GPU-idle measurements (default %(default)s)")
+    return ap
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = build_parser()
     args = ap.parse_args(argv)
+
     stamp = time.strftime("%Y%m%d-%H%M%S")
     out_dir = args.out.parent if args.out else (Path("/cache/hostcheck") if os.access("/cache", os.W_OK)
                                                else Path.cwd() / "hostcheck")
