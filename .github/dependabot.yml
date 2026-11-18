@@ -1,0 +1,48 @@
+# Dependabot (docs/development.md, "CI and style"): weekly pull requests for the workflows' actions and for tools/'s
+# lock, and security updates alone for the root lock. The labels name existing labels only, so that Dependabot adds
+# none of its own.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7  # a release waits a week before its pull request
+    labels: [ci-tests]
+    groups:
+      actions:  # minor and patch updates in one pull request; a major update has its own
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  - package-ecosystem: uv
+    directory: /tools
+    schedule:
+      interval: weekly
+    labels: [ci-tests]
+    groups:
+      tools:
+        patterns: ["*"]
+
+  # The root project: no version updates (a limit of 0), only security updates. The pinned GPU stack
+  # (pyproject.toml's constraint and override lists, recorded in tests/data/image/) is ignored for both kinds: a
+  # maintainer bumps it by hand and runs the GPU suite again.
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+    labels: [platform]
+    ignore:
+      - dependency-name: torch
+      - dependency-name: torchvision
+      - dependency-name: "flashinfer-*"
+      - dependency-name: llguidance
+      - dependency-name: tokenizers
+      - dependency-name: pillow
+      - dependency-name: triton
+      - dependency-name: "nvidia-*"
+      - dependency-name: "cuda-*"
+      - dependency-name: apache-tvm-ffi
+      - dependency-name: nccl4py
+      - dependency-name: nccl-extensions

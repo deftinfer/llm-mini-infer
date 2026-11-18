@@ -90,14 +90,15 @@ jobs:
 
   # The CPU suite (GPU tests skip), with the model fixtures (tests/scripts/fetch_fixtures.py: tokenizers and
   # configurations, no weights, cached by their pins) and helm (tests/deploy/test_helm.py). Three shards of about equal
-  # time run on their own runners, each in two pytest-xdist workers (the runner's two vCPUs); a file's tests stay on one
-  # worker, so a module's server starts once. The last shard takes every directory that the others do not name, so no
-  # new one is left out.
-  # Memory decides what runs together: the runner has 7.8 GB and 3 GB of swap, and when both are full it ends the job
-  # (its shutdown signal, or a hang that keeps no log). A test server is 0.7 GB (1.5 GB on Gemma's files), with an
-  # image pool 1.6 to 2.5 GB, and a pytest worker 0.8 to 1.9 GB. So the tests' servers start no image pool unless a
-  # test asks (tests/support/api_util.py), and the tests whose servers leave no room for a second worker's carry the
-  # serial mark: those with an image pool, and in the structured shard those that start a server beside their module's
+  # time run on their own runners, each in two pytest-xdist workers (the runner has four vCPUs); a file's tests stay on
+  # one worker, so a module's server starts once. The last shard takes every directory that the others do not name, so
+  # no new one is left out.
+  # Memory decides what runs together: the runner has about 16 GB and 3 GB of swap (ci_sample.py's first line), and
+  # when both are full it ends the job (its shutdown signal, or a hang that keeps no log). Measured earlier on a 2 vCPU,
+  # 7.8 GB runner, a test server is 0.7 GB (1.5 GB on Gemma's files), with an image pool 1.6 to 2.5 GB, and a pytest
+  # worker 0.8 to 1.9 GB. So the tests' servers start no image pool unless a test asks (tests/support/api_util.py),
+  # and the tests whose servers leave no room for a second worker's carry the serial mark: those with an image pool,
+  # and in the structured shard those that start a server beside their module's
   tests:
     runs-on: ubuntu-24.04
     timeout-minutes: 30

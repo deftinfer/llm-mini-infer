@@ -197,7 +197,7 @@ A bad row fails its request and the running requests that resumed from that requ
 - A request's cache writes stay **unverified** until its next finite sample. A non-finite result, an abort mid-prefill or a readmission that resumes elsewhere removes them, with the checkpoints attached to them and the entries below. What the request only read stays. A running request that only locked a removed node runs on but caches nothing more.
 - Both runners check the logits of sample rows. Gemma 4's runner also checks the last hidden state of a row that does not sample. On FP8 rows the activation quantizer turns a NaN finite, so such a NaN goes unseen.
 - The node a hit ends in, which other requests branch from, never carries the step of a request that only resumed from it, so it never rolls back with that request.
-- A non-finite row or an empty grammar mask fails its request with a 500 (on a stream, an error event); the server goes on.
+- A non-finite row or an empty grammar mask fails its request with a 500 (on a stream, an error event); the server goes on. A request preempted while such a sample was in flight does not fail then: the scheduler drops the sample, and the readmission samples that position again.
 
 ### The precise prefix
 
@@ -208,7 +208,7 @@ For block-FP8 models, `runner.cuda.fp8_cold_prefill` decides how a shared prefix
 - **Two key spaces.** The precise copy lives in a key space beside the FP8 one. An admission matches both and resumes from the deeper hit, the precise one on a tie, or from the precise one when the FP8 hit lies less than `dev.cache.refine_min` above it and either was computed from the FP8 copy or lies less than a checkpoint grid above it. That span then runs on the FP8 path, and the precise copy stays locked. No page is overwritten. Requests that resumed from the precise copy insert their continuations into the FP8 key space, which then takes the precise copy's pages wherever the tree alone held the FP8 copy's.
 - **Refines.** Two refines of one checkpoint never overlap. A refine is cut in fixed pieces at multiples of `dev.cache.refine_chunk_tokens` from position 0, each whole in one step, so every server start cuts the precise copy at the same boundaries whatever the load.
 - **PRECISE rows** share steps with FP8 rows, which keep their bits. They delay the step's other rows too, so each PRECISE token counts at its measured cost against the mixed-step bound.
-- **`bf16`** runs every chunk of a prompt without a cache hit with BF16 activations; **`fp8`** quantizes every activation.
+- **`bf16`** runs every chunk of a prompt without a cache hit with BF16 activations, into a precise copy. A prompt with any hit resumes from the deeper copy, the precise one on a tie, and runs the rest on the FP8 path. **`fp8`** quantizes every activation.
 
 ## Model execution
 

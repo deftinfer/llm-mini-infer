@@ -30,7 +30,8 @@ bench/             benchmarks (bench/README.md)
 deploy/            the image (Dockerfile), its configuration, docker compose, the Helm chart
 tools/             pinned command-line tools (fetch_tools.py) ([Tools](#tools))
 docs/              architecture.md, operations.md, development.md, vllm-compatibility.md, benchmarks.md
-.github/           CI (workflows/ci.yml, scripts/), the image (workflows/image.yml), the issue form (ISSUE_TEMPLATE/)
+.github/           CI (workflows/ci.yml, scripts/), the image (workflows/image.yml), the issue form (ISSUE_TEMPLATE/),
+                   the pull request template, Dependabot (dependabot.yml)
 results/           every tool's output (git-ignored)
 README.md, CHANGELOG.md, SECURITY.md, CONTRIBUTING.md, LICENSE   the root files
 ```
@@ -137,11 +138,13 @@ These are maintainer notes. Do them in this order:
 1. Set the version with `uv version <version>`. Set it also in the chart's `appVersion`, in `deploy/helm/examples/hostcheck-job.yaml` and in `tests/data/image/freeze.txt`. Set it in the image names of `README.md`, `docs/operations.md` and `deploy/docker-compose.yaml` too. Increase the chart's own `version` if the chart changed. `tests/deploy/test_image_build.py` checks that `pyproject.toml`, the chart, the Job and those image names agree.
 2. Write the version's entry in `CHANGELOG.md`. The tag message and the GitHub release body come from it.
 3. Merge to main, create the annotated tag `v<version>` on the commit, and push the tag. The image workflow publishes `:<version>`.
-4. Create the GitHub release for the tag.
+4. Create the GitHub release for the tag. Its body is the version's entry with absolute links, after two lines: the image, `ghcr.io/deftinfer/llm-mini-infer:<version>`, and the chart's version.
 
 ## CI and style
 
 `.github/workflows/ci.yml` runs on pushes to main, pull requests and dispatches (`gh workflow run ci.yml --ref <branch>`). A push to main that changes documentation only starts no job, and a pull request starts every job. Its jobs: ruff, the Helm chart (`helm lint`, `helm template`, kubeconform), the CPU suite in three parallel shards (by directory, each in two workers; a test whose servers leave the runner's memory no room for a second worker's takes the `serial` mark and runs after them, as `ci.yml` describes), `tools/`'s tests, and every fuzz suite on two seeds of 500 examples. The fuzz job runs only when `llm_mini_infer/`, `tests/`, the lock or `ci.yml` change beyond comments and docstrings (`.github/scripts/ci_changes.py`). The job `required` passes when every other job passed, and the fuzz job also when it was skipped. It is the check that main requires before a pull request merges.
+
+Dependabot (`.github/dependabot.yml`) never bumps the pinned GPU stack: a maintainer bumps it by hand and runs the GPU suite again. A security fix's commit body says which code paths the vulnerability reaches.
 
 ## Tools
 
@@ -150,6 +153,8 @@ These are maintainer notes. Do them in this order:
 ## Writing
 
 Commit messages have a subject of at most 72 characters and the details in the body. Prose (Markdown, commit bodies) follows ASD-STE100's writing rules, without its dictionary. Write each paragraph or list item on one line. Code lines split at ruff's 120 characters, and docstrings and comments follow the same split and rules. The rules: sentences of at most 20 words for an instruction and 25 for a description, one instruction per sentence, the active voice, one term for one concept, noun groups of at most three words, paragraphs of one topic and at most six sentences, no idioms, and no history notes. Put code names in backticks.
+
+A pull request's title has at most 65 characters, because the squash commit adds ` (#n)` and its subject stays at most 72.
 
 ## Licence notices
 
