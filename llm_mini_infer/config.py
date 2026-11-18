@@ -178,8 +178,10 @@ class CudaRunnerConfig(_Group):
     # Share of device memory for weights, activations and pools; startup fails when that much is not free
     memory_utilization: float = 0.9
     # A block-FP8 model's precise prefix (architecture.md, "The precise prefix"): "reuse" runs prompts on the FP8 path
-    # and recomputes a cached prefix with BF16 activations at its second reuse; "bf16" runs every prefill row of a
-    # prompt without a cache hit with BF16 activations (unique prompts pay too); "fp8" quantizes every activation
+    # and recomputes a cached prefix with BF16 activations at its second reuse. "bf16" runs every prefill row of a
+    # prompt without a cache hit with BF16 activations, into a precise copy (unique prompts pay too); a prompt with a
+    # hit resumes from the deeper copy, the precise one on a tie, and runs the rest on the FP8 path. "fp8" quantizes
+    # every activation
     fp8_cold_prefill: Literal["reuse", "bf16", "fp8"] = "reuse"
 
 

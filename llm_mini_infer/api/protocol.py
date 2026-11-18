@@ -192,7 +192,7 @@ class ChatCompletionRequest(_Strict):
     skip_special_tokens: bool = True
     include_stop_str_in_output: bool = False
     priority: int = 0
-    cache_salt: str | None = None
+    cache_salt: Any = None  # a string or None: `check_cache_salt` refuses the rest with vLLM's message
     user: str | None = None
     # Known, accepted only at their defaults
     n: int = 1
@@ -417,12 +417,12 @@ def check_reasoning_effort(value: Any) -> None:
 _SALT_FORBIDDEN = frozenset("@/\\\x00")
 
 
-def check_cache_salt(salt: str | None) -> None:
+def check_cache_salt(salt: object) -> None:
     """vLLM's `validate_cache_salt` and its two texts: a salt is a non-empty string of at most 128 characters, with no
     '@', '/', '\\' or NUL. It names a prefix-cache namespace and keys the encoder cache's entries."""
     if salt is None:
         return
-    if not salt:
+    if not isinstance(salt, str) or not salt:
         raise validation_error("Parameter 'cache_salt' must be a non-empty string if provided.", "cache_salt")
     if len(salt) > 128 or not _SALT_FORBIDDEN.isdisjoint(salt):
         raise validation_error("Parameter 'cache_salt' must be at most 128 characters and must not contain '@', "

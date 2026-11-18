@@ -8,7 +8,8 @@ own Python (the standard library and Linux's /proc; elsewhere the lines are empt
 It ends when FILE (--stop) appears, with a summary (the peaks, the Python processes and /dev/shm files left, and a
 warning annotation when memory ran low), or when the watched process is gone.
 
-    [mem]  every --every seconds (every --poll seconds under --low MB available; the peaks take every sample):
+    [mem]  the first line: the sampler's settings and the runner's size, mem_total and swap_total (MB) and cpus;
+           then every --every seconds (every --poll seconds under --low MB available; the peaks take every sample):
            +seconds, then MB: used (total - available), avail, free, shmem, swap used, the step's cgroup (current/peak,
            when it has them), /dev/shm (MB/files); psi (memory pressure, some/full avg10); load; py (the Python
            processes started since the sampler, and their RSS sum), srv (server launchers), orph (those whose parent is
@@ -244,8 +245,10 @@ class Sampler:
 
     def loop(self) -> None:
         a = self.args
+        mem = table("/proc/meminfo")
         self.say(f"[mem] sampler: a line every {a.every:g} s of samples every {a.poll:g} s, pid {os.getpid()},"
-                 f" uid {os.getuid()}, cgroup {self.cgroup}")
+                 f" uid {os.getuid()}, cgroup {self.cgroup}, mem_total={mem.get('MemTotal', 0) // 1024}"
+                 f" cpus={os.cpu_count()} swap_total={mem.get('SwapTotal', 0) // 1024}")
         next_sample = next_line = time.time()
         last_top = 0.0
         while True:

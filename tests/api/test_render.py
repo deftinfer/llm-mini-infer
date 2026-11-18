@@ -4,13 +4,15 @@ Skips when the git-ignored fixtures are absent."""
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import numpy as np
 import pytest
 
 from llm_mini_infer.render.content_format import detect_content_format
 from llm_mini_infer.render.messages import to_template_messages
 from llm_mini_infer.render.renderer import Renderer, TemplateError
-from llm_mini_infer.render.token_cache import SegmentCache
+from llm_mini_infer.render.token_cache import SegmentCache, pick_split_token
 
 from ..support.fixtures import MODELS, load_cases, model_dir, require_qwen
 
@@ -175,6 +177,99 @@ def test_segment_cache_splits_at_the_message_token() -> None:
         text = r.render(msgs, enable_thinking=False)
         assert r.encode(text).tolist() == r.tokenizer.encode(text, add_special_tokens=False).ids
     assert r.segment_cache.hits == 2 and r.segment_cache.misses == 1
+
+
+class _Added:
+    """An added token as `get_added_tokens_decoder()` gives it."""
+
+    def __init__(self, content: str, normalized: bool = False) -> None:
+        self.content, self.normalized = content, normalized
+        self.lstrip = self.rstrip = self.single_word = False
+
+
+class _Scanned(str):
+    """An added token's text that records the safety scan's reads of it: `c in o` and `o.endswith(...)`."""
+
+    scans: ClassVar[set[str]] = set()  # the candidates `c` that the scan ran for
+    reads: ClassVar[list[int]] = [0]
+
+    def __contains__(self, item: object) -> bool:
+        _Scanned.scans.add(str(item))
+        _Scanned.reads[0] += 1
+        return super().__contains__(item)
+
+    def endswith(self, *args) -> bool:
+        _Scanned.reads[0] += 1
+        return super().endswith(*args)
+
+
+class _Tokenizer:
+    def __init__(self, added: list[_Added]) -> None:
+        self.added = {1000 + i: t for i, t in enumerate(added)}
+
+    def get_added_tokens_decoder(self) -> dict[int, _Added]:
+        return self.added
+
+
+def _added_tokens(n: int, text: type[str] = str) -> list[_Added]:
+    """`n` safe tokens, then: one inside a longer token, one that a token ends with a prefix of, a normalized one, a
+    one-character one, and a longer safe one."""
+    safe = [_Added(text(f"<|t{i:04d}|>")) for i in range(n)]
+    special = [_Added(text("<|t0001|>x")), _Added(text("ab<|t0002")), _Added(text("<|n|>"), normalized=True),
+               _Added(text("x")), _Added(text("<|long_one|>"))]
+    return [*safe, *special]
+
+
+def _pick_before(tokenizer: _Tokenizer, probe: str | None) -> tuple[str, int] | None:
+    """`pick_split_token` as it was: the safety scan for every added token, then its count in the probe."""
+    if not probe:
+        return None
+    added = dict(tokenizer.get_added_tokens_decoder().items())
+    contents = [t.content for t in added.values()]
+    counts = {}
+    for tok in added.values():
+        c = tok.content
+        if tok.normalized or tok.lstrip or tok.rstrip or tok.single_word or len(c) < 2:
+            continue
+        if any(o != c and (c in o or any(o.endswith(c[:k]) for k in range(1, len(c)))) for o in contents):
+            continue
+        n = probe.count(c)
+        if n:
+            counts[c] = n
+    if not counts:
+        return None
+    best = max(counts, key=lambda c: (counts[c], len(c)))
+    return best, next(i for i, t in added.items() if t.content == best)
+
+
+SPLIT_PROBES = [  # a probe, and the token it picks
+    (None, None), ("", None), ("no added token here", None),
+    ("<|t0001|> <|t0001|> <|t0002|> <|t0002|> <|n|> <|n|> <|n|> x x x <|t0008|>", "<|t0008|>"),  # the safe one
+    ("<|t0005|> <|t0004|> <|t0005|> <|t0004|>", "<|t0004|>"),  # a tie: the first added wins
+    ("<|t0009|> <|long_one|> <|t0009|> <|long_one|>", "<|long_one|>"),  # a tie in count: the longer wins
+    ("<|t0003|> <|t0007|> <|t0007|> <|t0003|> <|t0007|>", "<|t0007|>"),  # the most frequent wins
+]
+
+
+def test_the_split_token_pick_is_the_same_as_before() -> None:
+    tokenizer = _Tokenizer(_added_tokens(200))
+    for probe, want in SPLIT_PROBES:
+        pick = pick_split_token(tokenizer, probe)
+        assert pick == _pick_before(tokenizer, probe) and (pick and pick[0]) == want, probe
+
+
+def test_the_split_token_scan_runs_only_for_tokens_in_the_probe() -> None:
+    """The safety scan reads every added token, so a scan for each of a few thousand made the pick quadratic."""
+    added = _added_tokens(4000, text=_Scanned)
+    tokenizer = _Tokenizer(added)
+    longest = max(len(t.content) for t in added)
+    for probe, want in SPLIT_PROBES:
+        _Scanned.scans.clear()
+        _Scanned.reads[0] = 0
+        pick = pick_split_token(tokenizer, probe)
+        present = {t.content for t in added if probe and t.content in probe}
+        assert (pick and pick[0]) == want and _Scanned.scans <= present, (probe, _Scanned.scans - present)
+        assert _Scanned.reads[0] <= len(present) * len(added) * longest, probe
 
 
 def gemma_renderer() -> Renderer:

@@ -262,8 +262,8 @@ SHARED_REFUSALS = [
      "System message must be at the beginning."),  # the chat template's reason alone
     ({"stop": ""}, None, "stop cannot contain an empty string."),
     ({"stop": ["a", ""]}, None, "stop cannot contain an empty string."),
-    ({"cache_salt": ""}, "cache_salt", "Parameter 'cache_salt' must be a non-empty string if provided. "
-                                       "(parameter=cache_salt)"),
+    *[({"cache_salt": salt}, "cache_salt", "Parameter 'cache_salt' must be a non-empty string if provided. "
+                                           "(parameter=cache_salt)") for salt in ("", 5, ["a"])],
     *[({"cache_salt": salt}, "cache_salt", "Parameter 'cache_salt' must be at most 128 characters and must not "
                                            "contain '@', '/', '\\\\', or NUL. (parameter=cache_salt)")
       for salt in ("x" * 129, "a/b", "a@b", "a\\b", "a\x00b")],

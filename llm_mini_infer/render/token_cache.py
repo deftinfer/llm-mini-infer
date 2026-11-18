@@ -37,11 +37,12 @@ def pick_split_token(tokenizer: Tokenizer, probe: str | None) -> tuple[str, int]
         c = tok.content
         if tok.normalized or tok.lstrip or tok.rstrip or tok.single_word or len(c) < 2:
             continue
+        n = probe.count(c)  # first: the scan below reads every added token, so it runs only for those in the probe
+        if not n:
+            continue
         if any(o != c and (c in o or any(o.endswith(c[:k]) for k in range(1, len(c)))) for o in contents):
             continue
-        n = probe.count(c)
-        if n:
-            counts[c] = n
+        counts[c] = n
     if not counts:
         return None
     best = max(counts, key=lambda c: (counts[c], len(c)))

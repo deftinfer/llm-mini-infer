@@ -43,6 +43,7 @@ def test_the_stop_file_ends_the_sampler_with_its_summary(tmp_path) -> None:
         watched.wait(10)
     lines = text.splitlines()
     assert p.returncode == 0 and lines[0].startswith("[mem] sampler: a line every 0.2 s")
+    assert all(f" {key}=" in lines[0] for key in ("mem_total", "cpus", "swap_total")), lines[0]  # the runner's size
     assert sum(line.startswith("[mem] +") for line in lines) >= 2, text  # the samples, and the stop's last one
     end = [line for line in lines if line.startswith("[end] ")]
     assert "peaks: used=" in end[0] and end[1].startswith("[end] Python processes left: ")
