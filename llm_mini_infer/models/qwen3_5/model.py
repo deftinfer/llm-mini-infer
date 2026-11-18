@@ -504,13 +504,14 @@ def map_weight_name(cfg: Qwen35Config, name: str, mtp: bool = False) -> tuple[st
     load the MTP layer (`mtp.*`; the first one when the checkpoint has several)."""
     if name.startswith(_SKIP_PREFIXES):
         return None
+    suffix = "." + cfg.quant.scale_suffix if cfg.quant is not None else ".weight_scale_inv"
     if name.startswith(_MTP_PREFIXES):
         name = name[name.index("mtp."):]
         if not mtp or (name.startswith("mtp.layers.") and not name.startswith("mtp.layers.0.")):
             return None
-        scale = name.endswith(".weight_scale_inv")
+        scale = name.endswith(suffix)
         if scale:
-            name = name.removesuffix("_scale_inv")
+            name = name[:-len(suffix)] + ".weight"
         pname, row0 = name, 0
         m = _LAYER.fullmatch(name)
         if m:
@@ -522,9 +523,9 @@ def map_weight_name(cfg: Qwen35Config, name: str, mtp: bool = False) -> tuple[st
                 raise ValueError(f"the FP8 shard {name} starts at row {row0}, inside a 128-row block of {pname}")
             return pname.removesuffix("weight") + "weight_scale", row0 // fp8.GROUP
         return pname, row0
-    scale = name.endswith(".weight_scale_inv")
+    scale = name.endswith(suffix)
     if scale:
-        name = name.removesuffix("_scale_inv")
+        name = name[:-len(suffix)] + ".weight"
     if name in ("lm_head.weight", "language_model.lm_head.weight"):
         if scale:
             raise NotImplementedError("an FP8 lm_head (Qwen's FP8 checkpoints keep it BF16)")
