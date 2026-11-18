@@ -24,6 +24,9 @@ signals (docker sends SIGTERM to PID 1 only); it passes the stop on to the front
   frontends) ends the start (`StopWhileStarting`): the launcher logs the signal, dumps the stacks of the process it was
   waiting for and of the engine, stops the rest and exits with 128 + the signal's number (143 for SIGTERM). During a
   model download, before these handlers, a stop signal ends the process at once with the same code (`exit_on_stop`).
+- **The parent's exit**, with `server.stop_with_parent` on (off by default): a thread polls the launcher's parent once
+  a second from the start of `serve` and, once it changed, sends the main thread SIGTERM unless a stop is under way, so
+  the download, the start or the drain ends as above (`_watch_parent`). A parent of pid 1, or none, is not watched.
 The engine and the pool workers ignore SIGTERM while the launcher lives (a supervisor that signals the whole process
 group must not abort requests the frontends are still draining); the launcher stops them itself.
 
@@ -46,6 +49,7 @@ import os
 import shutil
 import signal
 import socket
+import threading
 import time
 from collections import deque
 from collections.abc import Callable
@@ -72,6 +76,8 @@ POOL_READY_TIMEOUT_S = 120.0
 STACK_WAIT_S = 0.25
 TURN_S = 1.0  # a supervision turn's wait for its processes and signals
 OVERSLEEP_S = 5.0  # a turn this much later than its wait (or half the watchdog's period, if shorter) overslept
+PARENT_POLL_S = 1.0  # server.stop_with_parent: how often the launcher's parent is checked (`_watch_parent`)
+PARENT_SETTLE_S = 0.5  # and the wait from its exit to the check for a stop under way
 
 
 class StopWhileStarting(Exception):
@@ -118,10 +124,48 @@ def exit_on_stop() -> None:
     signal.signal(signal.SIGINT, stop)
 
 
+def _watch_parent(cfg: Config, parent: int, signals: list[int]) -> threading.Thread | None:
+    """With `server.stop_with_parent` on, a daemon thread that polls the launcher's parent (`parent`, its pid at the
+    start of `serve`) every PARENT_POLL_S and, once it changed, sends SIGTERM to the main thread (not to the process:
+    the handlers run there, and a process-directed signal may reach this thread instead, leaving the main thread's wait
+    uninterrupted), once, and ends. It sends nothing when `serve`'s `signals`, which only its handler writes, holds a
+    stop already: a second signal would fail the in-flight requests. It looks PARENT_SETTLE_S after it saw the change,
+    so that a SIGTERM the parent sent just before it exited has had its handler run. A parent of pid 1 (an init, or
+    what an orphan's parent becomes; a subreaper is watched as any parent) or 0 (none visible: the launcher is pid 1,
+    or its parent is in another pid namespace) is not watched."""
+    if not cfg.server.stop_with_parent:
+        return None
+    if parent == 1:
+        log.info("server.stop_with_parent: the launcher's parent is pid 1, which outlives it: not watched")
+        return None
+    if parent <= 0:
+        log.info("server.stop_with_parent: the launcher has no parent it can see (pid %d): not watched", parent)
+        return None
+    log.info("server.stop_with_parent: watching the launcher's parent, pid %d", parent)
+    main = threading.main_thread().ident
+
+    def watch() -> None:
+        while os.getppid() == parent:
+            time.sleep(PARENT_POLL_S)
+        time.sleep(PARENT_SETTLE_S)
+        if signals:
+            log.info("the launcher's parent (pid %d) exited; the server is stopping already", parent)
+            return
+        log.warning("the launcher's parent (pid %d) exited (server.stop_with_parent): stopping as on SIGTERM", parent)
+        signal.pthread_kill(main, signal.SIGTERM)
+
+    t = threading.Thread(target=watch, name="parent-watch", daemon=True)
+    t.start()
+    return t
+
+
 def serve(cfg: Config) -> int:
+    parent = os.getppid()  # first: a parent that exits while the server starts is still the one watched
     setup_logging(cfg.observability.log_level, "launcher")
     t0 = time.perf_counter()
     exit_on_stop()
+    signals: list[int] = []  # every stop signal received, in order (`on_signal`; `_watch_parent` reads it)
+    _watch_parent(cfg, parent, signals)
     if cfg.runner.kind == "fake":
         log.warning("runner.kind is fake: this server answers with random tokens (tests and benchmarks only; "
                     "set runner.kind: cuda to serve the model)")
@@ -138,7 +182,6 @@ def serve(cfg: Config) -> int:
     cfg.pixel_arena = cfg.pool_dir = ""  # the launcher's own (load() refuses both): it removes only an arena it made
     ipc_path = ipc.ipc_dir()
     ctx = mp.get_context("spawn")
-    signals: list[int] = []  # every stop signal received, in order
 
     def on_signal(signum: int, _frame: Any) -> None:
         signals.append(signum)

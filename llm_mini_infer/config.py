@@ -202,6 +202,9 @@ class ServerConfig(_Group):
     # fail them): set it above the balancer's detection time (its failure threshold x check interval). 0: refuse at
     # once. SIGINT (Ctrl-C) skips it.
     drain_grace_s: float = 0.0
+    # Stop as on SIGTERM when the process that started the server exits: for a supervisor that is not PID 1 and may die
+    # without stopping it (a test runner, a script). Off, the server outlives its parent, as one started with nohup.
+    stop_with_parent: bool = False
     request_id_header: bool = True  # echo X-Request-Id on every response, as vLLM's --enable-request-id-headers
     # Chat completions' `logprobs` and `top_logprobs` (at most 20: the OpenAI API's bound). Off (a request that
     # asks is a 400), the head runs as without them; on, the CUDA runner keeps its head's logits in a buffer of

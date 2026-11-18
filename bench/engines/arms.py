@@ -145,7 +145,8 @@ def argv(arm: Arm, binary: str | None = None, config: str | None = None) -> list
             cmd += ["--set", f"speculative.model={m.drafter}"]
         cmd += ["--set", f"model.max_model_len={CONTEXT}", "--set", f"scheduler.max_num_seqs={seqs}",
                 "--set", f"server.host={HOST}", "--set", f"server.port={PORT}",
-                "--set", f"speculative.num_speculative_tokens={k}"]
+                "--set", f"speculative.num_speculative_tokens={k}",
+                "--set", "server.stop_with_parent=true"]  # it stops when the driver exits without stopping it
         if arm.batch_invariant is not None:
             cmd += ["--set", f"dev.runner.cuda.batch_invariant={'true' if bi else 'false'}"]
         for s in arm.sets:

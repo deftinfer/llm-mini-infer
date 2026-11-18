@@ -10,6 +10,7 @@ import contextlib
 import http.client
 import io
 import json
+import logging
 import os
 import re
 import signal
@@ -23,9 +24,9 @@ from typing import Any
 
 import pytest
 
-from llm_mini_infer.launcher import Watchdog
+from llm_mini_infer.launcher import Watchdog, _watch_parent
 
-from ..support.api_util import Predictor, Server, content_of
+from ..support.api_util import Adopted, Predictor, Server, content_of, start_under_parent
 from ..support.fixtures import require_qwen
 from ..support.paths import ROOT
 
@@ -399,6 +400,128 @@ def test_orphans_stop_when_the_launcher_is_killed(model, tmp_path) -> None:
             arena.remove(pixels)
             shutil.rmtree(ipc_dir, ignore_errors=True)
         assert not os.path.exists(ipc_dir) and not os.path.exists(pixels)
+
+
+INFO = {"observability": {"log_level": "info"}}  # the launcher's `stopped (exit code N)` line, and the parent watch's
+
+
+def test_the_launcher_stops_when_its_parent_exits(model, tmp_path) -> None:
+    """server.stop_with_parent on (as the test Server has it): the launcher's parent SIGKILLed while the server serves,
+    the launcher logs it, drains as on SIGTERM (an idle server at once) and exits 0, and every process it started stops
+    with it."""
+    psutil = pytest.importorskip("psutil")
+    with Server(model, tmp_path, extra=INFO).start(under_parent=True) as srv:
+        parent = srv.parent.pid
+        children = psutil.Process(srv.proc.pid).children(recursive=True)
+        assert len(children) >= 2  # the engine and the frontend
+        t0 = time.monotonic()
+        srv.kill_parent()
+        code = srv.proc.wait(15)
+        took = time.monotonic() - t0
+        _, alive = psutil.wait_procs(children, timeout=15)
+        for p in alive:
+            p.kill()
+        assert not alive, [p.name() for p in alive]
+    log = srv.log_path.read_text()
+    assert code == 0 and took < 15, log[-3000:]
+    assert f"the launcher's parent (pid {parent}) exited (server.stop_with_parent): stopping as on SIGTERM" in log
+    assert "SIGTERM: draining" in log, log[-3000:]
+
+
+def test_a_launcher_whose_parent_exits_while_it_starts_stops(model, tmp_path) -> None:
+    """The parent SIGKILLed while the engine loads (dev.runner.fake.load_s): the start ends as on SIGTERM
+    (`StopWhileStarting`), and the launcher exits 143."""
+    srv = Server(model, tmp_path, extra={**INFO, "dev": {"runner": {"fake": {"load_s": 600}}}}).launch_under_parent()
+    try:
+        deadline = time.monotonic() + 60
+        while "dev.runner.fake.load_s" not in srv.log_path.read_text():
+            assert time.monotonic() < deadline and srv.proc.poll() is None, srv.log_path.read_text()[-2000:]
+            time.sleep(0.1)
+        parent = srv.parent.pid
+        t0 = time.monotonic()
+        srv.kill_parent()
+        code = srv.proc.wait(30)
+        took = time.monotonic() - t0
+    finally:
+        if srv.proc.poll() is None:
+            srv.proc.kill()
+        srv.stop()
+    log = srv.log_path.read_text()
+    assert code == 143 and took < 15, log[-3000:]
+    assert f"the launcher's parent (pid {parent}) exited" in log, log[-3000:]
+    assert "SIGTERM while starting (waiting for the engine)" in log, log[-3000:]
+
+
+def test_a_parent_that_stopped_the_launcher_before_it_exits_sends_no_second_signal(model, tmp_path) -> None:
+    """A supervisor that sends SIGTERM and then exits (a wrapper, a test's stop): the watch finds the stop under way and
+    sends nothing, so the drain (4 s of grace here: the watch looks meanwhile) ends with 0, not with a second signal's
+    exit 1."""
+    with Server(model, tmp_path, extra={**INFO, "server": {"drain_grace_s": 4}}).start(under_parent=True) as srv:
+        parent = srv.parent.pid
+        srv.proc.send_signal(signal.SIGTERM)
+        srv.kill_parent()
+        code = srv.proc.wait(30)
+    log = srv.log_path.read_text()
+    assert code == 0, log[-3000:]
+    assert f"the launcher's parent (pid {parent}) exited; the server is stopping already" in log, log[-3000:]
+    assert "again: failing in-flight requests" not in log and "stopping as on SIGTERM" not in log, log[-3000:]
+
+
+def test_a_parent_that_exits_during_a_download_ends_it_at_once(tmp_path) -> None:
+    """The watch runs from the start of `serve`, before its drain exists (a model download): the parent's exit reaches
+    the main thread while it waits on a thread pool, as huggingface_hub's, and `exit_on_stop` ends the process at once
+    (its line is the last thing it does before `os._exit(143)`; the exit code goes to an init, not to this test)."""
+    code = ("import logging, os, time\nfrom concurrent.futures import ThreadPoolExecutor\n"
+            "from types import SimpleNamespace\nfrom llm_mini_infer.launcher import _watch_parent, exit_on_stop\n"
+            "logging.basicConfig(level=logging.INFO)\nexit_on_stop()\n"
+            "_watch_parent(SimpleNamespace(server=SimpleNamespace(stop_with_parent=True)), os.getppid(), [])\n"
+            "with ThreadPoolExecutor(2) as ex:\n    f = ex.submit(time.sleep, 60)\n    print('ready', flush=True)\n"
+            "    f.result()\n")
+    out_path = tmp_path / "child.log"
+    with out_path.open("w") as out:
+        parent, pid = start_under_parent([sys.executable, "-c", code], dict(os.environ), out)
+    child = Adopted(pid, out_path)
+    try:
+        deadline = time.monotonic() + 30
+        while "ready" not in out_path.read_text():
+            assert time.monotonic() < deadline and child.poll() is None, out_path.read_text()
+            time.sleep(0.05)
+        t0 = time.monotonic()
+        parent.kill()
+        parent.wait(10)
+        child.wait(10)
+        took = time.monotonic() - t0
+    finally:
+        child.kill()
+        parent.kill()
+        parent.wait(10)
+        parent.stderr.close()
+    text = out_path.read_text()
+    assert took < 5, text
+    assert "exited (server.stop_with_parent): stopping as on SIGTERM" in text, text
+    assert text.rstrip().endswith("SIGTERM before the server started: exiting"), text
+
+
+def test_the_launcher_outlives_its_parent_by_default(model, tmp_path) -> None:
+    """server.stop_with_parent off (the default): the parent's exit changes nothing, as for a server started with
+    nohup; the launcher serves on until it is stopped."""
+    with Server(model, tmp_path, extra={**INFO, "server": {"stop_with_parent": False}}).start(under_parent=True) as srv:
+        srv.kill_parent()
+        time.sleep(3)  # three of the watch's looks, were it on
+        assert srv.proc.poll() is None and srv.get("/health")[0] == 200
+        assert srv.stop() == 0, srv.log_path.read_text()[-3000:]
+    assert "the launcher's parent" not in srv.log_path.read_text()
+
+
+def test_a_parent_of_pid_1_or_0_is_not_watched(caplog) -> None:
+    """Pid 1 (an init, or what an orphan's parent becomes) outlives the launcher, and 0 is no parent it can see (it is
+    pid 1, or its parent is in another pid namespace): no thread, one line saying so. Off, nothing is watched."""
+    on = SimpleNamespace(server=SimpleNamespace(stop_with_parent=True))
+    with caplog.at_level(logging.INFO, logger="llm_mini_infer.launcher"):
+        assert _watch_parent(on, 1, []) is None and _watch_parent(on, 0, []) is None
+    assert "the launcher's parent is pid 1, which outlives it: not watched" in caplog.text, caplog.text
+    assert "the launcher has no parent it can see (pid 0): not watched" in caplog.text, caplog.text
+    assert _watch_parent(SimpleNamespace(server=SimpleNamespace(stop_with_parent=False)), os.getppid(), []) is None
 
 
 @pytest.mark.serial  # a server with an image pool

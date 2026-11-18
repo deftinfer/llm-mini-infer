@@ -5,7 +5,10 @@ holds everything it starts; `Server.stop` kills what is left of the group once t
 `Server.start` stops what it launched. Until it is stopped, a server is registered here and in a PID file
 (`servers_dir`): `sweep` kills the servers this process never stopped (pytest's session finish, tests/conftest.py, and
 this process's exit), and `sweep_stale` those of a pytest process that was killed and so ran neither (the OOM killer, a
-timeout). A launcher does not watch its parent: without these it lives on, with its engine and its pixel arena."""
+timeout). A launcher stops by itself once the process that started it exits (`server.stop_with_parent`, on in the
+configuration written here); these remain for what that misses: a launcher killed outright (its pixel arena and IPC
+directory stay), a pytest process stopped rather than killed, and the entrypoint's checks, which run before the
+launcher watches its parent. `Server.start(under_parent=True)` puts a process between the two, for the tests to kill."""
 
 from __future__ import annotations
 
@@ -81,7 +84,7 @@ class Server:
         cfg = {
             "model": {"path": str(model_dir), "max_model_len": 4096, "served_model_name": "qwen-test"},
             "runner": kind,
-            "server": {"host": "127.0.0.1", "port": self.port, "drain_timeout_s": 20},
+            "server": {"host": "127.0.0.1", "port": self.port, "drain_timeout_s": 20, "stop_with_parent": True},
             "observability": {"debug_endpoints": True, "log_level": "warning"},
             "speculative": {"num_speculative_tokens": mtp},
             "dev": {"runner": {"fake": {"step_ms": step_ms, "strict": True, "eos": [list(e) for e in eos]}}},
@@ -91,7 +94,8 @@ class Server:
         self.cfg_path = tmp / f"server-{self.port}.yaml"
         self.cfg_path.write_text(yaml.safe_dump(cfg))
         self.log_path = tmp / f"server-{self.port}.log"
-        self.proc: subprocess.Popen | None = None
+        self.proc: subprocess.Popen | Adopted | None = None
+        self.parent: subprocess.Popen | None = None  # an intermediate parent's (`start(under_parent=True)`)
         self.pgid: int | None = None  # the launcher's process group (its pid), once launched and registered
         self._owner = 0  # the process that launched it (a forked child's copy of the registry is not its own)
         self._started: float | None = None  # the launcher's start time, as its PID file has it
@@ -109,11 +113,12 @@ class Server:
         with contextlib.suppress(Exception):  # the body's exception is the one to see, not a stop that timed out
             self.stop()
 
-    def start(self, timeout: float = 60) -> Server:
-        """`launch`, then a wait until the server is ready. A start that fails stops what it launched: a launcher that
-        exited ("server exited") keeps its exit code for `stop`, one not ready by the deadline is killed."""
+    def start(self, timeout: float = 60, under_parent: bool = False) -> Server:
+        """`launch` (or `launch_under_parent`), then a wait until the server is ready. A start that fails stops what it
+        launched: a launcher that exited ("server exited") keeps its exit code for `stop`, one not ready by the deadline
+        is killed."""
         try:
-            self.launch()
+            self.launch_under_parent() if under_parent else self.launch()
             deadline = time.monotonic() + timeout
             while time.monotonic() < deadline:
                 if self.proc.poll() is not None:
@@ -140,15 +145,7 @@ class Server:
         """Start the server's process, without waiting for it to be ready: in a session of its own, so that its process
         group holds the engine, the frontends and the pool; registered until it is stopped. A registration that fails
         (no folder or file for its PID file) stops it and raises its own error."""
-        self.log = self.log_path.open("w")
-        # no Hugging Face token, and no API key unless the test sets one (`env`): the tests' requests send none
-        drop = ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "LLM_MINI_INFER_API_KEY", "VLLM_API_KEY")
-        env = {k: v for k, v in os.environ.items() if k not in drop}
-        if "HF_ENDPOINT" in self.env:  # a test's local fake hub: the tests' own offline switch would refuse it
-            env.pop("HF_HUB_OFFLINE", None)
-        env.update(self.env)
-        cmd = self.command(env)
-        self.pgid, self._pid_file, self._ended = None, None, False
+        env, cmd = self._prepare()
         self.proc = subprocess.Popen(cmd, cwd=ROOT, stdout=self.log, stderr=subprocess.STDOUT, env=env,
                                      start_new_session=True)
         try:
@@ -157,6 +154,42 @@ class Server:
             self._end()
             raise
         return self
+
+    def launch_under_parent(self) -> Server:
+        """`launch`, with a process between this one and the launcher, `parent` (`start_under_parent`), which a test
+        kills (`kill_parent`) to see the launcher lose its parent. The launcher is not this process's child: `proc`
+        stands in for its Popen (`Adopted`), and its exit code is the one its log gives: the configuration's log level
+        must be INFO or DEBUG (`extra`), else a ValueError."""
+        level = yaml.safe_load(self.cfg_path.read_text())["observability"]["log_level"]
+        if level not in ("debug", "info"):
+            raise ValueError(f"a launcher under a parent logs its exit code at INFO, and this one logs at {level}")
+        env, cmd = self._prepare()
+        try:
+            self.parent, pid = start_under_parent(cmd, env, self.log)
+            self.proc = Adopted(pid, self.log_path)
+            self._register()
+        except BaseException:
+            self._end()
+            raise
+        return self
+
+    def kill_parent(self) -> None:
+        """SIGKILL to the intermediate parent (`launch_under_parent`), and a wait for it: the launcher is orphaned."""
+        self.parent.kill()
+        self.parent.wait(10)
+
+    def _prepare(self) -> tuple[dict[str, str], list[str]]:
+        """A launch's start: the log opened, the state of a previous launch cleared, the environment and the command."""
+        self.log = self.log_path.open("w")
+        # no Hugging Face token, and no API key unless the test sets one (`env`): the tests' requests send none
+        drop = ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "LLM_MINI_INFER_API_KEY", "VLLM_API_KEY")
+        env = {k: v for k, v in os.environ.items() if k not in drop}
+        if "HF_ENDPOINT" in self.env:  # a test's local fake hub: the tests' own offline switch would refuse it
+            env.pop("HF_HUB_OFFLINE", None)
+        env.update(self.env)
+        cmd = self.command(env)
+        self.pgid, self._pid_file, self._ended, self.parent = None, None, False, None
+        return env, cmd
 
     def stop(self, sig: int = signal.SIGTERM, timeout: float = 30) -> int:
         """`sig` to the launcher alone (its own SIGTERM and SIGINT handling, its drain and its exit code are what
@@ -181,7 +214,8 @@ class Server:
         IPC directory, which are removed; one that exited by itself removes them itself, and what it left is its own
         bug, to stay visible (CI reports the files left in /dev/shm). Then the server is unregistered and its log
         closed. A group is killed only while its id is known to be this server's: its launcher running and not reaped
-        yet, or reaped with no process given its pid since."""
+        yet, or reaped with no process given its pid since. An intermediate parent (`launch_under_parent`) is killed
+        after its launcher; a launcher of its that exited is then reaped by an init, which `_end_parent` waits for."""
         if self._ended:
             return
         self._ended = True
@@ -192,16 +226,36 @@ class Server:
                     _kill_group(pgid)
                     with contextlib.suppress(subprocess.TimeoutExpired):
                         self.proc.wait(10)
-                elif not _exists(pgid):
-                    _kill_group(pgid)
+                    self._end_parent()
+                else:
+                    self._end_parent()
+                    if not _exists(pgid):
+                        _kill_group(pgid)
                 code = self.proc.returncode
                 # died of a signal, and no other process has the pid since (the arena named by it would be its own)
                 if code is not None and code < 0 and not _running(pgid):
                     _remove_leftovers(pgid)
                 self._unregister()
         finally:
+            self._end_parent()
             if getattr(self, "log", None) is not None:
                 self.log.close()
+
+    def _end_parent(self) -> None:
+        """The intermediate parent, if any, killed and reaped; then, for up to 5 s, the wait until its launcher, if it
+        exited, is reaped by an init (one that does not reap leaves a zombie, which `_end` takes for a live group)."""
+        parent, self.parent = self.parent, None
+        if parent is None:
+            return
+        if parent.poll() is None:
+            parent.kill()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            parent.wait(10)
+        parent.stderr.close()
+        deadline = time.monotonic() + 5
+        while (self.pgid is not None and self.proc.poll() is not None and _exists(self.pgid)
+               and time.monotonic() < deadline):
+            time.sleep(0.05)
 
     def _register(self) -> None:
         """Into the registry (`sweep`) and a PID file named by the group id (`sweep_stale`, CI's failure path), with
@@ -292,6 +346,69 @@ class Server:
             return default
         assert found, (name, labels)
         return total
+
+
+_PARENT = """import json, os, subprocess, sys, time
+owner = os.getppid()
+p = subprocess.Popen(json.loads(sys.argv[1]), stderr=subprocess.STDOUT, start_new_session=True)
+print(p.pid, file=sys.stderr, flush=True)
+deadline = time.monotonic() + 3600
+while os.getppid() == owner and time.monotonic() < deadline:
+    time.sleep(0.2)
+"""  # an intermediate parent (`start_under_parent`): it lives until it is killed or its own parent is gone
+
+
+def start_under_parent(cmd: list[str], env: dict[str, str], out: Any) -> tuple[subprocess.Popen, int]:
+    """Start `cmd` (its stdout and stderr to the file `out`) under an intermediate parent: a process between this one
+    and `cmd`'s, which a test kills to orphan it. `cmd` runs in a session of its own (its pid is its process group, as
+    `launch`'s), from ROOT, and its parent waits, until it is killed or this process is gone. The parent's Popen
+    (its stderr a pipe, `Server._end_parent` closes it) and `cmd`'s pid."""
+    parent = subprocess.Popen([sys.executable, "-c", _PARENT, json.dumps(cmd)], cwd=ROOT, env=env, stdout=out,
+                              stderr=subprocess.PIPE, text=True)
+    line = parent.stderr.readline()
+    try:
+        return parent, int(line)
+    except ValueError:
+        parent.kill()
+        parent.wait(10)
+        why = line + parent.stderr.read()
+        parent.stderr.close()
+        raise RuntimeError(f"the intermediate parent started nothing: {why[-2000:]}") from None
+
+
+class Adopted:
+    """A launcher that is not this process's child (`Server.launch_under_parent`), with the part of Popen's interface
+    that `Server` uses. It has exited once it is gone or a zombie (`_alive`: its reaper may be an init that does not
+    reap), and its exit code is the last one its log gives (`stopped (exit code N)`, an INFO line), else -SIGKILL: a
+    death by a signal, whose number only its reaper learns, or an exit before `serve`'s main path, which logs no code
+    (a refused setting or download, `exit_on_stop`)."""
+
+    def __init__(self, pid: int, log_path: Path):
+        self.pid, self.log_path = pid, log_path
+        self.started = _start_time(pid)
+        self.returncode: int | None = None
+
+    def poll(self) -> int | None:
+        if self.returncode is None and not _alive(self.pid, self.started):
+            codes = re.findall(r"stopped \(exit code (-?\d+)\)", self.log_path.read_text(errors="replace"))
+            self.returncode = int(codes[-1]) if codes else -signal.SIGKILL
+        return self.returncode
+
+    def wait(self, timeout: float | None = None) -> int:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while self.poll() is None:
+            if deadline is not None and time.monotonic() > deadline:
+                raise subprocess.TimeoutExpired(str(self.pid), timeout)
+            time.sleep(0.05)
+        return self.returncode
+
+    def send_signal(self, sig: int) -> None:
+        if self.poll() is None:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(self.pid, sig)
+
+    def kill(self) -> None:
+        self.send_signal(signal.SIGKILL)
 
 
 class Predictor:

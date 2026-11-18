@@ -140,6 +140,7 @@ A deployment sets the rest with `--set`, the chart's `config`, or a file mounted
 | `server.request_id_header` | `true` | echo `X-Request-Id` |
 | `server.logprobs` | `false` | answer `logprobs` and `top_logprobs` (off: a 400); the CUDA runner then keeps a buffer of its head's logits for them |
 | `server.keep_alive_s` | 5 | the idle time of an HTTP connection |
+| `server.stop_with_parent` | `false` | stop as on SIGTERM when the launcher's parent process exits |
 | `engine.watchdog_s` | 60 | stop an engine whose step loop is stuck this long; 0 disables it |
 | `engine.plan_at_boundary` | `false` | [plan at the forward/sampling boundary](architecture.md#planning-at-the-forwardsampling-boundary): Gemma 4 with structured output only |
 | `observability.log_level`, `log_requests` | `info`, `true` | the log, and a line per chat request |
@@ -177,7 +178,7 @@ A deployment sets the rest with `--set`, the chart's `config`, or a file mounted
 
 The supervisor's grace period (`docker stop -t`, `stop_grace_period`, `terminationGracePeriodSeconds`) must exceed `drain_grace_s + drain_timeout_s` by about 20 s. A second signal fails the requests at once (exit 1). SIGINT drains without the grace.
 
-**Other stops.** A signal before the server is ready ends the start: the engine's stacks go to the log, and the container exits 143 (130 for SIGINT). A signal during a model download ends it at once, with the same codes.
+**Other stops.** A signal before the server is ready ends the start: the engine's stacks go to the log, and the container exits 143 (130 for SIGINT). A signal during a model download ends it at once, with the same codes. With `server.stop_with_parent` on, the exit of the launcher's parent process (a wrapper such as `uv run`, if one started it) stops the server as SIGTERM would, within about two seconds; a parent of PID 1, or none (the launcher is PID 1), is not watched. Turn it on under a supervisor that is not PID 1 and may die without stopping the server, such as a test runner or a script. In a container it does nothing.
 
 **Failures.** An engine or frontend that exits, or a step loop stuck for `engine.watchdog_s`, fails the requests in flight (503, or an error event on a stream), and the container exits 1. The launcher replaces an image pool worker that crashes or holds an image past its deadline (45 s at the default): that image fails with a 400, and nothing else stops. More than 3 worker deaths in 60 s stop the container. A non-finite result or a grammar error fails only its request, with a 500.
 

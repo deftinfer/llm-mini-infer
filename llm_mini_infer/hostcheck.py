@@ -205,6 +205,7 @@ class Server:
         self.port = port
         args = [sys.executable, "-m", "llm_mini_infer.cli", "serve", "--config", config, "--host", "127.0.0.1",
                 "--port", str(port), "--set", "observability.debug_endpoints=true",
+                "--set", "server.stop_with_parent=true",  # it stops when this check exits without stopping it
                 "--set", f"observability.log_requests={'true' if log_requests else 'false'}",
                 *(["--set", "observability.log_level=info"] if log_requests else []),  # the request lines are INFO
                 *[x for s in sets for x in ("--set", s)]]

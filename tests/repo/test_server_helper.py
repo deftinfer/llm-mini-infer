@@ -261,8 +261,9 @@ def test_the_context_manager_stops_on_exit_and_keeps_the_bodys_exception(tmp_pat
 @pytest.mark.parametrize("how", ["kill", "exit", "return"])
 def test_a_killed_pytests_server_dies_at_the_next_stale_file_sweep(tmp_path, servers, how) -> None:
     """A pytest process that is SIGKILLed, or exits without its exit hooks (os._exit), in the middle of a test: its
-    server lives on, until another process's stale-file sweep. While that pytest runs, the sweep leaves its server
-    alone (another session's); one that exits normally sweeps its own (atexit)."""
+    server (a stand-in, which does not watch its parent as a launcher does) lives on, until another process's
+    stale-file sweep. While that pytest runs, the sweep leaves its server alone (another session's); one that exits
+    normally sweeps its own (atexit)."""
     owner = subprocess.Popen([sys.executable, "-c", OWNER, str(tmp_path)], cwd=ROOT, stdin=subprocess.PIPE,
                              stdout=subprocess.PIPE, text=True)
     try:
