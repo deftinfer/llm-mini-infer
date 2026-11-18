@@ -286,8 +286,11 @@ class App:
         # tokenizes (`check_length`)
         self.max_chars_per_token = max(map(len, self.renderer.tokenizer.get_vocab(with_added_tokens=True)))
         if self.renderer.templates:
-            compile_template(self.renderer.default_template)  # compile once, before serving
-            _ = self.renderer.content_format, self.renderer.template_variables
+            try:
+                compile_template(self.renderer.default_template)  # compile once, before serving
+                _ = self.renderer.content_format, self.renderer.template_variables
+            except TemplateError:
+                pass  # a template list without a default: compile on demand; each request answers a 400 instead
         # built before serving: the tool results' plain tokenizer and the prompt's segment cache (`Renderer.encode`)
         _ = self.renderer.neutral, self.renderer.segment_cache
         self.metrics = Metrics(self.model_name, self.max_model_len)
@@ -664,13 +667,15 @@ class App:
         r = self.renderer
         msgs = [msgspec.to_builtins(m) for m in messages]
         try:
-            conv = self._template_messages(msgs, where)
-        except RecursionError as exc:
-            raise ApiError(400, "the messages are nested too deeply", "messages") from exc
-        kw = r.filter_template_kwargs(self.template_kwargs(kwargs, effort))
-        try:
+            try:
+                conv = self._template_messages(msgs, where)
+            except RecursionError as exc:
+                raise ApiError(400, "the messages are nested too deeply", "messages") from exc
+            kw = r.filter_template_kwargs(self.template_kwargs(kwargs, effort))
             return r.render(conv, tools=tools, add_generation_prompt=add_generation_prompt, **kw), conv, kw, msgs
         except TemplateError as exc:
+            # select_template (no template / no default), content_format / supports_developer_role and
+            # filter_template_kwargs all raise it before the render's own handler; all are a client 400.
             raise validation_error(str(exc)) from exc  # vLLM's: the template's reason alone
 
     def tool_spans(self, msgs: list[dict], text: str, add_generation_prompt: bool, kw: dict,
