@@ -73,6 +73,9 @@ class Spec:
     preempt_at: int | None = None
     preempt_pages: tuple[int, int] = (0, 0)
     logprobs: int = -1  # its tokens' logprobs with this many top entries (AddRequest.logprobs; -1: none)
+    # Penalties and the logit bias (AddRequest's; the fake's tokens ignore them, its checks read the ADMIT)
+    penalties: tuple[float, float, float] = (1.0, 0.0, 0.0)  # repetition, presence, frequency
+    bias: dict[int, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -174,7 +177,7 @@ class Harness:
                              draft_kv=draft_kv, precise=precise, refine_after=refine_after, refine_min=refine_min,
                              precise_cost=precise_cost, refine_chunk_tokens=refine_chunk_tokens,
                              forced_prefix=forced_prefix, eos_free_finish=eos_free_finish, batch_invariant=inv,
-                             logprobs=True)
+                             logprobs=True, penalties_vocab=vocab)
 
         try:
             self.sched = scheduler(want)
@@ -273,7 +276,10 @@ class Harness:
                                     seed=spec.seed, stop_token_ids=spec.stop_ids, ignore_eos=spec.ignore_eos,
                                     priority=spec.priority, cache_salt=spec.salt, cache_hints=spec.hints,
                                     images=image_refs(spec.images), grammar=spec.grammar,
-                                    stop_strings=spec.stop_strings, logprobs=spec.logprobs))
+                                    stop_strings=spec.stop_strings, logprobs=spec.logprobs,
+                                    repetition_penalty=spec.penalties[0], presence_penalty=spec.penalties[1],
+                                    frequency_penalty=spec.penalties[2], bias_ids=sorted(spec.bias),
+                                    bias_values=[spec.bias[t] for t in sorted(spec.bias)]))
         self.results[spec.rid] = Result()
         if (0, spec.rid) not in self.sched.reqs:
             self.rejected.add(spec.rid)

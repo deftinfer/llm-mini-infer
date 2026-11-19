@@ -111,6 +111,7 @@ from .plan import (
     FOLD_ALL,
     LOGPROBS,
     MASKED,
+    MAX_LOGIT_BIAS,
     PRECISE,
     SAMPLE,
     STATE_ZERO,
@@ -178,6 +179,7 @@ class Req:
     __slots__ = (
         "arrival",
         "base_precise",
+        "bias",
         "cached",
         "compiled",
         "continues",
@@ -215,6 +217,7 @@ class Req:
         "out_chunks",
         "own_ckpts",
         "pages",
+        "pen",
         "pend",
         "plock",
         "priority",
@@ -271,6 +274,11 @@ class Req:
         self.temperature, self.top_p, self.min_p = msg.temperature, msg.top_p, msg.min_p
         self.top_k = int(np.int32(msg.top_k))
         self.seed = int(np.uint64(seed))
+        # Penalties (repetition, presence, frequency; None: neutral) and the logit bias (ids ascending, values; None)
+        pen = (float(msg.repetition_penalty), float(msg.presence_penalty), float(msg.frequency_penalty))
+        self.pen = pen if pen != (1.0, 0.0, 0.0) else None
+        self.bias = (np.asarray(msg.bias_ids, np.int32), np.asarray(msg.bias_values, np.float32)) \
+            if len(msg.bias_ids) else None
         self.stop_ids = np.asarray(msg.stop_token_ids, np.int32)
         self.ignore_eos = msg.ignore_eos
         self.stop_list: list[int] = []  # the commit limit's stop tokens (set by the scheduler under MTP)
@@ -652,7 +660,7 @@ class Scheduler:
                  refine_min: int = REFINE_MIN,
                  precise_cost: float = 1.0, refine_chunk_tokens: int = 0, mtp_k_max: int = 0,
                  forced_prefix: bool = False, eos_free_finish: bool = False, batch_invariant: bool = False,
-                 logprobs: bool = False, compile_timeout_s: float = COMPILE_TIMEOUT_S):
+                 logprobs: bool = False, penalties_vocab: int = 0, compile_timeout_s: float = COMPILE_TIMEOUT_S):
         self.max_num_seqs = max_num_seqs
         self.max_tokens = max_num_batched_tokens
         self.max_model_len = max_model_len
@@ -685,8 +693,10 @@ class Scheduler:
             hybrid = True  # hits land on window checkpoints, as on GDN state checkpoints
             self.wkv = self.kv
             self.windows = WindowStore(self.kv)
+        # Penalties and the logit bias (the runner's `Capabilities.penalties`: its vocabulary; 0: none)
+        self.pen_vocab = penalties_vocab
         self.builder = PlanBuilder(max_num_seqs, max_num_batched_tokens, page_size, max_model_len, mtp_k, window,
-                                   self.wps, checkpoint_grid)
+                                   self.wps, checkpoint_grid, vocab=penalties_vocab)
         self._rng = random.Random(seed)
         self.hybrid = hybrid
         self.grid = checkpoint_grid
@@ -937,6 +947,16 @@ class Scheduler:
             return
         self._to_waiting(req)
 
+    def _check_penalties(self, msg: AddRequest) -> str | None:
+        """Why the runner cannot take a request's penalties or logit bias (None: it can)."""
+        ids = np.asarray(msg.bias_ids, np.int64)
+        if not self.pen_vocab:
+            return "penalties or a logit bias, but this runner applies none"
+        if len(ids) > MAX_LOGIT_BIAS or len(msg.bias_values) != len(ids) or \
+                (len(ids) and (ids[0] < 0 or ids[-1] >= self.pen_vocab or (np.diff(ids) <= 0).any())):
+            return f"a logit bias of {len(ids)} entries that are not distinct ascending ids below {self.pen_vocab}"
+        return None
+
     def _new_request(self, msg: AddRequest) -> Req | None:
         """`add`'s checks and its request, built; None (the reason logged) when a check rejects it."""
         key = (msg.frontend, msg.rid)
@@ -956,6 +976,9 @@ class Scheduler:
             reason = "logprobs, but this runner computes none"
         elif msg.logprobs > MAX_LOGPROBS:
             reason = f"{msg.logprobs} top logprobs (at most {MAX_LOGPROBS})"
+        elif (msg.repetition_penalty, msg.presence_penalty, msg.frequency_penalty) != (1.0, 0.0, 0.0) or \
+                len(msg.bias_ids):
+            reason = self._check_penalties(msg)
         elif msg.images:
             reason = self._check_images(msg, n)
         built = fut = None
@@ -1573,9 +1596,12 @@ class Scheduler:
         if cache is not None:
             forbid = (lambda pos: self._in_span(req, pos)) if self.bidi and len(req.sp_start) else None
             key = self._key(req)
-            m = cache.match(req.ns, key, step, total - 1, forbid=forbid, spans=req.spans)
+            # A penalised readmission resumes within its prompt at most: the runner counts its outputs as it
+            # recomputes them (`sched.plan`, ADMIT), and only a prompt's tokens can come with an admission
+            cap = total if req.pen is None else min(total, req.prompt_len + 1)
+            m = cache.match(req.ns, key, step, cap - 1, forbid=forbid, spans=req.spans)
             if self.pns_on:  # the precise prefix's copies (module docstring)
-                pm = cache.match(precise_ns(req.ns), key, step, total - 1, forbid=forbid, spans=req.spans)
+                pm = cache.match(precise_ns(req.ns), key, step, cap - 1, forbid=forbid, spans=req.spans)
             # The hit is pinned by its STATE_COPY below, not here: a request that waits reads nothing, and its
             # matched checkpoint may then make room for the branch checkpoint it waits for. Until the STATE_COPY,
             # nothing can evict it: `_branch_wait` waits whenever its allocation succeeds, and page eviction skips the
@@ -1586,11 +1612,11 @@ class Scheduler:
                 # an FP8 checkpoint that the `short` rule below passes over whatever its writer: once it is visible,
                 # the request resumes from the precise copy all the same, so a wait would only cost it a step
                 pending = 0
-            wait = pending > best or self._branch_wait(m, total, step, floor=pm.hit)
+            wait = pending > best or self._branch_wait(m, cap, step, floor=pm.hit)
             if not wait and self.pns_on:
                 # a precise copy at least as deep as the FP8 hit is being written by this plan: it comes next step
                 wait = (pm.pending > pm.hit and pm.pending >= m.hit) or \
-                    self._branch_wait(pm, total, step, floor=m.hit)
+                    self._branch_wait(pm, cap, step, floor=m.hit)
             if not wait and self.precise == "reuse" and m.hit > pm.hit:
                 gap = m.hit - pm.hit
                 if pm.hit and gap < self.refine_min and (gap < self.grid or not m.node.on_precise):
@@ -1781,15 +1807,21 @@ class Scheduler:
             flags |= ADMIT_LOGPROBS
             self.lp[slot] = req.logprobs
             self.n_lp += 1
+        terms: dict[str, Any] = {}
+        if req.pen is not None:
+            rp, pp, fp = req.pen
+            terms = dict(rep=rp, pres=pp, freq=fp, prompt_len=req.prompt_len, prompt=req.tokens)
+        if req.bias is not None:
+            terms.update(bias_ids=req.bias[0], bias_val=req.bias[1])
         if self.k:
             if not req.stop_list:
                 eos = [] if req.ignore_eos else self.eos_ids.tolist()
                 req.stop_list = list(dict.fromkeys([*eos, *req.stop_ids.tolist()]))
             b.add_admit(slot, live, hit, req.temperature, req.top_p, req.top_k, req.min_p, req.seed, flags,
-                        max_len=req.prompt_len + req.max_out, stop=req.stop_list, rope_off=req.rope_off)
+                        max_len=req.prompt_len + req.max_out, stop=req.stop_list, rope_off=req.rope_off, **terms)
         else:
             b.add_admit(slot, live, hit, req.temperature, req.top_p, req.top_k, req.min_p, req.seed, flags,
-                        rope_off=req.rope_off)
+                        rope_off=req.rope_off, **terms)
         b.add_pages(slot, 0, pages)
         req.hit, req.cow, req.cow_unv = hit, own[0] if tail else 0, below
         if tail:
