@@ -228,7 +228,6 @@ class _Mirror:
         self.top_p = np.ones(slots, np.float32)
         self.top_k = np.zeros(slots, np.int64)
         self.min_p = np.zeros(slots, np.float32)
-        self.seen = np.zeros(slots, np.int32)
         self.lp = np.zeros(slots, bool)  # admitted with ADMIT_LOGPROBS
 
 
@@ -1485,6 +1484,9 @@ class GemmaRunner(Runner):
             raise PlanError(f"step {plan.step_id}: image inputs, but this runner has no vision tower")
         free, adm = plan.free_slot.astype(np.int64), plan.admit_slot.astype(np.int64)
         fx.n_free, fx.n_admit, fx.n_pages, fx.n_wpages = len(free), len(adm), len(plan.page_id), len(plan.wpage_id)
+        for what, a in (("FREE", free), ("ADMIT", adm)):  # a slot at most once per list (`CudaRunner._stage_effects`)
+            if len(a) > 1 and len(set(a.tolist())) != len(a):
+                raise PlanError(f"step {plan.step_id}: a slot appears twice in {what}: {a.tolist()}")
         if fx.n_free:
             if (free < 1).any() or (free > s_max).any() or not m.admitted[free].all():
                 raise PlanError(f"step {plan.step_id}: FREE of a slot that is not admitted: {free.tolist()}")
@@ -1519,7 +1521,9 @@ class GemmaRunner(Runner):
             if not n:
                 continue
             lo = 1 if pool == "full" else 0  # window entries of 0 clear released pages
-            ok_slot = m.admitted[slot_a] | (np.isin(slot_a, free) & (id_a == 0) if pool == "window" else False)
+            ok_slot = (slot_a >= 1) & (slot_a <= s_max)
+            if ok_slot.all():
+                ok_slot = m.admitted[slot_a] | (np.isin(slot_a, free) & (id_a == 0) if pool == "window" else False)
             if not ok_slot.all() or (idx_a < 0).any() or (idx_a >= max_idx).any() or (id_a < lo).any() or \
                     (id_a >= n_arena).any():
                 raise PlanError(f"step {plan.step_id}: {pool} PAGES out of range or for a slot that is not admitted")
@@ -1599,10 +1603,7 @@ class GemmaRunner(Runner):
         if n > pc.max_num_seqs or (slots < 1).any() or (slots > pc.max_num_seqs).any() or \
                 not m.admitted[slots].all():
             raise PlanError(f"step {step}: SCHED rows for slots that are not admitted: {slots.tolist()}")
-        m.seen[slots] += 1
-        dup = bool((m.seen[slots] > 1).any())
-        m.seen[slots] = 0
-        if dup:
+        if n > 1 and len(set(slots.tolist())) != n:
             raise PlanError(f"step {step}: a slot appears twice in SCHED")
         t_total = int(nq.sum())
         if (nq < 1).any() or t_total > pc.max_num_batched_tokens:

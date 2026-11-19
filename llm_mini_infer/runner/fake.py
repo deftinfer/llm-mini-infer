@@ -525,7 +525,7 @@ class FakeRunner(FakeChecks, Runner):
                 self.history[slot] = []
                 self.img_hist[slot] = []
         for slot, idx, page in zip(plan.page_slot.tolist(), plan.page_index.tolist(), plan.page_id.tolist()):
-            if not self.admitted[slot]:
+            if not 1 <= slot <= nseq or not self.admitted[slot]:  # the range first: a Python index wraps
                 self._fail(plan, f"PAGES for slot {slot}, which is not admitted")
             if not 0 <= idx < self.max_pages_per_seq or not 1 <= page < self.pools.num_pages:
                 self._fail(plan, f"PAGES entry ({slot}, {idx}) = {page} out of range")
@@ -538,7 +538,7 @@ class FakeRunner(FakeChecks, Runner):
             self._fail(plan, "window PAGES, but this model has no sliding window")
         freed = set(plan.free_slot.tolist())
         for slot, idx, page in zip(plan.wpage_slot.tolist(), plan.wpage_index.tolist(), plan.wpage_id.tolist()):
-            if not self.admitted[slot]:
+            if not 1 <= slot <= nseq or not self.admitted[slot]:
                 if page == 0 and slot in freed:
                     continue  # a release of the request this plan FREEs (plan.py)
                 self._fail(plan, f"window PAGES for slot {slot}, which is not admitted")

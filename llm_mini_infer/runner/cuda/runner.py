@@ -413,7 +413,6 @@ class _Mirror:
         self.top_p = np.ones(slots, np.float32)
         self.top_k = np.zeros(slots, np.int64)
         self.min_p = np.zeros(slots, np.float32)
-        self.seen = np.zeros(slots, np.int32)
         self.lp = np.zeros(slots, bool)  # admitted with ADMIT_LOGPROBS
 
 
@@ -1896,6 +1895,13 @@ class CudaRunner(Runner):
         fx.fold = None
         free, adm = plan.free_slot.astype(np.int64), plan.admit_slot.astype(np.int64)
         fx.n_free, fx.n_admit, fx.n_pages, fx.n_zero = len(free), len(adm), len(plan.page_id), 0
+        # a slot at most once per list (a FREE and an ADMIT of one slot is its reuse): `m.epoch[adm] += 1` counts a
+        # repeated index once, and `index_copy_` keeps one of its entries, in no set order
+        for what, a in (("FREE", free), ("ADMIT", adm)):
+            if len(a) > 1 and len(set(a.tolist())) != len(a):
+                raise PlanError(f"step {plan.step_id}: a slot appears twice in {what}: {a.tolist()}")
+        if len(plan.state_copy_dst) > 1 and len(set(plan.state_copy_dst.tolist())) != len(plan.state_copy_dst):
+            raise PlanError(f"step {plan.step_id}: two STATE_COPYs into one slot: {plan.state_copy_dst.tolist()}")
         if len(plan.fold_slot):
             if not self.k:
                 raise PlanError(f"step {plan.step_id}: FOLD without MTP")
@@ -1942,8 +1948,8 @@ class CudaRunner(Runner):
                 fx.o_ropeoff = st.put(plan.admit_rope_off.astype(np.int64))
         if fx.n_pages:
             pslot, pidx, pid = plan.page_slot, plan.page_index, plan.page_id
-            if not m.admitted[pslot].all() or (pidx < 0).any() or (pidx >= self.max_pages).any() or \
-                    (pid < 1).any() or (pid >= self.pc.num_pages).any():
+            if (pslot < 1).any() or (pslot > s_max).any() or not m.admitted[pslot].all() or (pidx < 0).any() or \
+                    (pidx >= self.max_pages).any() or (pid < 1).any() or (pid >= self.pc.num_pages).any():
                 raise PlanError(f"step {plan.step_id}: PAGES out of range or for a slot that is not admitted")
             fx.o_pslot, fx.o_pidx, fx.o_pid = st.put(pslot), st.put(pidx), st.put(pid)
         fx.n_kvc, fx.n_sc = len(plan.kv_copy_src), len(plan.state_copy_src)
@@ -2041,10 +2047,7 @@ class CudaRunner(Runner):
         if n > pc.max_num_seqs or (slots < 1).any() or (slots > pc.max_num_seqs).any() or \
                 not m.admitted[slots].all():
             raise PlanError(f"step {step}: SCHED rows for slots that are not admitted: {slots.tolist()}")
-        m.seen[slots] += 1
-        dup = bool((m.seen[slots] > 1).any())
-        m.seen[slots] = 0
-        if dup:
+        if n > 1 and len(set(slots.tolist())) != n:
             raise PlanError(f"step {step}: a slot appears twice in SCHED")
         t_total = int(nq.sum())
         if (nq < 1).any() or t_total > pc.max_num_batched_tokens:

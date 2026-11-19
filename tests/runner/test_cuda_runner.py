@@ -275,6 +275,74 @@ def test_plan_violations_raise(runner) -> None:
         runner.launch_forward(b.finish(2))
 
 
+def _admit(b: PlanBuilder, slot: int, state_slot: int, pages: list[int]) -> None:
+    b.add_admit(slot, state_slot, 0, *GREEDY)
+    b.add_pages(slot, 0, pages)
+
+
+def _row(b: PlanBuilder, slot: int) -> None:
+    b.add_explicit_row(slot, np.arange(5, dtype=np.int32), 0, STATE_ZERO | SAMPLE)
+
+
+def _launch(runner, pc: PoolConfig, *builds) -> None:
+    """One plan per function in `builds`, in the engine's call order (launch N+1, wait N, sample N+1)."""
+    b = PlanBuilder(pc.max_num_seqs, pc.max_num_batched_tokens, pc.page_size)
+    prev = None
+    for step, build in enumerate(builds, 1):
+        b.begin()
+        build(b)
+        h = runner.launch_forward(b.finish(step))
+        if prev is not None:
+            runner.wait(prev)
+        runner.launch_sample(h)
+        prev = h
+    if prev is not None:
+        runner.wait(prev)
+
+
+@pytest.mark.parametrize(("builds", "match"), [
+    # `seen[slots] += 1` counted a repeated index once, so the old check never saw a slot twice
+    pytest.param([lambda b: (_admit(b, 1, 1, [1, 2]), _row(b, 1), _row(b, 1))],
+                 "a slot appears twice in SCHED", id="sched-slot-twice"),
+    # slot -1 wrapped to the last slot (4), whose page table took the entry
+    pytest.param([lambda b: (_admit(b, 1, 1, [1, 2]), _admit(b, 4, 2, [3, 4]), b.add_pages(-1, 1, [5]))],
+                 "PAGES out of range or for a slot that is not admitted", id="pages-slot-minus-1"),
+    pytest.param([lambda b: (_admit(b, 1, 1, [1, 2]), b.add_pages(5, 0, [5]))],
+                 "PAGES out of range or for a slot that is not admitted", id="pages-slot-past-max"),
+    pytest.param([lambda b: _admit(b, 1, 1, [1, 2]), lambda b: (b.add_free(1), b.add_free(1))],
+                 r"a slot appears twice in FREE: \[1, 1\]", id="free-twice"),
+    pytest.param([lambda b: (b.add_admit(1, 1, 0, *GREEDY), b.add_admit(1, 2, 0, *GREEDY),
+                             b.add_pages(1, 0, [1, 2]))],
+                 r"a slot appears twice in ADMIT: \[1, 1\]", id="admit-twice"),
+    pytest.param([lambda b: (b.add_state_copy(1, 3), b.add_state_copy(2, 3))],
+                 r"two STATE_COPYs into one slot: \[3, 3\]", id="state-copy-destination-twice"),
+])
+def test_repeated_or_out_of_range_slots_raise(runner, builds, match) -> None:
+    """A slot twice in SCHED, FREE or ADMIT, a PAGES entry for a slot outside 1..max_num_seqs, and one STATE_COPY
+    destination twice each raise PlanError."""
+    pc = configure(runner, budget=64)
+    with pytest.raises(PlanError, match=match):
+        _launch(runner, pc, *builds)
+    configure(runner, budget=64)
+
+
+@pytest.mark.parametrize("builds", [
+    pytest.param([lambda b: (_admit(b, 1, 1, [1, 2]), _row(b, 1)),
+                  lambda b: (b.add_free(1), _admit(b, 1, 2, [3, 4]), _row(b, 1))], id="free-and-admit-one-slot"),
+    pytest.param([lambda b: (b.add_admit(1, 2, 0, *GREEDY), b.add_pages(1, 0, [1, 2]), b.add_state_copy(3, 2),
+                             _row(b, 1))], id="state-copy-into-the-admits-state-slot"),
+    pytest.param([lambda b: (_admit(b, 1, 1, [1, 2]), _row(b, 1)),
+                  lambda b: (b.add_free(1), b.add_admit(2, 1, 0, *GREEDY), b.add_pages(2, 0, [3, 4]),
+                             b.add_state_copy(3, 1), _row(b, 2))], id="state-copy-into-a-readmitted-state-slot"),
+])
+def test_slot_reuse_in_one_plan_is_valid(runner, builds) -> None:
+    """The checks are within one list: a FREE and an ADMIT of one slot in one plan, a STATE_COPY into the state slot
+    an ADMIT takes, and one into a state slot freed and admitted again in the same plan all pass."""
+    pc = configure(runner, budget=64)
+    _launch(runner, pc, *builds)
+    configure(runner, budget=64)
+
+
 def test_the_mirror_check_sees_device_tables_that_disagree(runner) -> None:
     """`check_mirror` (dev.runner.cuda.check) after a step that samples slot 1 and admits slot 2 mid-prompt: a pending
     token for the slot that has not sampled, none for the one that has, or a seq_len outside the host mirror's range

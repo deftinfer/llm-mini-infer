@@ -505,6 +505,34 @@ def test_a_slot_twice_in_sched_raises() -> None:
         r.launch_forward(b.finish(1))
 
 
+@pytest.mark.parametrize("slot", [-1, 3])
+@pytest.mark.parametrize(("where", "full", "match"), [
+    pytest.param("PAGES", False, r"^step \d+: PAGES for slot -?\d, which is not admitted", id="pages"),
+    pytest.param("window PAGES", False, r"window PAGES for slot -?\d, which is not admitted", id="window-pages"),
+    pytest.param("SCHED", False, r"SCHED row for a slot that is not admitted: \[-?\d\]", id="sched"),
+    pytest.param("SCHED", True, r"SCHED row for a slot that is not admitted: \[-?\d\]", id="sched-full")])
+def test_a_slot_out_of_range_raises(where: str, full: bool, match: str, slot: int) -> None:
+    """A PAGES or window PAGES entry or a SCHED row for slot -1 or max_num_seqs + 1 fails the plan, with the last slot
+    admitted (before, -1 indexed the last slot's tables and the plan passed; max_num_seqs + 1 raised IndexError)."""
+    window = 8 if where == "window PAGES" else 0
+    r = FakeRunner(vocab_size=1000, max_positions=256, full_checks=full, window=window)
+    pc = PoolConfig(page_size=4, num_pages=16, num_state_slots=4, max_num_seqs=2, max_num_batched_tokens=64,
+                    max_model_len=256, eos_token_ids=(999,), window_page_size=4 if window else 0)
+    r.configure(pc)
+    b = PlanBuilder(pc.max_num_seqs, pc.max_num_batched_tokens, pc.page_size, pc.max_model_len, 0, window, 4)
+    b.begin()
+    b.add_admit(2, 1, 0, 0.0, 1.0, 0, 0.0, 1)
+    b.add_pages(2, 0, [1, 2])
+    if where == "PAGES":
+        b.add_pages(slot, 2, [3])
+    elif where == "window PAGES":
+        b.add_wpages(slot, 0, [3])
+    else:
+        b.add_explicit_row(slot, np.arange(5, dtype=np.int32), 0, STATE_ZERO)
+    with pytest.raises(PlanError, match=match):
+        r.launch_forward(b.finish(1))
+
+
 def _allowed(vocab: int, constrained: bool) -> np.ndarray:
     allowed = np.ones(vocab, bool)
     if constrained:

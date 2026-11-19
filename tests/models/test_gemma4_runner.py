@@ -15,7 +15,8 @@ import torch
 from llm_mini_infer.engine.core import EngineCore
 from llm_mini_infer.engine.messages import AddRequest, FinishReason
 from llm_mini_infer.models.gemma4.model import SLIDING
-from llm_mini_infer.runner.base import NONFINITE
+from llm_mini_infer.runner.base import NONFINITE, PlanError
+from llm_mini_infer.sched.plan import SAMPLE, STATE_ZERO, PlanBuilder
 from llm_mini_infer.sched.scheduler import Scheduler
 
 from ..support.tiny_gemma import (
@@ -324,6 +325,89 @@ def test_fp8_rows_turn_nan_finite(tiny_fp8) -> None:
     nan, clean = run(True), run(False)
     assert all(r.status is None for r in nan + clean) and nan[1].n_out.tolist() == [1, 1]
     assert np.array_equal(nan[0].tokens, clean[0].tokens) and np.array_equal(nan[1].tokens[0], clean[1].tokens[0])
+
+
+# -- contract violations -----------------------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def runner(tiny):
+    return gemma_cpu_runner(tiny, gemma_pools(budget=64, page_size=4))
+
+
+def _configure(runner):
+    pc = gemma_pools(budget=64, page_size=4)
+    runner.configure(pc)
+    return pc
+
+
+def _launch(runner, pc, *builds) -> None:
+    """One plan per function in `builds`, in the engine's call order (launch N+1, wait N, sample N+1)."""
+    b = PlanBuilder(pc.max_num_seqs, pc.max_num_batched_tokens, pc.page_size, pc.max_model_len, 0, W,
+                    pc.window_page_size)
+    prev = None
+    for step, build in enumerate(builds, 1):
+        b.begin()
+        build(b)
+        h = runner.launch_forward(b.finish(step))
+        if prev is not None:
+            runner.wait(prev)
+        runner.launch_sample(h)
+        prev = h
+    if prev is not None:
+        runner.wait(prev)
+
+
+def _admit(b: PlanBuilder, slot: int, page: int) -> None:
+    """ADMIT with full page `page` and window pages `page` + 1 and + 2 (one arena: distinct ids across slots)."""
+    b.add_admit(slot, slot, 0, *GREEDY)
+    b.add_pages(slot, 0, [page])
+    b.add_wpages(slot, 0, [page + 1, page + 2])
+
+
+def _row(b: PlanBuilder, slot: int) -> None:
+    b.add_explicit_row(slot, np.arange(5, dtype=np.int32), 0, STATE_ZERO | SAMPLE)
+
+
+@pytest.mark.parametrize(("builds", "match"), [
+    # `seen[slots] += 1` counted a repeated index once, so the old check never saw a slot twice
+    pytest.param([lambda b: (_admit(b, 1, 1), _row(b, 1), _row(b, 1))],
+                 "a slot appears twice in SCHED", id="sched-slot-twice"),
+    # slot -1 wrapped to the last slot (4), whose page table took the entry
+    pytest.param([lambda b: (_admit(b, 1, 1), _admit(b, 4, 4), b.add_pages(-1, 1, [7]))],
+                 "full PAGES out of range or for a slot that is not admitted", id="full-pages-slot-minus-1"),
+    pytest.param([lambda b: (_admit(b, 1, 1), b.add_pages(5, 0, [7]))],
+                 "full PAGES out of range or for a slot that is not admitted", id="full-pages-slot-past-max"),
+    pytest.param([lambda b: (_admit(b, 1, 1), _admit(b, 4, 4), b.add_wpages(-1, 2, [7]))],
+                 "window PAGES out of range or for a slot that is not admitted", id="window-pages-slot-minus-1"),
+    pytest.param([lambda b: (_admit(b, 1, 1), b.add_wpages(5, 0, [7]))],
+                 "window PAGES out of range or for a slot that is not admitted", id="window-pages-slot-past-max"),
+    pytest.param([lambda b: _admit(b, 1, 1), lambda b: (b.add_free(1), b.add_free(1))],
+                 r"a slot appears twice in FREE: \[1, 1\]", id="free-twice"),
+    pytest.param([lambda b: (b.add_admit(1, 1, 0, *GREEDY), b.add_admit(1, 1, 0, *GREEDY), b.add_pages(1, 0, [1]))],
+                 r"a slot appears twice in ADMIT: \[1, 1\]", id="admit-twice"),
+])
+def test_repeated_or_out_of_range_slots_raise(runner, builds, match) -> None:
+    """A slot twice in SCHED, FREE or ADMIT, and a full or window PAGES entry for a slot outside 1..max_num_seqs each
+    raise PlanError."""
+    pc = _configure(runner)
+    with pytest.raises(PlanError, match=match):
+        _launch(runner, pc, *builds)
+    _configure(runner)
+
+
+@pytest.mark.parametrize("builds", [
+    pytest.param([lambda b: (_admit(b, 1, 1), _row(b, 1)),
+                  lambda b: (b.add_free(1), _admit(b, 1, 4), _row(b, 1))], id="free-and-admit-one-slot"),
+    pytest.param([lambda b: (_admit(b, 1, 1), _row(b, 1)),
+                  lambda b: (b.add_free(1), b.add_wpages(1, 0, [0]))], id="window-release-of-a-freed-slot"),
+])
+def test_slot_reuse_and_window_release_in_one_plan_pass(runner, builds) -> None:
+    """The checks are within one list: a FREE and an ADMIT of one slot in one plan pass, and so do window PAGES of
+    page id 0 (a release) for a slot the same plan FREEs."""
+    pc = _configure(runner)
+    _launch(runner, pc, *builds)
+    _configure(runner)
 
 
 # -- the engine end to end ----------------------------------------------------------------------------------------

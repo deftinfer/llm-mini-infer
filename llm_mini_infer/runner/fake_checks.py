@@ -67,6 +67,8 @@ class FakeChecks:
         sl = slots.tolist()
         if len(set(sl)) != n:
             self._fail(plan, "a slot appears twice in SCHED")
+        if min(sl) < 1 or max(sl) > self.pools.max_num_seqs:  # the range first: an index of -1 wraps
+            self._fail(plan, f"SCHED row for a slot that is not admitted: {sl}")
         if not self.admitted[slots].all():
             self._fail(plan, f"SCHED row for a slot that is not admitted: {slots[~self.admitted[slots]].tolist()}")
         k = self.k
@@ -150,6 +152,8 @@ class FakeChecks:
             return e, e, e, np.zeros(0, bool)
         if len(set(slots.tolist())) != n:
             self._fail(plan, "a slot appears twice in SCHED")
+        if (slots < 1).any() or (slots > self.pools.max_num_seqs).any():
+            self._fail(plan, f"SCHED row for a slot that is not admitted: {slots.tolist()}")
         if not self.admitted[slots].all():
             self._fail(plan, f"SCHED row for a slot that is not admitted: {slots[~self.admitted[slots]].tolist()}")
         k = self.k
