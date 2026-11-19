@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import os
+import shutil
+import stat
 import sys
+import tempfile
 
 import pytest
 
@@ -18,6 +22,61 @@ def pytest_configure(config) -> None:
     from llm_mini_infer.runner.cuda import sync_check
 
     sync_check.DEFAULT = os.environ.get(SYNC_CHECK_ENV, "error")
+    _servers_root()
+
+
+def _servers_root() -> None:
+    """The servers' socket directories and pixel arenas go to a root of the tests' own (`llm_mini_infer.leftovers`,
+    TEST_ROOT_ENV), never to /tmp or /dev/shm, where a starting server removes a killed one's files: no test sweeps the
+    files of a server it did not start (another session's, a developer's). Set before the session's hooks and every
+    test, and inherited by xdist's workers and the servers. One per user, kept between sessions, so a killed session's
+    files are the next one's to sweep; its `shm` is a folder in /dev/shm where the host has one, so the arenas stay in
+    shared memory as a server's do. A value already set is used as given."""
+    from llm_mini_infer import leftovers
+
+    if os.environ.get(leftovers.TEST_ROOT_ENV):
+        return
+    name = f"llm-mini-tests-{os.getuid()}"
+    root = os.path.join(leftovers.tmp_root(), name)  # /tmp: a socket's path holds about 104 bytes
+    _own_folder(root)
+    if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK):
+        shm, link = os.path.join("/dev/shm", name), os.path.join(root, "shm")
+        _own_folder(shm)
+        with contextlib.suppress(FileExistsError):
+            os.symlink(shm, link)
+        if not os.path.islink(link) or os.readlink(link) != shm:
+            raise pytest.UsageError(f"{link} is not a link to {shm}: remove it, or set {leftovers.TEST_ROOT_ENV}")
+    os.environ[leftovers.TEST_ROOT_ENV] = root
+
+
+def _own_folder(path: str) -> None:
+    """`path`, made private when missing; refused unless it is a folder of this user's (another user could make it
+    first in a shared /tmp)."""
+    with contextlib.suppress(FileExistsError):
+        os.mkdir(path, 0o700)
+    st = os.lstat(path)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        raise pytest.UsageError(f"{path} is not a folder of this user's (uid {st.st_uid}), and the test servers' files "
+                                "need one: remove it, or set LLM_MINI_INFER_TEST_TMP")
+
+
+@pytest.fixture
+def private_tmp(monkeypatch):
+    """A root of this test's own for the servers' socket directories and arenas (`_servers_root`), set for the test and
+    the servers it starts, so that no other test's server sweeps what a killed one left before the test looks; with
+    an `shm` folder (in /dev/shm) where the session's root has one. Removed at the end."""
+    from llm_mini_infer import leftovers
+
+    session = os.environ[leftovers.TEST_ROOT_ENV]
+    root = tempfile.mkdtemp(prefix="t-", dir=session)
+    made = [root]
+    if os.path.isdir(os.path.join(session, "shm")):
+        made.append(tempfile.mkdtemp(prefix="t-", dir=os.path.join(session, "shm")))
+        os.symlink(made[-1], os.path.join(root, "shm"))
+    monkeypatch.setenv(leftovers.TEST_ROOT_ENV, root)
+    yield root
+    for path in made:
+        shutil.rmtree(path, ignore_errors=True)
 
 
 try:

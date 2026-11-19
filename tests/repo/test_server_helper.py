@@ -38,13 +38,13 @@ signal.alarm(60)
 how, port = sys.argv[1].split("+"), int(sys.argv[2])
 child = subprocess.Popen([sys.executable, "-c", CHILD])  # in its group, as an engine is
 print("child", child.pid, flush=True)
-if "arena" in how:  # what a launcher with images makes, as it makes them (launcher._start_images)
+if "arena" in how:  # what a launcher with images makes, as it makes them (launcher.serve, launcher._start_images)
     from llm_mini_infer.engine import ipc
     from llm_mini_infer.vision import arena
 
-    ipc_path = ipc.ipc_dir()
+    ipc_path, lock = ipc.locked_dir()  # the locks held until it exits (llm_mini_infer.leftovers)
     pixels = arena.arena_path(arena.default_dir(ipc_path), f"{os.getpid()}-{os.path.basename(ipc_path)}")
-    arena.create(pixels, 4096)
+    pixels_lock = arena.create_locked(pixels, 4096)
     print("arena", ipc_path, pixels, flush=True)
 if "exit" in how:
     sys.exit(3)
@@ -145,8 +145,9 @@ def assert_gone(srv: StandIn, child: int, servers: Path) -> None:
 
 
 @pytest.fixture(autouse=True)
-def servers(tmp_path, monkeypatch) -> Path:
-    """Each test's own registry and PID files' folder: its sweeps see no other test's server, nor another session's.
+def servers(tmp_path, monkeypatch, private_tmp) -> Path:
+    """Each test's own registry and PID files' folder, and root for the servers' files (`private_tmp`): its sweeps see
+    no other test's server, nor another session's, and no other test's server removes what a killed stand-in left.
     What a failing test left is swept after it."""
     folder = tmp_path / "servers"
     monkeypatch.setenv(api_util.SERVERS_ENV, str(folder))

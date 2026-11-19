@@ -15,6 +15,7 @@ Arrays handed to `encode` must not be modified afterwards: ZMQ may still be send
 from __future__ import annotations
 
 import os
+import shutil
 from collections.abc import Sequence
 from typing import Any
 
@@ -22,6 +23,7 @@ import msgspec
 import numpy as np
 import zmq
 
+from .. import leftovers
 from .messages import MESSAGE_TYPES
 
 _EXT_RAW = 1
@@ -90,11 +92,22 @@ class Decoder:
 
 
 def ipc_dir(base: str | None = None) -> str:
-    """A short private directory for the `ipc://` socket files (sun_path is limited to about 104 bytes)."""
+    """A short private directory for the `ipc://` socket files (sun_path is limited to about 104 bytes), in /tmp
+    (`leftovers.tmp_root`) unless `base` names another."""
     import tempfile
 
-    path = tempfile.mkdtemp(prefix="llm-mini-infer-", dir=base or ("/tmp" if os.path.isdir("/tmp") else None))
-    return path
+    return tempfile.mkdtemp(prefix=leftovers.PREFIX, dir=base or leftovers.tmp_root())
+
+
+def locked_dir() -> tuple[str, int]:
+    """The launcher's socket directory: an `ipc_dir` with its lock file, locked (`leftovers`). Its path and the lock's
+    descriptor: close it once the directory is removed."""
+    path = ipc_dir()
+    try:
+        return path, leftovers.locked_file(os.path.join(path, leftovers.LOCK_FILE))
+    except BaseException:
+        shutil.rmtree(path, ignore_errors=True)
+        raise
 
 
 def engine_input_addr(path: str) -> str:

@@ -12,7 +12,7 @@ The image is `ghcr.io/deftinfer/llm-mini-infer:0.8.0` ([tags](development.md#bui
 
 The image runs as the user `llm-mini-infer` (uid 10001), listens on port 8000, and keeps its caches and downloads in `/cache`. Its entrypoint runs `serve` (the default: `llm-mini-infer serve` with `$LLM_MINI_INFER_CONFIG` and the further arguments), `hostcheck` ([the host check](#the-host-check)), or any other command as given.
 
-Before the server starts, `serve` checks the configuration, the model (a mounted `config.json`, or a repo id that it downloads into a writable cache) and `/dev/shm`. A failed check exits 2 with a message that tells what to fix.
+Before the server starts, `serve` checks the configuration, the model (a mounted `config.json`, or a repo id that it downloads into a writable cache) and `/dev/shm`. A failed check exits 2 with a message that tells what to fix. A server that was killed (SIGKILL, the OOM killer) leaves its pixel arena in `/dev/shm`, which a pod keeps across a container's restart, and its socket directory in `/tmp`: the next start removes both before its checks.
 
 **Requirements:** those of the [quickstart](../README.md#quickstart), and 2 GB of `/dev/shm` (Docker's default is 64 MB).
 

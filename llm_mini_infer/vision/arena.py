@@ -1,11 +1,12 @@
 """The pixel arena: one shared-memory file for every image's uint8 pixels, which never travel over ZMQ
 (architecture.md, "Frontend and engine messages").
 
-- **Who maps it:** the launcher creates it (`create`), the image pool's workers write the pixels of their jobs into it,
-  and the engine reads them when it encodes an image (`map_readonly`). The frontends never map it: each one owns a
-  fixed partition and allocates byte ranges there (`Allocator`), passing the offsets around.
+- **Who maps it:** the launcher creates it (`create_locked`), the image pool's workers write the pixels of their jobs
+  into it, and the engine reads them when it encodes an image (`map_readonly`). The frontends never map it: each one
+  owns a fixed partition and allocates byte ranges there (`Allocator`), passing the offsets around.
 - **Where:** `/dev/shm` when it exists and is writable (tmpfs), else the server's private IPC directory. The file is
-  unlinked when the launcher stops.
+  unlinked when the launcher stops, and a killed launcher's when the next server starts (`leftovers`): the launcher
+  holds a lock on it meanwhile.
 - **Lifetime of a range:** the frontend allocates it before it submits the pool job and frees it once the engine says
   the request no longer needs its pixels (`StepOutputs.released`: after the request left the engine and every step
   launched until then completed; an encoder-cache eviction or a preemption may need the pixels again before that), or
@@ -22,11 +23,13 @@ import mmap
 import os
 from pathlib import Path
 
+from .. import leftovers
+
 ALIGN = 4096  # ranges start on page boundaries: a worker's write never shares a page with another range
 
 
 def default_dir(ipc_dir: str) -> str:
-    return "/dev/shm" if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK) else ipc_dir
+    return leftovers.shm_root() or ipc_dir
 
 
 def create(path: str, size: int) -> None:
@@ -34,14 +37,31 @@ def create(path: str, size: int) -> None:
     pre-populated mapping never takes a page fault on a pixel read."""
     fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
     try:
-        os.ftruncate(fd, size)
-        if hasattr(os, "posix_fallocate"):
-            try:
-                os.posix_fallocate(fd, 0, size)
-            except OSError as exc:  # e.g. /dev/shm smaller than the arena: fail now, not on the 100th image
-                raise OSError(f"cannot allocate the {size >> 20} MiB pixel arena at {path}: {exc}") from exc
+        _allocate(fd, path, size)
     finally:
         os.close(fd)
+
+
+def create_locked(path: str, size: int) -> int:
+    """The launcher's arena: created as `create` does, but locked from the moment it appears (`leftovers.locked_file`).
+    The lock's descriptor: close it once the file is removed. A failure removes the file."""
+    fd = leftovers.locked_file(path)
+    try:
+        _allocate(fd, path, size)
+    except BaseException:
+        remove(path)
+        os.close(fd)
+        raise
+    return fd
+
+
+def _allocate(fd: int, path: str, size: int) -> None:
+    os.ftruncate(fd, size)
+    if hasattr(os, "posix_fallocate"):
+        try:
+            os.posix_fallocate(fd, 0, size)
+        except OSError as exc:  # e.g. /dev/shm smaller than the arena: fail now, not on the 100th image
+            raise OSError(f"cannot allocate the {size >> 20} MiB pixel arena at {path}: {exc}") from exc
 
 
 def remove(path: str) -> None:
@@ -122,4 +142,4 @@ class Allocator:
 
 
 def arena_path(directory: str, tag: str) -> str:
-    return str(Path(directory) / f"llm-mini-infer-{tag}-pixels")
+    return str(Path(directory) / f"{leftovers.PREFIX}{tag}{leftovers.ARENA_SUFFIX}")

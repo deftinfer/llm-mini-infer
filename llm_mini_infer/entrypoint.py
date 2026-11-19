@@ -9,9 +9,10 @@
 **serve** (default) reads `$LLM_MINI_INFER_CONFIG` (default `/etc/llm-mini-infer/config.yaml`) with the extra arguments,
 which are `llm-mini-infer serve`'s (`--model`, `--set group.key=value`, ...). It checks the container first: the model
 directory is mounted, or a Hugging Face repo id (the model's or its drafter's) downloads into a writable cache, and
-`/dev/shm` holds the pixel arena. A failed check stops it with a message that names the setting to fix; an unwritable
-compile cache only logs a warning. Then it runs the launcher in this process, which docker's init (`init: true`) or
-an orchestrator's signals: SIGTERM drains (`launcher`), and before the drain starts (a download) it exits at once.
+`/dev/shm` holds the pixel arena, once a killed server's files are removed (`leftovers`). A failed check stops it
+with a message that names the setting to fix; an unwritable compile cache only logs a warning. Then it runs the
+launcher in this process, which docker's init (`init: true`) or an orchestrator's signals: SIGTERM drains
+(`launcher`), and before the drain starts (a download) it exits at once.
 """
 
 from __future__ import annotations
@@ -105,9 +106,11 @@ def main(argv: list[str] | None = None) -> None:
     if cmd == "serve":
         config = os.environ.get("LLM_MINI_INFER_CONFIG", CONFIG)
         log.info("llm-mini-infer %s, configuration %s", os.environ.get("LLM_MINI_INFER_BUILD", "(no build id)"), config)
+        from . import leftovers
         from .launcher import exit_on_stop
 
         exit_on_stop()  # the checks may download
+        leftovers.sweep()  # a killed server's arena, which /dev/shm's check would count (a pod keeps /dev/shm)
         problems = preflight(config, args)
         for p in problems:
             log.error("%s", p)
