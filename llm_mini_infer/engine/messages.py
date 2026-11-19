@@ -71,6 +71,13 @@ class AddRequest(_Msg):
     # steps
     stop_strings: bool = False
     logprobs: int = -1  # its output tokens' logprobs with this many top entries (0..runner.base.MAX_LOGPROBS); -1: none
+    # Penalties (vLLM's; neutral: 1, 0, 0) and the logit bias: distinct token ids, ascending, and their values in
+    # [-100, 100] (at most `sched.plan.MAX_LOGIT_BIAS`); empty: none
+    repetition_penalty: float = 1.0
+    presence_penalty: float = 0.0
+    frequency_penalty: float = 0.0
+    bias_ids: list[int] = []
+    bias_values: list[float] = []
 
 
 class Abort(_Msg):

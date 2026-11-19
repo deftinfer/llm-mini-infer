@@ -31,7 +31,7 @@ from typing import Any
 import msgspec
 import numpy as np
 
-from ..config import Config, tokenizer_eos_token
+from ..config import PENALTIES, Config, tokenizer_eos_token
 from ..engine.core import PHASES
 from ..engine.messages import AddRequest
 from ..grammar import GrammarError, NestingError
@@ -1010,6 +1010,13 @@ class App:
         if lp >= 0 and not self.cfg.server.logprobs:
             raise ApiError(400, "logprobs are off on this server (server.logprobs)", "logprobs")
         d = self.defaults
+        dp = self.cfg.sampling_penalties
+        pen = {f: getattr(req, f) if getattr(req, f) is not None else dp.get(f, v) for f, v in PENALTIES.items()}
+        if not self.cfg.server.penalties:  # its defaults are neutral then (`config.derive`)
+            off = next((f for f, v in PENALTIES.items() if pen[f] != v), "logit_bias" if req.logit_bias else None)
+            if off is not None:
+                raise ApiError(400, "penalties and logit_bias are off on this server (server.penalties)", off)
+        bias = sorted((int(k), v) for k, v in req.logit_bias.items()) if req.logit_bias else []  # distinct (validated)
         max_tokens = min(max_tokens if max_tokens is not None else (d.max_tokens or limit), limit - n)
         stops = [req.stop] if isinstance(req.stop, str) else (req.stop or [])
         stop_ids = req.stop_token_ids or []
@@ -1059,7 +1066,8 @@ class App:
             top_k=top_k if 0 < top_k < self.vocab else 0,  # -1, 0 and the vocabulary or more: off (no filter)
             min_p=req.min_p if req.min_p is not None else d.min_p, seed=sampling_seed(req.seed),
             stop_token_ids=stop_ids, ignore_eos=req.ignore_eos, priority=req.priority, cache_salt=req.cache_salt,
-            t_recv_ns=t_recv, cache_hints=hints, request_id=rid, stop_strings=bool(stops), logprobs=lp)
+            t_recv_ns=t_recv, cache_hints=hints, request_id=rid, stop_strings=bool(stops), logprobs=lp, **pen,
+            bias_ids=[t for t, _ in bias], bias_values=[v for _, v in bias])
         add.images = offsets
         return st, add
 

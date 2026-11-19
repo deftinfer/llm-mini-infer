@@ -15,6 +15,7 @@ import pytest
 
 from llm_mini_infer.api.app import tally_for
 from llm_mini_infer.api.engine_client import sampling_temperature
+from llm_mini_infer.api.protocol import ApiError, decode_chat, validate_chat
 from llm_mini_infer.engine.core import PHASES
 from llm_mini_infer.metrics import Metrics
 from llm_mini_infer.runner.base import UNION_BUCKETS
@@ -37,7 +38,8 @@ def server(tmp_path_factory):
     model = require_qwen()
     pred = Predictor(model)
     prompt = pred.prompt(MSG, **KW)
-    srv = Server(model, tmp_path_factory.mktemp("srv"), eos=[(EOS_SEED, len(prompt) + 3)])
+    srv = Server(model, tmp_path_factory.mktemp("srv"), eos=[(EOS_SEED, len(prompt) + 3)],
+                 extra={"server": {"penalties": True}})  # the fake runner takes them and ignores them
     srv.start()
     srv.pred, srv.prompt_ids = pred, prompt
     yield srv
@@ -199,9 +201,9 @@ def test_stop_token_ids(server) -> None:
 
 BAD = [
     ({"foo": 1}, 400), ({"n": 2}, 400), ({"logprobs": True, "top_logprobs": 21}, 400),
-    ({"frequency_penalty": 0.5}, 400), ({"presence_penalty": 1.0}, 400), ({"repetition_penalty": 1.1}, 400),
     ({"top_logprobs": 2}, 400),
-    ({"logit_bias": {"1": 2.0}}, 400), ({"tool_choice": "required"}, 400), ({"min_tokens": 5}, 400),
+    ({"presence_penalty": 2.5}, 400), ({"repetition_penalty": 0}, 400), ({"logit_bias": {"x": 1}}, 400),
+    ({"tool_choice": "required"}, 400), ({"min_tokens": 5}, 400),
     ({"tool_choice": "auto"}, 400), ({"tools": []}, 400), ({"tools": [], "tool_choice": "none"}, 400),
     ({"tools": [{"type": "function", "function": {"parameters": {}}}]}, 400),
     ({"response_format": {"type": "json_schema"}}, 400), ({"response_format": {"type": "structural_tag"}}, 400),
@@ -349,6 +351,133 @@ def test_known_fields_at_defaults_are_accepted(server) -> None:
     assert body["usage"]["completion_tokens"] == 2
     code, body = server.post("/v1/chat/completions", chat(max_tokens=2, model=""))  # an empty name is the served model
     assert code == 200, body
+
+
+def test_the_sampling_fields_are_accepted(server) -> None:
+    for extra in ({"presence_penalty": -2}, {"presence_penalty": 2}, {"frequency_penalty": -2.0},
+                  {"frequency_penalty": 2.0}, {"frequency_penalty": 0.5, "presence_penalty": 1.0},
+                  {"repetition_penalty": 0.5}, {"repetition_penalty": 1.5}, {"repetition_penalty": 1e-30},
+                  {"presence_penalty": None, "frequency_penalty": None, "repetition_penalty": None},
+                  {"logit_bias": {"1": 2.0, "+5": -3, " 7 ": 100, "05": 1, "5": 2}},
+                  {"logit_bias": {"3": 1000, "4": -1000}}, {"logit_bias": {}}, {"logit_bias": None},
+                  {"logit_bias": {str(i): 1.0 for i in range(1024)}}):
+        code, body = server.post("/v1/chat/completions", chat(max_tokens=2, **extra))
+        assert code == 200, (extra, body)
+
+
+def test_penalties_off_are_a_400(tmp_path) -> None:
+    """server.penalties off (the default): a penalty at a value that is not neutral or a logit bias is a 400 naming the
+    setting, after the request's checks; neutral values and an empty bias pass, as before the fields were supported."""
+    with Server(require_qwen(), tmp_path).start() as srv:
+        for extra in ({"presence_penalty": 0, "frequency_penalty": 0.0, "repetition_penalty": 1}, {"logit_bias": {}},
+                      {"presence_penalty": None, "logit_bias": None}):
+            code, body = srv.post("/v1/chat/completions", chat(max_tokens=2, **extra))
+            assert code == 200, (extra, body)
+        for extra, param in (({"repetition_penalty": 1.1}, "repetition_penalty"),
+                             ({"presence_penalty": 0.5}, "presence_penalty"),
+                             ({"frequency_penalty": -0.5}, "frequency_penalty"),
+                             ({"logit_bias": {"7": 1}}, "logit_bias"),
+                             ({"presence_penalty": 1, "logit_bias": {"7": 1}}, "presence_penalty")):
+            code, body = srv.post("/v1/chat/completions", chat(max_tokens=2, **extra))
+            assert code == 400 and body["error"] == {
+                "message": "penalties and logit_bias are off on this server (server.penalties)",
+                "type": "BadRequestError", "param": param, "code": 400}, (extra, body)
+        code, body = srv.post("/v1/chat/completions", chat(max_tokens=2, presence_penalty=3))  # its check comes first
+        assert code == 400 and body["error"]["message"] == "presence_penalty must be in [-2, 2], got 3.0.", body
+
+
+# The checks without the server: the decoded request and `validate_chat`, as the frontend runs them
+MSGS = [{"role": "user", "content": "hi"}]
+
+
+def checked_request(body: dict, vocab: int = VOCAB):
+    req = decode_chat(json.dumps({"messages": MSGS, **body}).encode())
+    validate_chat(req, vocab)
+    return req
+
+
+def refusal(body: dict, vocab: int = VOCAB) -> ApiError:
+    with pytest.raises(ApiError) as exc:
+        checked_request(body, vocab)
+    assert exc.value.status == 400
+    return exc.value
+
+
+SAMPLING_REFUSALS = [
+    ({"presence_penalty": 2.5}, None, "presence_penalty must be in [-2, 2], got 2.5."),
+    ({"presence_penalty": -2.5}, None, "presence_penalty must be in [-2, 2], got -2.5."),
+    ({"frequency_penalty": -2.1}, None, "frequency_penalty must be in [-2, 2], got -2.1."),
+    ({"frequency_penalty": 3}, None, "frequency_penalty must be in [-2, 2], got 3.0."),
+    ({"repetition_penalty": 0}, None, "repetition_penalty must be greater than zero, got 0.0."),
+    ({"repetition_penalty": -1}, None, "repetition_penalty must be greater than zero, got -1.0."),
+    ({"repetition_penalty": 1e-400}, None, "repetition_penalty must be greater than zero, got 0.0."),
+    ({"repetition_penalty": 1e-40}, None, "repetition_penalty must be a normal float32 number (from 1.1754944e-38 "
+                                          "to 3.4028235e+38), got 1e-40."),
+    ({"repetition_penalty": 1e39}, None, "repetition_penalty must be a normal float32 number (from 1.1754944e-38 "
+                                         "to 3.4028235e+38), got 1e+39."),
+    ({"logit_bias": {"x": 1, "3": 1, "1.5": 2}}, "logit_bias",
+     "logit_bias contains key(s) that cannot be converted to integer token IDs: ['x', '1.5'] "
+     "(parameter=logit_bias, value=['x', '1.5'])"),
+    ({"logit_bias": {"": 1}}, "logit_bias", "logit_bias contains key(s) that cannot be converted to integer token IDs: "
+                                            "[''] (parameter=logit_bias, value=[''])"),
+    ({"logit_bias": {"1": 1, str(VOCAB): 1, "-1": 1}}, "logit_bias",
+     f"token_id(s) [{VOCAB}, -1] in logit_bias contain out-of-vocab token ids. Vocabulary size: {VOCAB} "
+     f"(parameter=logit_bias, value=[{VOCAB}, -1])"),
+    ({"logit_bias": {"-1": 1}}, "logit_bias", f"token_id(s) [-1] in logit_bias contain out-of-vocab token ids. "
+                                              f"Vocabulary size: {VOCAB} (parameter=logit_bias, value=[-1])"),
+    ({"logit_bias": {str(i): 1 for i in range(1025)}}, "logit_bias",
+     "Too many logit bias tokens: 1025. The max size is 1024."),
+    # the order: the penalties before temperature; the keys before the penalties; the vocabulary before stop_token_ids
+    ({"presence_penalty": 3, "temperature": 3}, None, "presence_penalty must be in [-2, 2], got 3.0."),
+    ({"presence_penalty": 3, "frequency_penalty": 3}, None, "presence_penalty must be in [-2, 2], got 3.0."),
+    ({"frequency_penalty": 3, "repetition_penalty": 0}, None, "frequency_penalty must be in [-2, 2], got 3.0."),
+    ({"logit_bias": {"x": 1}, "presence_penalty": 3}, "logit_bias",
+     "logit_bias contains key(s) that cannot be converted to integer token IDs: ['x'] "
+     "(parameter=logit_bias, value=['x'])"),
+    ({"logit_bias": {str(VOCAB): 1}, "stop_token_ids": [VOCAB + 1]}, "logit_bias",
+     f"token_id(s) [{VOCAB}] in logit_bias contain out-of-vocab token ids. Vocabulary size: {VOCAB} "
+     f"(parameter=logit_bias, value=[{VOCAB}])"),
+]
+
+
+@pytest.mark.parametrize(("body", "param", "message"), SAMPLING_REFUSALS,
+                         ids=[json.dumps(r[0])[:40] for r in SAMPLING_REFUSALS])
+def test_the_sampling_fields_refusals(body, param, message) -> None:
+    err = refusal(body)
+    assert (err.param, err.message) == (param, message)
+
+
+def test_the_sampling_fields_refusals_over_http(server) -> None:
+    for extra, param, message in SAMPLING_REFUSALS[:3] + SAMPLING_REFUSALS[9:10]:
+        code, body = server.post("/v1/chat/completions", chat(max_tokens=4, **extra))
+        assert code == 400 and (body["error"]["param"], body["error"]["message"]) == (param, message), body
+
+
+def test_a_penalty_that_is_not_a_number_is_a_400_at_decoding(server) -> None:
+    # msgspec refuses NaN and Infinity (not JSON) and 1e999 (out of range) before `validate_chat`
+    for value in ("NaN", "Infinity", "-Infinity", "1e999", "-1e999"):
+        for field in ("presence_penalty", "frequency_penalty", "repetition_penalty"):
+            raw = b'{"messages": [{"role": "user", "content": "hi"}], "max_tokens": 2, "%s": %s}' % (
+                field.encode(), value.encode())
+            code, body = server.post("/v1/chat/completions", None, raw=raw)
+            assert code == 400 and body["error"]["message"], (field, value, body)
+        with pytest.raises(ApiError) as exc:
+            decode_chat(b'{"messages": [{"role": "user", "content": "hi"}], "presence_penalty": %s}' % value.encode())
+        assert exc.value.status == 400
+
+
+def test_logit_bias_is_converted_in_place() -> None:
+    req = checked_request({"logit_bias": {"+5": 1, " 7 ": 250, "05": -300, "5_0": 2, "3": 0.5, "5": 7, "9": -250}})
+    # ids in first-seen order, each with its last value, clamped to +-100; keys canonical
+    assert req.logit_bias == {"5": 7.0, "7": 100.0, "50": 2.0, "3": 0.5, "9": -100.0}
+    assert list(req.logit_bias) == ["5", "7", "50", "3", "9"]
+    assert checked_request({"logit_bias": {}}).logit_bias == {}
+    assert checked_request({}).logit_bias is None
+    req = checked_request({"presence_penalty": -2, "frequency_penalty": 2, "repetition_penalty": 1.5})
+    assert (req.presence_penalty, req.frequency_penalty, req.repetition_penalty) == (-2, 2, 1.5)
+    req = checked_request({})
+    assert req.presence_penalty is req.frequency_penalty is req.repetition_penalty is None
+    assert len(checked_request({"logit_bias": {str(i): 1 for i in range(1024)}}).logit_bias) == 1024
 
 
 def test_other_error_routes(server) -> None:

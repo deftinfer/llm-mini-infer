@@ -550,7 +550,7 @@ def test_logs_never_carry_request_contents(model, tmp_path) -> None:
                      {"messages": msgs, "max_tokens": 5, "response_format": {
                          "type": "json_schema", "json_schema": {"name": "x", "schema": {"type": secret}}}},  # a 400
                      {"messages": [{"role": secret, "content": secret}]},  # a 400 that quotes the role in its message
-                     {"messages": msgs, "max_tokens": 4, "logit_bias": {"1": 1}, "user": secret}):  # 400
+                     {"messages": msgs, "max_tokens": 4, "min_tokens": 5, "user": secret}):  # 400
             status, _, out = request(srv, {**body, "chat_template_kwargs": KW})
             if status == 200:
                 text = content_of(out) if isinstance(out, list) else out["choices"][0]["message"]["content"]
