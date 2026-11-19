@@ -14,7 +14,7 @@ import pytest
 from llm_mini_infer.runner.base import PlanError
 from llm_mini_infer.sched.plan import SAMPLE, STATE_ZERO, PlanBuilder
 
-from ..support.penalty_cases import REQS, check_oracle, run, seq
+from ..support.penalty_cases import REQS, check_oracle, check_words, run, seq
 from ..support.tiny_gemma import make_tiny_assistant, make_tiny_gemma
 from ..support.tiny_qwen import make_tiny_model
 
@@ -39,11 +39,12 @@ def model_of(kind: str, qwen, gemma):
 
 @pytest.mark.parametrize(("kind", "k"), [("qwen", 0), ("qwen", 3), ("gemma", 0), ("gemma", 2)])
 def test_tokens_are_vllms(kind: str, k: int, qwen, gemma) -> None:
-    """Every request's tokens against the oracle, the forced prefix's tokens counted as output; the requests without
-    terms are those of a runner without the setting."""
+    """Every request's tokens against the oracle, the forced prefix's tokens counted as output, and its slot's words
+    at the end; the requests without terms are those of a runner without the setting."""
     model = model_of(kind, qwen, gemma)
-    out, logits, _ = run(kind, model, REQS, k=k)
+    out, logits, sched = run(kind, model, REQS, k=k, max_num_seqs=8)
     assert check_oracle(REQS, out, logits) > 60
+    assert check_words(REQS, out, sched.final_words) == 5  # each slot's words: its prompt's bits and tokens' counts
     plain = [q for q in REQS if q not in PENALISED]
     off, _, _ = run(kind, model, plain, k=k, penalties=False, hook=False)
     assert {q["rid"]: out[q["rid"]] for q in plain} == off

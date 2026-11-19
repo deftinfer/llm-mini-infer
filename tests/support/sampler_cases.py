@@ -1,4 +1,5 @@
-"""The sampler's fits against its target distribution (tests/runner/test_sampler.py)."""
+"""The sampler's fits against its target distribution (tests/runner/test_sampler.py), and the penalties' and logit
+bias's tables of a step's rows (`terms_tables`: tests/kernels/test_kernels.py)."""
 
 from __future__ import annotations
 
@@ -82,3 +83,48 @@ def assert_fits(tokens: np.ndarray, probs: np.ndarray) -> None:
     exp = np.array([expected[b].sum() for b in bins])
     chi2, df = float(((obs - exp) ** 2 / exp).sum()), len(bins) - 1
     assert chi2 < df + 10 * np.sqrt(2 * df), (chi2, df)
+
+
+def terms_tables(rng: np.random.Generator, n: int, vocab: int, k: int, device: torch.device) -> tuple:
+    """Slots 1 .. n (slot 0: padding) in `runner.cuda.penalties`' layout, a row each: penalties, a bias (up to 1,024
+    entries), both or neither; prompts and outputs with repeats; each row at a verify window position w (0 .. k,
+    k > 0) with k drafts (repeats among them). Returns (tables: `PenaltyTables`' fields, drafts [n + 1, k], w [n])."""
+    from types import SimpleNamespace
+
+    from llm_mini_infer.runner.cuda.penalties import BIASED, TERM_BIAS, TERM_PEN
+    from llm_mini_infer.sched.plan import MAX_LOGIT_BIAS
+
+    s = n + 1
+    cnt = np.zeros((s, vocab), np.uint32)  # the words' bits; viewed as int32 below
+    bid = np.zeros((s, MAX_LOGIT_BIAS), np.int32)
+    bval = np.zeros((s, MAX_LOGIT_BIAS), np.float32)
+    terms = np.zeros(s, np.int32)
+    rep, pres, freq = np.ones(s, np.float32), np.zeros(s, np.float32), np.zeros(s, np.float32)
+    nb = np.zeros(s, np.int32)
+    for i in range(1, s):
+        kind = i % 4  # 0: none, 1: penalties, 2: a bias, 3: both
+        if kind in (1, 3):
+            terms[i] |= TERM_PEN
+            rep[i] = [0.7, 1.3, 2.0, 1.0][(i // 4) % 4]
+            pres[i] = [0.0, 0.5, -1.5, 2.0][(i // 8) % 4]
+            freq[i] = [0.3, -2.0, 1.0, 0.0][(i // 2) % 4]
+            prompt = rng.integers(0, vocab, rng.integers(1, 3000))
+            cnt[i, prompt] |= np.uint32(1 << 31)  # PROMPT
+            outs = rng.integers(0, vocab, rng.integers(0, 400))
+            outs = np.concatenate([outs, np.argsort(-rng.random(vocab))[:20].repeat(5)])  # some tokens many times
+            np.add.at(cnt[i], outs, np.uint32(1))
+        if kind in (2, 3):
+            terms[i] |= TERM_BIAS
+            m = MAX_LOGIT_BIAS if i % 8 == 2 else int(rng.integers(1, 40))
+            ids = np.sort(rng.choice(vocab, m, replace=False))
+            nb[i] = m
+            bid[i, :m], bval[i, :m] = ids, rng.uniform(-100, 100, m).astype(np.float32)
+            cnt[i, ids] |= np.uint32(BIASED)
+    drafts = rng.integers(0, vocab, (s, max(k, 1)))
+    drafts[:, -1] = drafts[:, 0]  # a repeated draft
+    w = rng.integers(0, k + 1, n) if k else np.zeros(n, np.int64)
+    t = lambda a: torch.as_tensor(a, device=device)  # noqa: E731
+    tables = SimpleNamespace(terms=t(terms), rep=t(rep), pres=t(pres), freq=t(freq),
+                             cnt=t(cnt.view(np.int32)), bias_n=t(nb),
+                             bias_id=t(bid), bias_val=t(bval), vocab=vocab)
+    return tables, t(drafts[:, :k] if k else drafts[:, :0]), w

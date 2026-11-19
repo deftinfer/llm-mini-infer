@@ -238,8 +238,8 @@ def sample(logits: torch.Tensor, plan: SamplePlan, temperature: torch.Tensor, to
     for g in plan.groups:
         idx = g.idx
         x = logits.index_select(0, idx) / temperature.index_select(0, idx)[:, None]
-        if clamp_rows is not None:
-            x = torch.where(clamp_rows.index_select(0, idx)[:, None], x.clamp(-F_MAX, F_MAX), x)
+        if clamp_rows is not None:  # an excluded token (masked, padding) stays -inf, as the kernel skips it
+            x = torch.where(clamp_rows.index_select(0, idx)[:, None] & (x != float("-inf")), x.clamp(-F_MAX, F_MAX), x)
         if g.min_p:
             mp = min_p.index_select(0, idx)
             x = x.masked_fill(x < x.amax(-1, keepdim=True) + torch.log(mp)[:, None], float("-inf"))

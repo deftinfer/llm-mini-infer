@@ -1,6 +1,6 @@
-"""The penalties' and logit bias's runs on the tiny models (tests/runner/test_cuda_penalties.py): requests through
-the scheduler and engine loop, each token's logits from the runner's hook, and the oracle, vLLM's terms written from
-its v2 sampler (`vllm_terms`)."""
+"""The penalties' and logit bias's runs on the tiny models (tests/runner/test_cuda_penalties.py,
+tests/runner/test_penalties_gpu.py): requests through the scheduler and engine loop, each token's logits from the
+runner's hook, and the oracle, vLLM's terms written from its v2 sampler (`vllm_terms`)."""
 
 from __future__ import annotations
 
@@ -82,8 +82,11 @@ def run(kind: str, model: Any, reqs: list[dict], *, k: int = 0, penalties: bool 
     rids: list[int] = []
     orig = r.launch_forward
 
+    slot_of: dict[int, int] = {}
+
     def launch(plan: Any, *a: Any, **kw: Any) -> Any:
         rids[:] = [sched.slot_req[s].rid for s in plan.sched_slot.tolist()]
+        slot_of.update({rid: s for rid, s in zip(rids, plan.sched_slot.tolist())})
         return orig(plan, *a, **kw)
 
     def on_logits(chunk: Any) -> None:
@@ -118,6 +121,9 @@ def run(kind: str, model: Any, reqs: list[dict], *, k: int = 0, penalties: bool 
             drain()
     drain()
     assert sched.grammars.errors == 0
+    pen = r.tables.pen
+    # each request's slot words at the end (`final_words`: a slot no later request took holds its request's)
+    sched.final_words = {rid: pen.cnt[s].cpu() for rid, s in slot_of.items()} if pen is not None else {}
     r.shutdown()
     return out, logits, sched
 
@@ -186,4 +192,28 @@ def check_oracle(reqs: list[dict], out: dict, logits: dict, tie: float = 1e-4) -
     return checked
 
 
-__all__ = ["EOS", "REQS", "VOCAB", "add_request", "check_oracle", "run", "seq", "unpack_masks", "vllm_terms"]
+def check_words(reqs: list[dict], out: dict, words: dict, eos: int = EOS) -> int:
+    """Each penalised request's slot words at the end: the prompt bit on its prompt's tokens alone, the bias bit on its
+    bias ids alone, and the count of every token its delivered tokens hold (an EOS aside: the EOS-free finish appends
+    one no sampler drew). Returns how many requests were checked."""
+    from llm_mini_infer.runner.cuda.penalties import BIASED, COUNT
+
+    n = 0
+    for q in reqs:
+        if not (q.get("rep", 1.0) != 1.0 or q.get("pres") or q.get("freq")):
+            continue
+        w = words[q["rid"]]
+        assert sorted(torch.nonzero(w < 0)[:, 0].tolist()) == sorted(set(q["prompt"])), q["rid"]
+        assert sorted(torch.nonzero(w & BIASED)[:, 0].tolist()) == sorted(q.get("bias") or {}), q["rid"]
+        toks = [t for t in out[q["rid"]][0] if t != eos]
+        want = torch.bincount(torch.tensor(toks, dtype=torch.long), minlength=len(w)) if toks else \
+            torch.zeros(len(w), dtype=torch.long)
+        got = (w & COUNT).long()
+        got[eos] = 0
+        assert torch.equal(got, want), (q["rid"], torch.nonzero(got != want)[:, 0].tolist()[:8])
+        n += 1
+    return n
+
+
+__all__ = ["EOS", "REQS", "VOCAB", "add_request", "check_oracle", "check_words", "run", "seq", "unpack_masks",
+           "vllm_terms"]
