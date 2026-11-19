@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import fcntl
 import os
 import shutil
 import stat
@@ -16,6 +17,7 @@ pytest.register_assert_rewrite("tests.support")
 # The CUDA sync check of the runners the suite builds (`llm_mini_infer.runner.cuda.sync_check`): error; this variable
 # set to warn or off for another. A runner on the CPU or the torch references never arms it
 SYNC_CHECK_ENV = "LLM_MINI_INFER_TEST_SYNC_CHECK"
+HELD = "held"  # in a test's private root (`private_tmp`): the lock its test holds while it runs
 
 
 def pytest_configure(config) -> None:
@@ -69,14 +71,45 @@ def private_tmp(monkeypatch):
 
     session = os.environ[leftovers.TEST_ROOT_ENV]
     root = tempfile.mkdtemp(prefix="t-", dir=session)
+    held = leftovers.locked_file(os.path.join(root, HELD))  # a killed session's go at its next start
     made = [root]
-    if os.path.isdir(os.path.join(session, "shm")):
-        made.append(tempfile.mkdtemp(prefix="t-", dir=os.path.join(session, "shm")))
-        os.symlink(made[-1], os.path.join(root, "shm"))
-    monkeypatch.setenv(leftovers.TEST_ROOT_ENV, root)
-    yield root
-    for path in made:
-        shutil.rmtree(path, ignore_errors=True)
+    try:
+        if os.path.isdir(os.path.join(session, "shm")):
+            made.append(tempfile.mkdtemp(prefix="t-", dir=os.path.join(session, "shm")))
+            os.symlink(made[-1], os.path.join(root, "shm"))
+        monkeypatch.setenv(leftovers.TEST_ROOT_ENV, root)
+        yield root
+    finally:
+        for path in made:
+            shutil.rmtree(path, ignore_errors=True)
+        os.close(held)
+
+
+def remove_stale_roots(session: str) -> None:
+    """The private roots (`private_tmp`) in `session` of tests whose pytest process was killed before their teardown,
+    with what their servers left there, an arena in /dev/shm among them: the roots whose lock (HELD) nobody holds. A
+    root whose test runs (another session's), or one without the lock file yet, stays."""
+    try:
+        names = sorted(name for name in os.listdir(session) if name.startswith("t-"))
+    except OSError:
+        return
+    for name in names:
+        root = os.path.join(session, name)
+        try:
+            fd = os.open(os.path.join(root, HELD), os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError:
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            shm = os.path.join(root, "shm")
+            twin = os.readlink(shm) if os.path.islink(shm) else ""
+            if os.path.dirname(twin) == os.path.join(session, "shm") and os.path.basename(twin).startswith("t-"):
+                shutil.rmtree(twin, ignore_errors=True)
+            shutil.rmtree(root, ignore_errors=True)
+        except OSError:  # held: its test runs
+            pass
+        finally:
+            os.close(fd)
 
 
 try:
@@ -153,9 +186,17 @@ def pytest_sessionfinish(session):
 
 def pytest_sessionstart(session) -> None:
     """A session starts without the servers of one that was killed (CI's serial run, after its workers' run hit its
-    limit): in xdist's controller, or a run without xdist, as at the finish below."""
+    limit), then without its tests' private roots (`remove_stale_roots`): in xdist's controller, or a run without
+    xdist, as at the finish below."""
     if not hasattr(session.config, "workerinput"):
         _sweep("sweep_stale", load=True)
+        try:
+            from llm_mini_infer import leftovers
+
+            remove_stale_roots(os.environ[leftovers.TEST_ROOT_ENV])
+        except Exception as e:  # as `_sweep`'s: a warning, never a stop
+            print(f"warning: the tests' private roots' sweep failed: {type(e).__name__}: {e}", file=sys.stderr,
+                  flush=True)
 
 
 @pytest.hookimpl(optionalhook=True)

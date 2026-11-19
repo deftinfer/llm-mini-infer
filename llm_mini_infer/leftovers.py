@@ -132,7 +132,7 @@ def _remove_dir(path: str) -> int | None:
         try:
             if not _ours(f"{path}/{LOCK_FILE}", os.fstat(fd), stat.S_ISREG) or not _unlocked(fd):
                 return None
-            size = sum(e.stat(follow_symlinks=False).st_size for e in os.scandir(dfd))
+            size = _dir_size(dfd)
             if not _same(os.lstat(path), st):
                 return None
             shutil.rmtree(path)
@@ -158,6 +158,16 @@ def _remove_arena(path: str) -> int | None:
         return fst.st_size
     finally:
         os.close(fd)
+
+
+def _dir_size(dfd: int) -> int:
+    """The bytes of the files in the directory open as `dfd` (an orphan may still remove its socket meanwhile)."""
+    size = 0
+    with os.scandir(dfd) as entries:
+        for entry in entries:
+            with contextlib.suppress(FileNotFoundError):
+                size += entry.stat(follow_symlinks=False).st_size
+    return size
 
 
 def _ours(path: str, st: os.stat_result, kind) -> bool:

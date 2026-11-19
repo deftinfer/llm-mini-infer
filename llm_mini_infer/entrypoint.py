@@ -110,7 +110,7 @@ def main(argv: list[str] | None = None) -> None:
         from .launcher import exit_on_stop
 
         exit_on_stop()  # the checks may download
-        leftovers.sweep()  # a killed server's arena, which /dev/shm's check would count (a pod keeps /dev/shm)
+        leftovers.sweep()  # a killed server's arena, which /dev/shm's check would count (the launcher's finds none)
         problems = preflight(config, args)
         for p in problems:
             log.error("%s", p)

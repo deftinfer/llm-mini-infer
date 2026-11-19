@@ -27,6 +27,7 @@ from llm_mini_infer.engine import ipc
 from llm_mini_infer.leftovers import ARENA_SUFFIX, LOCK_FILE, NEW_SUFFIX, PREFIX
 from llm_mini_infer.vision import arena
 
+from ..conftest import HELD, remove_stale_roots
 from ..support.paths import ROOT
 
 LOGGER = "llm_mini_infer.leftovers"
@@ -140,11 +141,11 @@ def _line(proc: subprocess.Popen, timeout: float = 60) -> str:
 
 
 def _entries(root: str) -> set[str]:
-    """Every folder and file under `root`, `shm`'s too, by its path there."""
+    """Every folder and file under `root`, `shm`'s too, by its path there; but `private_tmp`'s lock."""
     out = set()
     for folder, dirs, files in os.walk(root, followlinks=True):
         out.update(os.path.relpath(os.path.join(folder, name), root) for name in dirs + files)
-    return out
+    return out - {HELD}
 
 
 def _free(path: str) -> bool:
@@ -445,7 +446,29 @@ def test_a_killed_holders_lock_is_free_at_once(where, private_tmp) -> None:
         shutil.rmtree(folder, ignore_errors=True)
 
 
-# -- the tests' root ---------------------------------------------------------------------------------------------------
+# -- the tests' roots --------------------------------------------------------------------------------------------------
+
+def test_a_killed_sessions_private_roots_go_at_the_next_start(private_tmp) -> None:
+    """A test's private root (`private_tmp`) whose pytest was killed before the teardown: nobody holds its lock, so
+    the next session's start removes it, with its folder in `shm`; a root whose test runs (its lock held, here by this
+    process) and one without the lock file yet stay."""
+    session = tempfile.mkdtemp(dir=private_tmp)
+    os.mkdir(os.path.join(session, "shm"))
+    dead, live, new = (os.path.join(session, f"t-{name}") for name in ("dead", "live", "new"))
+    twin = os.path.join(session, "shm", "t-twin")
+    for path in (dead, live, new, twin):
+        os.mkdir(path)
+    Path(twin, "arena").write_bytes(b"x")
+    os.symlink(twin, os.path.join(dead, "shm"))
+    os.close(leftovers.locked_file(os.path.join(dead, HELD)))
+    fd = leftovers.locked_file(os.path.join(live, HELD))
+    try:
+        remove_stale_roots(session)
+        assert not os.path.lexists(dead) and not os.path.lexists(twin)
+        assert os.path.isdir(live) and os.path.isdir(new)
+    finally:
+        os.close(fd)
+
 
 def test_the_files_follow_the_tests_root(layout) -> None:
     """The socket directories in it, the arenas in its `shm` where there is one, else in the socket directory."""
