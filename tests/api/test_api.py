@@ -410,7 +410,6 @@ SAMPLING_REFUSALS = [
     ({"frequency_penalty": 3}, None, "frequency_penalty must be in [-2, 2], got 3.0."),
     ({"repetition_penalty": 0}, None, "repetition_penalty must be greater than zero, got 0.0."),
     ({"repetition_penalty": -1}, None, "repetition_penalty must be greater than zero, got -1.0."),
-    ({"repetition_penalty": 1e-400}, None, "repetition_penalty must be greater than zero, got 0.0."),
     ({"repetition_penalty": 1e-40}, None, "repetition_penalty must be a normal float32 number (from 1.1754944e-38 "
                                           "to 3.4028235e+38), got 1e-40."),
     ({"repetition_penalty": 1e39}, None, "repetition_penalty must be a normal float32 number (from 1.1754944e-38 "
@@ -464,6 +463,10 @@ def test_a_penalty_that_is_not_a_number_is_a_400_at_decoding(server) -> None:
         with pytest.raises(ApiError) as exc:
             decode_chat(b'{"messages": [{"role": "user", "content": "hi"}], "presence_penalty": %s}' % value.encode())
         assert exc.value.status == 400
+    # 1e-400 decodes (it underflows to 0.0), then its check refuses it
+    req = decode_chat(b'{"messages": [{"role": "user", "content": "hi"}], "repetition_penalty": 1e-400}')
+    with pytest.raises(ApiError, match=r"repetition_penalty must be greater than zero, got 0\.0\."):
+        validate_chat(req, VOCAB)
 
 
 def test_logit_bias_is_converted_in_place() -> None:
@@ -478,6 +481,51 @@ def test_logit_bias_is_converted_in_place() -> None:
     req = checked_request({})
     assert req.presence_penalty is req.frequency_penalty is req.repetition_penalty is None
     assert len(checked_request({"logit_bias": {str(i): 1 for i in range(1024)}}).logit_bias) == 1024
+
+
+def test_the_request_takes_the_penalties_and_the_bias(tmp_path) -> None:
+    """The frontend's request (`App._chat_request`, after `validate_chat`): an unset penalty takes the server's default
+    (the model's generation_config.json's, `Config.sampling_penalties`), a set one wins (a neutral one included), and
+    the bias goes as ascending ids with clamped values; with server.penalties off such a request is a 400."""
+    import asyncio
+    import shutil
+
+    from llm_mini_infer import config
+    from llm_mini_infer.api.app import App
+    from llm_mini_infer.engine import ipc
+
+    def add_of(app: App, body: dict):
+        req = decode_chat(json.dumps({"messages": MSGS, "max_tokens": 4, **body}).encode())
+        validate_chat(req, app.vocab)
+        return app._chat_request(req, 0, None, "r")[1]
+
+    path = require_qwen()
+    for on in (True, False):
+        cfg = config.derive(config.load(None, {"model.path": str(path), "server.penalties": on}))
+        if on:
+            cfg.sampling_penalties = {"repetition_penalty": 1.05, "presence_penalty": 0.5, "frequency_penalty": 0.0}
+        ipc_dir = ipc.ipc_dir()
+        app = App(cfg, 0, ipc_dir)
+        try:
+            if on:
+                add = add_of(app, {})
+                assert (add.repetition_penalty, add.presence_penalty, add.frequency_penalty) == (1.05, 0.5, 0.0)
+                assert add.bias_ids == [] and add.bias_values == []
+                add = add_of(app, {"repetition_penalty": 1.0, "frequency_penalty": -1.5,
+                                   "logit_bias": {"7": 2, "+3": -150, "11": 0.25}})
+                assert (add.repetition_penalty, add.presence_penalty, add.frequency_penalty) == (1.0, 0.5, -1.5)
+                assert add.bias_ids == [3, 7, 11] and add.bias_values == [-100.0, 2.0, 0.25]
+            else:
+                add = add_of(app, {"repetition_penalty": 1.0, "logit_bias": {}})
+                assert (add.repetition_penalty, add.presence_penalty, add.frequency_penalty) == (1.0, 0.0, 0.0)
+                for body, param in (({"frequency_penalty": 0.1}, "frequency_penalty"),
+                                    ({"logit_bias": {"3": 1}}, "logit_bias")):
+                    with pytest.raises(ApiError) as exc:
+                        add_of(app, body)
+                    assert exc.value.param == param and "server.penalties" in exc.value.message
+        finally:
+            asyncio.run(app.client.close())
+            shutil.rmtree(ipc_dir, ignore_errors=True)
 
 
 def test_other_error_routes(server) -> None:

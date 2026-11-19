@@ -566,8 +566,9 @@ TERMS_COMBOS = [(0.0, 1.0, 0, 0.0), (1.0, 1.0, 0, 0.0), (0.7, 0.8, 20, 0.0), (1.
 def _terms_run(logits, rng, k: int, ids=None, mask=None, mask_row=None, padded=False, reps: int = 8, vocab: int = 0):
     """`TERMS_COMBOS` rows with penalties, a bias (1,024 entries on some), both or neither
     (`sampler_cases.terms_tables`), each at a verify window position (k > 0): the kernel's tokens, statuses and counts
-    after its commit, and the reference's (`apply_terms`, then `sample`; a penalised row's token counted). `vocab`: the
-    tables' (default: the logits' width)."""
+    after it, and the reference's (`apply_terms`, then `sample`). Without a window the samples are committed (no MTP: a
+    penalised row's token counts), with one not (MTP commits after its verification), as the runners call it.
+    `vocab`: the tables' (default: the logits' width)."""
     from llm_mini_infer.runner.cuda.penalties import TERM_PEN
     from llm_mini_infer.runner.cuda.sampler import apply_terms
 
@@ -591,8 +592,8 @@ def _terms_run(logits, rng, k: int, ids=None, mask=None, mask_row=None, padded=F
     before = tables.cnt.clone()
     ops.sample(logits, row_slot=slots, qpos=torch.as_tensor(qpos, device=DEV), temperature=t(temp, np.float32),
                top_p=t(top_p, np.float32), top_k=t(top_k, np.int64), min_p=t(min_p, np.float32),
-               seed=t(seed, np.int64), out=out, status=status, pending=pending, ids=ids, mask=mask, mask_row=mask_row,
-               padded=padded, terms=tables, drafts=drafts if k else None, window=window)
+               seed=t(seed, np.int64), out=out, status=status, pending=None if k else pending, ids=ids, mask=mask,
+               mask_row=mask_row, padded=padded, terms=tables, drafts=drafts if k else None, window=window)
     got_cnt = tables.cnt.clone()
     cols = torch.arange(logits.shape[1], device=DEV) if ids is None else ids.long()
     win = None
@@ -612,7 +613,7 @@ def _terms_run(logits, rng, k: int, ids=None, mask=None, mask_row=None, padded=F
                        torch.as_tensor(top_k, device=DEV), torch.as_tensor(min_p, device=DEV), keys,
                        cols, mask=mask, mask_row=mask_row, adjusted=adj, clamp_rows=flags != 0)
     want_cnt = before.clone()
-    on = ((flags & TERM_PEN) != 0) & (wst == 0)
+    on = ((flags & TERM_PEN) != 0) & (wst == 0) & (k == 0)
     want_cnt.view(-1).index_add_(0, slots * tables.cnt.shape[1] + want, on.to(torch.int32))
     params = (temp, top_p, top_k, min_p, seed, qpos)
     return (out.cpu().numpy(), status.cpu().numpy(), got_cnt), (want.cpu().numpy(), wst.cpu().numpy(), want_cnt), \
@@ -624,7 +625,8 @@ def _terms_run(logits, rng, k: int, ids=None, mask=None, mask_row=None, padded=F
 def test_sampler_with_terms_matches_reference(vocab, k) -> None:
     """Penalties and the logit bias (runner/cuda/penalties.py) at each real vocabulary, on every sampler path, greedy
     included, with a verify window's drafts (k 5): token for token with the reference, the statuses alike, and the
-    commit's counts (a penalised row's token, once). Rows without terms are the kernel's without them."""
+    counts after it (without a window a penalised row's token once; with one none). Rows without terms are the
+    kernel's without them."""
     rng = np.random.default_rng(vocab + k)
     torch.manual_seed(11)
     n = len(TERMS_COMBOS) * 8
@@ -661,10 +663,11 @@ def test_sampler_with_terms_under_masks_and_the_sparse_head(vocab) -> None:
     ids = torch.as_tensor(np.concatenate([union, np.full(pad, -1)]).astype(np.int32), device=DEV)
     rows = torch.as_tensor(np.arange(n) % 2, device=DEV)
     sparse = (torch.randn(n, len(union) + pad, device=DEV) * 4).to(BF).float()
-    (a, sa, ca), (b, sb, cb), _, _ = _terms_run(sparse, np.random.default_rng(3), 0, ids=ids, mask=mask,
-                                                mask_row=rows, padded=True, vocab=vocab)
-    assert sa.tolist() == sb.tolist() and np.array_equal(a, b) and torch.equal(ca, cb)
-    assert np.isin(a, union).all()
+    for k in (0, 5):  # the sparse head under MTP: its columns' tokens against a verify window's drafts
+        (a, sa, ca), (b, sb, cb), _, _ = _terms_run(sparse, np.random.default_rng(3 + k), k, ids=ids, mask=mask,
+                                                    mask_row=rows, padded=True, vocab=vocab)
+        assert sa.tolist() == sb.tolist() and np.array_equal(a, b) and torch.equal(ca, cb)
+        assert np.isin(a, union).all()
 
 
 # temperature, top_p, top_k, min_p: top-k and top-p cuts inside tie groups of thousands, one batch (k <= 2,048) or

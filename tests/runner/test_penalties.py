@@ -27,6 +27,7 @@ from llm_mini_infer.runner.cuda.penalties import (
 )
 from llm_mini_infer.runner.cuda.runner import _Staging, stage_terms
 from llm_mini_infer.runner.cuda.sampler import F_MAX, NONFINITE, apply_terms, plan_sampling, row_keys, sample
+from llm_mini_infer.runner.fake_checks import FakeChecks
 from llm_mini_infer.sched.plan import ADMIT_PENALTIES, MAX_LOGIT_BIAS, SAMPLE, STATE_ZERO, PlanBuilder
 
 from ..support.penalty_cases import vllm_terms
@@ -251,24 +252,105 @@ def test_the_builder_sets_the_flag() -> None:
 def test_the_staging_holds_a_worst_step() -> None:
     """Every slot admitted at once, each penalised with a cached prefix and 1,024 bias entries, beside a full budget of
     a penalised slot's explicit tokens: what `PenaltyTables.staging` reserves holds it."""
-    slots, budget = 4, 64
-    pt, m = PenaltyTables(slots + 1, V, torch.device("cpu")), mirror(slots + 1)
+    slots, budget, vocab = 4, 64, 4096
+    pt, m = PenaltyTables(slots + 1, vocab, torch.device("cpu")), mirror(slots + 1)
     pi, pf, pb = pt.staging(slots + 1, budget)
     st = _Staging(torch.device("cpu"), pi, pf, 8, 4, 4, cap_b=pb)
-    b = PlanBuilder(slots, budget, 4, 1024, vocab=V)
-    ids = list(range(0, 2 * MAX_LOGIT_BIAS, 2))[:MAX_LOGIT_BIAS]
-    ids = [i % V for i in ids]
-    ids = sorted(set(ids))
+    b = PlanBuilder(slots, budget, 4, 1024, vocab=vocab)
+    ids = list(range(0, 2 * MAX_LOGIT_BIAS, 2))
     b.begin()
     for s in range(1, slots + 1):
         b.add_admit(s, s, 3, 0.0, 1.0, 0, 0.0, 5, rep=1.2, prompt_len=200, prompt=np.arange(3, dtype=np.int32),
                     bias_ids=ids, bias_val=[1.0] * len(ids))
-    b.add_explicit_row(1, np.arange(budget, dtype=np.int32) % V, 3, SAMPLE)
+    b.add_explicit_row(1, np.arange(budget, dtype=np.int32), 3, SAMPLE)
     plan = b.finish(1)
     adm = plan.admit_slot.astype(np.int64)
     fx = stage_terms(plan, st, adm, plan.admit_seq_len.astype(np.int64), m, pt, 1024)
-    e = stage_explicit(plan, m, st, V)
+    e = stage_explicit(plan, m, st, vocab)
+    used = (4 * slots + 2 * slots * MAX_LOGIT_BIAS + budget, 3 * slots + slots * MAX_LOGIT_BIAS,
+            slots * pt.words + slots * MAX_LOGIT_BIAS)  # what a step of `slots` admissions takes: within the reserve
+    assert (st.ki, st.kf, st.kb) == used and used <= (pi, pf, pb)
     st.upload(None)
     apply_admit(pt, fx, st)
     apply_explicit(pt, e, st)
-    assert int(pt.bias_n[slots]) == len(ids) and int((pt.cnt[1] < 0).sum()) == budget
+    assert int(pt.bias_n[slots]) == MAX_LOGIT_BIAS and int((pt.cnt[1] < 0).sum()) == budget
+    assert int(((pt.cnt[2] & BIASED) != 0).sum()) == MAX_LOGIT_BIAS
+
+
+def test_the_builder_sets_every_entry() -> None:
+    """A plan's ADMIT terms hold no value left from the buffer's earlier use: the bias arrays as wide as the plan's
+    largest bias, zero past each row's own; the bitsets only with a penalised admission, zero in the others' rows."""
+    b = PlanBuilder(3, 64, 4, 1024, vocab=V)
+    for buf in b._bufs:  # garbage of earlier plans
+        buf.admit_bias_ids.fill(7)
+        buf.admit_bias_val.fill(7.0)
+        buf.admit_prompt_bits.fill(0xFFFFFFFF)
+    b.begin()
+    b.add_admit(1, 1, 0, 0.0, 1.0, 0, 0.0, 5, bias_ids=[2, 4, 6], bias_val=[1.0, 2.0, 3.0])
+    b.add_admit(2, 2, 2, 0.0, 1.0, 0, 0.0, 5, rep=1.3, prompt_len=9, prompt=np.array([5, 40], np.int32),
+                bias_ids=[9], bias_val=[-1.0])
+    b.add_admit(3, 3, 0, 0.0, 1.0, 0, 0.0, 5)
+    p = b.finish(1)
+    assert p.admit_bias_ids.tolist() == [[2, 4, 6], [9, 0, 0], [0, 0, 0]]
+    assert p.admit_bias_val.tolist() == [[1.0, 2.0, 3.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
+    bits = np.unpackbits(p.admit_prompt_bits.view(np.uint8), axis=1, bitorder="little")
+    assert not bits[0].any() and not bits[2].any() and np.flatnonzero(bits[1]).tolist() == [5, 40]
+    b.begin()
+    b.add_admit(1, 1, 0, 0.0, 1.0, 0, 0.0, 5)
+    p = b.finish(2)
+    assert p.admit_bias_ids.shape == (1, 0) and p.admit_prompt_bits.shape == (1, 0)
+
+
+class _Checks(FakeChecks):
+    """`FakeChecks._check_terms` alone: a vocabulary, the setting, and `_fail` raising."""
+
+    def __init__(self, penalties: bool = True) -> None:
+        self.vocab, self.penalties = V, penalties
+
+    def _fail(self, plan, why: str) -> None:
+        raise AssertionError(why)
+
+
+def bad_plans() -> list[tuple[str, object]]:
+    """Plans whose single ADMIT breaks the contract of `sched.plan` (one each), and what both runners say."""
+    out = []
+
+    def make(**kw):
+        b = PlanBuilder(2, 64, 4, 1024, vocab=V)
+        b.begin()
+        b.add_admit(1, 1, kw.pop("seq", 0), 0.0, 1.0, 0, 0.0, 5, **kw)
+        return b.finish(1)
+
+    p = make(bias_ids=[4, 9], bias_val=[1.0, 2.0])
+    p.admit_bias_ids[0, :2] = [9, 4]
+    out.append(("not distinct ascending", p))
+    p = make(bias_ids=[4, V - 1], bias_val=[1.0, 2.0])
+    p.admit_bias_ids[0, 1] = V
+    out.append(("not distinct ascending|in the vocabulary", p))
+    p = make(rep=1.2, prompt_len=4)
+    p.admit_rep[0] = float("nan")
+    out.append(("not finite", p))
+    p = make(rep=1.2, prompt_len=4)
+    p.admit_rep[0] = 0.0
+    out.append(("above 0|not finite", p))
+    out.append(("past its prompt|resumes within its prompt", make(seq=6, rep=1.2, prompt_len=4,
+                                                                    prompt=np.arange(6, dtype=np.int32))))
+    return out
+
+
+@pytest.mark.parametrize("which", range(5))
+def test_plans_breaking_the_terms_contract_are_refused(which: int) -> None:
+    """The fake runner's checks and both CUDA runners' `stage_terms` refuse each broken ADMIT; a runner without the
+    setting refuses any term."""
+    from llm_mini_infer.runner.base import PlanError
+
+    why, plan = bad_plans()[which]
+    with pytest.raises(AssertionError, match=why):
+        _Checks()._check_terms(plan, 0, int(plan.admit_seq_len[0]))
+    pt, st, m = PenaltyTables(3, V, torch.device("cpu")), staging(), mirror(3)
+    with pytest.raises(PlanError):
+        stage_terms(plan, st, plan.admit_slot.astype(np.int64), plan.admit_seq_len.astype(np.int64), m, pt, 1024)
+    with pytest.raises(AssertionError, match="takes none"):
+        _Checks(penalties=False)._check_terms(plan, 0, int(plan.admit_seq_len[0]))
+    with pytest.raises(PlanError, match=r"server\.penalties"):
+        stage_terms(plan, st, plan.admit_slot.astype(np.int64), plan.admit_seq_len.astype(np.int64), m, None, 1024)

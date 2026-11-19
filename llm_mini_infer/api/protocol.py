@@ -5,8 +5,8 @@
 - Fields we know but do not implement are accepted only at their default values (`n=1`, `echo=false`, ...) and are
   a 400 otherwise.
 - **`frequency_penalty`, `presence_penalty`, `repetition_penalty`, `logit_bias`**: vLLM's checks, order, messages and
-  params (`validate_chat`): the penalties' ranges, `logit_bias` keys as integers (`int(key)`; the converted dict, values
-  clamped to [-100, 100], replaces the request's), then its token ids against the vocabulary. Ours: a
+  params (`validate_chat`): `logit_bias` keys as integers (`int(key)`; the converted dict, values clamped to
+  [-100, 100], replaces the request's), the penalties' ranges, then its token ids against the vocabulary. Ours: a
   `repetition_penalty` outside the normal float32 range, and more than `MAX_LOGIT_BIAS` entries.
 - What vLLM refuses too is refused with its message, `(parameter=P, value=V)` suffix and param
   (`validation_error`).

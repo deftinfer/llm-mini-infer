@@ -87,8 +87,9 @@ def assert_fits(tokens: np.ndarray, probs: np.ndarray) -> None:
 
 def terms_tables(rng: np.random.Generator, n: int, vocab: int, k: int, device: torch.device) -> tuple:
     """Slots 1 .. n (slot 0: padding) in `runner.cuda.penalties`' layout, a row each: penalties, a bias (up to 1,024
-    entries), both or neither; prompts and outputs with repeats; each row at a verify window position w (0 .. k,
-    k > 0) with k drafts (repeats among them). Returns (tables: `PenaltyTables`' fields, drafts [n + 1, k], w [n])."""
+    entries), both or neither (on some a repetition penalty at float32's smallest normal: the clamp); prompts and
+    outputs with repeats; each row at a verify window position w (0 .. k, k > 0) with k drafts (repeats among them).
+    Returns (tables: `PenaltyTables`' fields, drafts [n + 1, k], w [n])."""
     from types import SimpleNamespace
 
     from llm_mini_infer.runner.cuda.penalties import BIASED, TERM_BIAS, TERM_PEN
@@ -105,7 +106,7 @@ def terms_tables(rng: np.random.Generator, n: int, vocab: int, k: int, device: t
         kind = i % 4  # 0: none, 1: penalties, 2: a bias, 3: both
         if kind in (1, 3):
             terms[i] |= TERM_PEN
-            rep[i] = [0.7, 1.3, 2.0, 1.0][(i // 4) % 4]
+            rep[i] = [0.7, 1.3, 2.0, 1.0][(i // 4) % 4] if i % 16 != 5 else 1.1754944e-38  # the clamp's rows
             pres[i] = [0.0, 0.5, -1.5, 2.0][(i // 8) % 4]
             freq[i] = [0.3, -2.0, 1.0, 0.0][(i // 2) % 4]
             prompt = rng.integers(0, vocab, rng.integers(1, 3000))
