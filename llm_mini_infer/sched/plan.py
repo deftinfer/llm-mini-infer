@@ -18,6 +18,15 @@ Struct-of-arrays numpy views, handed to the runner by reference. Sections and th
    whose target sample is one of those stop tokens or would put the bonus token at `max_len` or beyond, so such a
    finish is the last token of its step and the committed state never runs past it. A stop token beyond `STOP_W` can
    be overrun: the scheduler drops what follows (`overrun`).
+   **Penalties and the logit bias** (`Capabilities.penalties`; architecture.md, "Sampling"), in plans of a builder
+   made with the vocabulary (`vocab`; otherwise their widths are 0 and every admission is neutral): `admit_rep`,
+   `admit_pres`, `admit_freq` (neutral 1, 0, 0) and `admit_prompt_len`; `ADMIT_PENALTIES` when one of the three is not
+   neutral, and then `admit_prompt_bits` [n, ceil(V / 32)] holds bit t % 32 of word t / 32 for each token t at the
+   positions [0, seq_len) (the cached prefix: never past the prompt, the scheduler caps such a request's match there;
+   zero for the plan's other admissions; width 0 in a plan without a penalised one); `admit_bias_n` entries of
+   `admit_bias_ids` [n, w] (distinct, ascending; w the plan's largest count, the rest zero) and `admit_bias_val`. The
+   runner counts what follows itself: an explicit token at a position below `prompt_len` is a prompt token, any later
+   one (a readmission's recomputed outputs, a forced prefix) and every sample it commits an output token.
 3. **PAGES** `page_slot/page_index/page_id` — set `row[slot][index] = page_id` (set semantics: writing an
    existing entry replaces it). Page 0 is the null page. Rows of different slots may name the same page: shared
    pages hold a cached prefix and are read-only.
@@ -136,12 +145,13 @@ LOGPROBS = 32  # a SAMPLE row whose samples' logprobs the runner returns (above)
 # admit_flags
 ADMIT_LOGPROBS = 1  # the request asks for logprobs (its SAMPLE rows are LOGPROBS)
 ADMIT_CONSTRAINED = 2  # the request has a grammar (its SAMPLE rows are MASKED until it terminates)
-ADMIT_PENALTIES = 4  # reserved: penalties, likewise
+ADMIT_PENALTIES = 4  # a penalty is not neutral: the runner keeps the request's prompt and output counts
 
 CKPT_GRID = 64  # GDN chunk size: mid-chunk checkpoint offsets are multiples of it (where a cut replays its chunks)
 CKPT_END_OF_STEP = -1
 FOLD_ALL = -1  # fold_n: every pending window record
 STOP_W = 8  # admit_stop width: a request's stop tokens the runner knows (more: the scheduler cuts)
+MAX_LOGIT_BIAS = 1024  # admit_bias_ids width: a request's logit_bias entries at most (vLLM's v2 runner's limit)
 
 I32 = np.int32
 
@@ -154,8 +164,10 @@ def reserve_positions(steps_in_flight: int, k: int) -> int:
 
 class StepPlan:
     __slots__ = (
-        "admit_flags", "admit_max_len", "admit_min_p", "admit_rope_off", "admit_seed", "admit_seq_len", "admit_slot",
-        "admit_state_slot", "admit_stop", "admit_temperature", "admit_top_k", "admit_top_p",
+        "admit_bias_ids", "admit_bias_n", "admit_bias_val", "admit_flags", "admit_freq", "admit_max_len", "admit_min_p",
+        "admit_pres", "admit_prompt_bits", "admit_prompt_len", "admit_rep", "admit_rope_off", "admit_seed",
+        "admit_seq_len", "admit_slot", "admit_state_slot", "admit_stop", "admit_temperature", "admit_top_k",
+        "admit_top_p",
         "ckpt_dst", "ckpt_offset", "ckpt_sched",
         "enc_grid", "enc_hw", "enc_key", "enc_pixels", "enc_row0", "enc_rows", "enc_tokens",
         "fold_n", "fold_slot",
@@ -186,6 +198,15 @@ class StepPlan:
     admit_flags: np.ndarray
     admit_max_len: np.ndarray
     admit_stop: np.ndarray
+    # penalties and the logit bias (widths 0 without them)
+    admit_rep: np.ndarray
+    admit_pres: np.ndarray
+    admit_freq: np.ndarray
+    admit_prompt_len: np.ndarray
+    admit_prompt_bits: np.ndarray
+    admit_bias_n: np.ndarray
+    admit_bias_ids: np.ndarray
+    admit_bias_val: np.ndarray
     page_slot: np.ndarray
     page_index: np.ndarray
     page_id: np.ndarray
@@ -258,7 +279,8 @@ class StepPlan:
 
 
 class _Buffers:
-    def __init__(self, max_seqs: int, max_tokens: int, max_pages: int, max_ckpts: int, max_wpages: int = 0):
+    def __init__(self, max_seqs: int, max_tokens: int, max_pages: int, max_ckpts: int, max_wpages: int = 0,
+                 vocab: int = 0):
         s = max_seqs + 1
         self.wpage_slot = np.empty(max_wpages, I32)
         self.wpage_index = np.empty(max_wpages, I32)
@@ -279,6 +301,14 @@ class _Buffers:
         self.admit_flags = np.empty(s, np.uint32)
         self.admit_max_len = np.empty(s, I32)
         self.admit_stop = np.empty((s, STOP_W), I32)
+        self.admit_rep = np.empty(s, np.float32)
+        self.admit_pres = np.empty(s, np.float32)
+        self.admit_freq = np.empty(s, np.float32)
+        self.admit_prompt_len = np.empty(s, I32)
+        self.admit_prompt_bits = np.empty((s, -(-vocab // 32)), np.uint32)  # np.empty: touched by penalised ones only
+        self.admit_bias_n = np.empty(s, I32)
+        self.admit_bias_ids = np.empty((s, MAX_LOGIT_BIAS if vocab else 0), I32)
+        self.admit_bias_val = np.empty((s, MAX_LOGIT_BIAS if vocab else 0), np.float32)
         self.admit_rope_off = np.zeros(s, I32)
         self.page_slot = np.empty(max_pages, I32)
         self.page_index = np.empty(max_pages, I32)
@@ -327,10 +357,11 @@ class PlanBuilder:
     """Builds plans into two alternating buffer sets, the second a margin: the runner reads a plan's arrays only until
     it launches the plan's sampling, which the engine does before it builds the next plan (the contract above).
     `page_size`: the full-attention KV page; `window_page_size` (sliding-window models; 0: `page_size`): the window
-    page; `grid`: the checkpoint grid (`Capabilities.checkpoint_grid`)."""
+    page; `grid`: the checkpoint grid (`Capabilities.checkpoint_grid`); `vocab` (0: none): the vocabulary size of
+    the penalties' and the logit bias's arrays (`Capabilities.penalties`)."""
 
     def __init__(self, max_seqs: int, max_tokens: int, page_size: int, max_model_len: int = 0, mtp_k: int = 0,
-                 window: int = 0, window_page_size: int = 0, grid: int = CKPT_GRID):
+                 window: int = 0, window_page_size: int = 0, grid: int = CKPT_GRID, vocab: int = 0):
         max_pages = page_write_capacity(max_seqs, max_tokens, page_size, max_model_len, reserve_positions(2, mtp_k))
         self.k = mtp_k
         # Checkpoints per step: mid-chunk ones are at most one per `grid` query tokens; every row may add an
@@ -338,7 +369,8 @@ class PlanBuilder:
         max_ckpts = max_tokens // grid + 2 * (max_seqs + 1) + 16
         max_wpages = window_page_write_capacity(max_seqs, max_tokens, window_page_size or page_size, window,
                                                 reserve_positions(2, mtp_k)) if window else 0
-        self._bufs = tuple(_Buffers(max_seqs, max_tokens, max_pages, max_ckpts, max_wpages) for _ in range(2))
+        self.vocab = vocab
+        self._bufs = tuple(_Buffers(max_seqs, max_tokens, max_pages, max_ckpts, max_wpages, vocab) for _ in range(2))
         self._flip = 0
         self.b = self._bufs[0]
         self.n_fold = self.n_free = self.n_admit = self.n_pages = self.n_sched = self.n_tokens = self.n_device = 0
@@ -355,6 +387,7 @@ class PlanBuilder:
         self.max_query_len = 0
         self.emb_on = self.rope_on = False  # the plan has image tokens / M-RoPE rows
         self.enc = []
+        self.max_bias, self.any_pen = 0, False  # the widths of the ADMIT terms' arrays (`finish`)
 
     def add_fold(self, slot: int, n: int) -> None:
         """FOLD: apply the first n pending window records of `slot` to its live state (FOLD_ALL: every one)."""
@@ -367,8 +400,32 @@ class PlanBuilder:
 
     def add_admit(self, slot: int, state_slot: int, seq_len: int, temperature: float, top_p: float, top_k: int,
                   min_p: float, seed: int, flags: int = 0, max_len: int = 1 << 30,
-                  stop: np.ndarray | list[int] = (), rope_off: int = 0) -> None:
+                  stop: np.ndarray | list[int] = (), rope_off: int = 0, rep: float = 1.0, pres: float = 0.0,
+                  freq: float = 0.0, prompt_len: int = 0, prompt: np.ndarray | None = None,
+                  bias_ids: np.ndarray | list[int] = (), bias_val: np.ndarray | list[float] = ()) -> None:
+        """ADMIT. Penalties (not neutral: `ADMIT_PENALTIES` is set here) and the logit bias need a builder made with
+        `vocab`; `prompt`: the request's tokens at positions [0, seq_len), prompt tokens all (their bits)."""
         b, i = self.b, self.n_admit
+        nb = len(bias_ids)
+        pen = rep != 1.0 or pres != 0.0 or freq != 0.0
+        if (pen or nb) and not self.vocab:
+            raise ValueError("penalties or a logit bias in a plan without them (PlanBuilder's vocab)")
+        b.admit_rep[i], b.admit_pres[i], b.admit_freq[i] = rep, pres, freq
+        b.admit_prompt_len[i] = prompt_len
+        b.admit_bias_n[i] = nb
+        if nb:
+            b.admit_bias_ids[i, :nb] = bias_ids
+            b.admit_bias_val[i, :nb] = bias_val
+            self.max_bias = max(self.max_bias, nb)
+        if pen:
+            self.any_pen = True
+            flags |= ADMIT_PENALTIES
+            seen = np.zeros(b.admit_prompt_bits.shape[1] * 32, bool)
+            if seq_len:
+                seen[np.asarray(prompt)[:seq_len]] = True
+            b.admit_prompt_bits[i] = np.packbits(seen, bitorder="little").view("<u4")
+        else:
+            flags &= ~ADMIT_PENALTIES
         b.admit_rope_off[i] = rope_off
         b.admit_max_len[i] = min(max_len, (1 << 31) - 1)
         b.admit_stop[i] = -1
@@ -559,6 +616,19 @@ class PlanBuilder:
         p.admit_flags = b.admit_flags[:na]
         p.admit_max_len = b.admit_max_len[:na]
         p.admit_stop = b.admit_stop[:na]
+        p.admit_rep, p.admit_pres, p.admit_freq = b.admit_rep[:na], b.admit_pres[:na], b.admit_freq[:na]
+        p.admit_prompt_len, p.admit_bias_n = b.admit_prompt_len[:na], b.admit_bias_n[:na]
+        w = self.max_bias  # the arrays' every entry set (plans are compared whole: tests/scripts/plandiff.py)
+        if w:
+            for i in np.flatnonzero(b.admit_bias_n[:na] < w).tolist():
+                b.admit_bias_ids[i, b.admit_bias_n[i]:w] = 0
+                b.admit_bias_val[i, b.admit_bias_n[i]:w] = 0
+        p.admit_bias_ids, p.admit_bias_val = b.admit_bias_ids[:na, :w], b.admit_bias_val[:na, :w]
+        if self.any_pen:
+            b.admit_prompt_bits[:na][(b.admit_flags[:na] & ADMIT_PENALTIES) == 0] = 0
+            p.admit_prompt_bits = b.admit_prompt_bits[:na]
+        else:
+            p.admit_prompt_bits = b.admit_prompt_bits[:na, :0]
         npg = self.n_pages
         p.page_slot = b.page_slot[:npg]
         p.page_index = b.page_index[:npg]

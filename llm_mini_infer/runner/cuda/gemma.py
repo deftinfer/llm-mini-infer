@@ -100,6 +100,7 @@ from .heads import NO_HEADS, VARIANT_HEADS, GrammarSampling, Heads
 from .images import ImageEncoder, VisionOptions
 from .logprobs import CHUNK as LP_CHUNK
 from .logprobs import LogprobsPass
+from .penalties import PenaltyTables, apply_admit, apply_explicit, stage_explicit
 from .runner import (
     _HOOK_CHUNK,
     _LEAD_CYCLES,
@@ -122,8 +123,10 @@ from .runner import (
     plan_bracket,
     require_cuda_device,
     split_step,
+    stage_terms,
     step_rows,
     step_timing,
+    warm_terms,
 )
 from .sampler import draw, host_plan
 
@@ -197,6 +200,7 @@ class _Tables:
         self.min_p = torch.zeros(slots, dtype=torch.float32, device=device)
         self.top_k = torch.zeros(slots, dtype=torch.int64, device=device)
         self.seed = torch.zeros(slots, dtype=torch.int64, device=device)
+        self.pen: PenaltyTables | None = None  # penalties and the logit bias (`runner.cuda.penalties`), when on
         self.k = k
         if k:  # MTP: the drafts each slot's next decode row verifies, and the commit limits (ADMIT)
             self.drafts = torch.zeros((slots, k), dtype=torch.int64, device=device)
@@ -209,6 +213,8 @@ class _Tables:
         self.seq_len.zero_()
         self.pending.fill_(-1)
         self.temperature.zero_()
+        if self.pen is not None:
+            self.pen.reset()
         if self.k:
             self.drafts.zero_()
             self.stop.fill_(-1)
@@ -229,11 +235,14 @@ class _Mirror:
         self.top_k = np.zeros(slots, np.int64)
         self.min_p = np.zeros(slots, np.float32)
         self.lp = np.zeros(slots, bool)  # admitted with ADMIT_LOGPROBS
+        self.terms = np.zeros(slots, np.int32)  # penalties and the logit bias (`runner.cuda.penalties`)
+        self.prompt_len = np.zeros(slots, np.int64)
 
 
 class _Effects:
-    __slots__ = ("n_admit", "n_free", "n_kvc", "n_pages", "n_wpages", "o_adm", "o_admseq", "o_f", "o_free", "o_kvc",
-                 "o_maxlen", "o_pid", "o_pidx", "o_pslot", "o_seed", "o_stop", "o_topk", "o_wid", "o_widx", "o_wslot")
+    __slots__ = ("explicit", "n_admit", "n_free", "n_kvc", "n_pages", "n_wpages", "o_adm", "o_admseq", "o_f", "o_free",
+                 "o_kvc", "o_maxlen", "o_pid", "o_pidx", "o_pslot", "o_seed", "o_stop", "o_topk", "o_wid", "o_widx",
+                 "o_wslot", "terms")
 
 
 _EMPTY = np.zeros(0, np.int64)
@@ -277,7 +286,7 @@ class GemmaRunner(Runner):
                  attn512_split_keys: int = 0,
                  head_fixed_m: bool = False, encode_per_image: bool = False, window_split_keys: int = 0,
                  batch_invariant: bool = False, sync_check: str | None = None, memory_history: str | None = None,
-                 logprobs: bool = False):
+                 logprobs: bool = False, penalties: bool = False):
         """`mtp_k` > 0 drafts that many tokens per step with the MTP `assistant` (its checkpoint directory;
         `draft_vocab`, `draft_fp8`: its head, `runner.cuda.draft_head`). `sparse_head`, `sparse_head_rows`,
         `draft_universe`: the grammar-aware heads (`runner.cuda.heads`; with `grammar` only, the universe with MTP).
@@ -291,7 +300,8 @@ class GemmaRunner(Runner):
         final chunks then take their forced prefix whole (the parts above are the runner's; `make_cuda_runner` sets them
         together). `sync_check`: off, warn or error around the step's launches (`runner.cuda.sync_check`; None: its
         default). `memory_history`: a file for the snapshot of an eager tower call after startup (`memory_report`).
-        `logprobs`: takes LOGPROBS rows, its head's logits kept for them (`runner.cuda.logprobs`)."""
+        `logprobs`: takes LOGPROBS rows, its head's logits kept for them (`runner.cuda.logprobs`). `penalties`: takes
+        admissions with penalties and a logit bias (`runner.cuda.penalties`)."""
         if always_split and not grammar:
             raise ValueError("always-split graphs need the grammar masks' split (structured output)")
         self.device = torch.device(device)
@@ -309,6 +319,7 @@ class GemmaRunner(Runner):
         self.window = cfg.sliding_window
         self.S, self.B = max_num_seqs, max_num_batched_tokens
         self.logprobs = logprobs
+        self.penalties = penalties
         self.lp: LogprobsPass | None = None
         if mtp_k and assistant is None:
             raise ValueError("MTP with Gemma 4 needs its assistant model (speculative.model)")
@@ -461,7 +472,7 @@ class GemmaRunner(Runner):
                 precise_step_ms=self.stats.get("precise_step_ms", 0.0), forward_end=self.grammar and self.cuda,
                 sample_step_ms=self.stats.get("sample_step_ms", 0.0),
                 launch_step_ms=self.stats.get("launch_step_ms", 0.0), batch_invariant=self.inv,
-                logprobs=self.logprobs)
+                logprobs=self.logprobs, penalties=self.penalties)
         return self._caps
 
     def attention_counters(self) -> AttentionCounters:
@@ -631,7 +642,7 @@ class GemmaRunner(Runner):
     def _builder(self) -> PlanBuilder:
         pc = self.pc
         return PlanBuilder(pc.max_num_seqs, pc.max_num_batched_tokens, pc.page_size, pc.max_model_len, self.k,
-                           self.window, pc.window_page_size)
+                           self.window, pc.window_page_size, vocab=self.cfg.vocab_size if self.penalties else 0)
 
     def _allocate(self, pc: PoolConfig) -> None:
         if self._allocated:
@@ -677,8 +688,13 @@ class GemmaRunner(Runner):
             n32 += 4 * (tmax + 2)  # the spans' FlashInfer plan
         if self.k:  # the drafter's: a FlashInfer plan and attn512's rows and items (at most 9/5 of a wave and a margin)
             n32 += 8 * (slots + 1) + 4 * (slots + 4 * 1024)
-        self._staging = [_GStaging(dev, cap_i, 3 * slots, slots, self.static.size, self.static.out.numel(), n32=n32,
-                                   px_bytes=self.img.px_bytes if self.mm else 0) for _ in range(2)]
+        cap_f, cap_b = 3 * slots, 0
+        if self.penalties:  # the device tables (`runner.cuda.penalties`), and what a step stages for them
+            self.tables.pen = PenaltyTables(slots, cfg.vocab_size, dev)
+            pi, pf, cap_b = self.tables.pen.staging(slots, tmax)
+            cap_i, cap_f = cap_i + pi, cap_f + pf
+        self._staging = [_GStaging(dev, cap_i, cap_f, slots, self.static.size, self.static.out.numel(), n32=n32,
+                                   px_bytes=self.img.px_bytes if self.mm else 0, cap_b=cap_b) for _ in range(2)]
         self.gs.allocate(pc.max_num_seqs * L)
         self.lp = LogprobsPass(smax, cfg.vocab_size, self.gs.rows if self.gs.sparse else 0, dev) \
             if self.logprobs else None
@@ -800,7 +816,8 @@ class GemmaRunner(Runner):
         rows = [(i + 1, lens[i]) for i in range(n)]
         # with PRECISE rows possible, the first row is one: a step of both paths (the precise prefix)
         plans = [lambda: self._synthetic(b, 1, rows, pages_from=1, params=params[:n], room=room,
-                                         precise=[self.fp8.precise and i == 0 for i in range(n)])]
+                                         precise=[self.fp8.precise and i == 0 for i in range(n)],
+                                         terms=warm_terms(lens) if self.penalties else ())]
         if n * self.L <= budget:  # with grammar masks: the split path (under MTP 1 + k masks per row)
             plans.append(lambda: self._decode_plan(b, 2, [r[0] for r in rows], masked=self.grammar))
             for j in range(len(heads)):  # and each grammar heads' sampling path once (`_run`), a decode step apiece
@@ -882,17 +899,18 @@ class GemmaRunner(Runner):
 
     def _synthetic(self, b: PlanBuilder, step: int, rows: list[tuple[int, int]], *, pages_from: int,
                    free: list[int] = (), params: Any = None, room: int = 0,
-                   precise: bool | list[bool] = False) -> StepPlan:
+                   precise: bool | list[bool] = False, terms: list[dict | None] = ()) -> StepPlan:
         """A plan admitting (slot, prompt length) rows as complete prompts (SAMPLE), each with full and window pages
         for two decode steps after it plus `room` positions (`_page_layout`). `precise`: the rows are PRECISE (one flag
-        per row, or one for all)."""
+        per row, or one for all); `terms`: a row's penalties and logit bias (`warm_terms`)."""
         b.begin()
         for s in free:
             b.add_free(s)
         layout, _ = self._page_layout(rows, pages_from, room)
         for i, ((slot, n), (fp, wp)) in enumerate(zip(rows, layout)):
             p = params[i] if isinstance(params, list) else (params or (0.0, 1.0, 0, 0.0))
-            b.add_admit(slot, slot, 0, p[0], p[1], p[2], p[3], seed=1234 + slot)
+            b.add_admit(slot, slot, 0, p[0], p[1], p[2], p[3], seed=1234 + slot,
+                        **(terms[i] or {} if i < len(terms) else {}))
             b.add_pages(slot, 0, fp)
             b.add_wpages(slot, 0, wp)
             pre = precise[i] if isinstance(precise, list) else precise
@@ -1325,13 +1343,14 @@ class GemmaRunner(Runner):
             if st:
                 sel = s.s_idx[:st]
                 self._sample(hidden, pos.index_select(0, sel), s.s_slot[:st], s.out_tok[:st, 0], s.out_st[:st],
-                             tb.pending, splan, mask=mask, sparse=heads[0])
+                             tb.pending, splan, mask=mask, sparse=heads[0], terms=True)
             tb.seq_len.index_add_(0, r_slot, s.r_nq[:rp])
             return
         sel = s.s_idx[:st]
         spos = pos.index_select(0, sel)
         if st:
-            self._sample(hidden, spos, s.s_slot[:st], s.y[:st], s.y_st[:st], None, splan, mask=mask, sparse=heads[0])
+            self._sample(hidden, spos, s.s_slot[:st], s.y[:st], s.y_st[:st], None, splan, mask=mask, sparse=heads[0],
+                         terms=True, window=(s.tok, sel))
         a, _, _ = mtp_verify(s, tb, r_slot, rp, cr, st, k)
         if cr:
             self._draft(hidden, spos, a, st, cr, mode, lay, dctx, uni=heads[1])
@@ -1394,11 +1413,13 @@ class GemmaRunner(Runner):
     def _sample(self, hidden: torch.Tensor, qpos: torch.Tensor, slots: torch.Tensor, out: torch.Tensor,
                 status: torch.Tensor, pending: torch.Tensor | None, splan: Any,
                 mask: tuple[torch.Tensor, torch.Tensor] | None = None, draft: bool = False, sparse: bool = False,
-                uni: bool = False) -> None:
+                uni: bool = False, terms: bool = False,
+                window: tuple[torch.Tensor, torch.Tensor] | None = None) -> None:
         """One token per row of `hidden` at position qpos + 1 (the sampler keys it there). `draft`: `hidden` is the
         assistant's draft hidden, scored by its head (`DraftHead`, over its token ids), or with `uni` by the universe's
         (`SubsetHead`); `sparse`: the target's head scores this step's union only (`_sparse_logits`), the masks read
-        through its ids. Padded ids (−1) are never drawn (`ops.sample`)."""
+        through its ids. Padded ids (−1) are never drawn (`ops.sample`). `terms`, `window`: the target's penalties and
+        logit bias (`sampler.draw`)."""
         if draft:
             head = self.gs.uni_head if uni else self.draft_head
             ids, padded, logits = head.ids, uni, head.logits(hidden)
@@ -1409,7 +1430,7 @@ class GemmaRunner(Runner):
             ids, padded = None, False
             logits = self.model.logits(hidden, self.lp.dense if self.lp is not None else None)
         draw(logits, ids, padded, cuda=self.cuda, tables=self.tables, slots=slots, qpos=qpos, out=out, status=status,
-             pending=pending, plan=splan, mask=mask, vocab_ids=self._vocab_ids)
+             pending=pending, plan=splan, mask=mask, vocab_ids=self._vocab_ids, terms=terms, window=window)
 
     def _logprobs(self, h: _Handle, lay: _Layout, heads: Heads) -> None:
         """The step's LOGPROBS samples' values, after its sampling on `heads`, from the logits it read
@@ -1477,6 +1498,7 @@ class GemmaRunner(Runner):
     def _stage_effects(self, plan: StepPlan, st: _Staging) -> _Effects:
         m, s_max = self.mirror, self.pc.max_num_seqs
         fx = _Effects()
+        fx.terms = None
         if len(plan.state_copy_src) or len(plan.ckpt_sched):
             raise PlanError(f"step {plan.step_id}: STATE_COPY or CKPT for a sliding-window model (its checkpoints are "
                             "windows in the scheduler)")
@@ -1492,6 +1514,7 @@ class GemmaRunner(Runner):
                 raise PlanError(f"step {plan.step_id}: FREE of a slot that is not admitted: {free.tolist()}")
             m.admitted[free] = m.sampled[free] = m.lp[free] = False
             m.seq_len[free] = m.slack[free] = 0
+            m.terms[free] = 0
             fx.o_free = st.put(free)
         if fx.n_admit:
             seq = plan.admit_seq_len.astype(np.int64)
@@ -1507,6 +1530,7 @@ class GemmaRunner(Runner):
             m.lp[adm] = (plan.admit_flags & ADMIT_LOGPROBS) != 0
             if self.lp is None and m.lp[adm].any():
                 raise PlanError(f"step {plan.step_id}: ADMIT_LOGPROBS, but this runner was built without logprobs")
+            fx.terms = stage_terms(plan, st, adm, seq, m, self.tables.pen, self.pc.max_model_len)
             fx.o_adm, fx.o_admseq = st.put(adm), st.put(seq)
             fx.o_topk = st.put(plan.admit_top_k)
             fx.o_seed = st.put(np.ascontiguousarray(plan.admit_seed).view(np.int64))
@@ -1544,6 +1568,7 @@ class GemmaRunner(Runner):
             if (kv < 1).any() or (kv >= n_arena).any():
                 raise PlanError(f"step {plan.step_id}: KV_COPY page out of range")
             fx.o_kvc = st.put(kv)
+        fx.explicit = stage_explicit(plan, m, st, self.cfg.vocab_size) if self.penalties else None
         return fx
 
     def _apply_effects(self, fx: _Effects, st: _Staging) -> None:
@@ -1576,6 +1601,10 @@ class GemmaRunner(Runner):
         if fx.n_kvc:  # copy-on-write of shared partial pages of either kind: whole arena pages
             n = fx.n_kvc
             self.arena.copy(st.i(fx.o_kvc, n), st.i(fx.o_kvc + n, n))
+        if fx.terms is not None:  # penalties and the logit bias: the admissions' rows, then the explicit rows' tokens
+            apply_admit(t.pen, fx.terms, st)
+        if fx.explicit is not None:
+            apply_explicit(t.pen, fx.explicit, st)
 
     def _layout(self, plan: StepPlan, st: _Staging) -> _Layout:
         """SCHED → this step's row order, tokens, sample tokens and both attentions' metadata (MTP: each row's KV

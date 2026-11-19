@@ -730,7 +730,9 @@ def dequant_fp8(w: torch.Tensor, ws: torch.Tensor, out: torch.Tensor | None = No
 def sample(logits: torch.Tensor, *, row_slot: torch.Tensor, qpos: torch.Tensor, temperature: torch.Tensor,
            top_p: torch.Tensor, top_k: torch.Tensor, min_p: torch.Tensor, seed: torch.Tensor, out: torch.Tensor,
            status: torch.Tensor, pending: torch.Tensor | None = None, ids: torch.Tensor | None = None,
-           mask: torch.Tensor | None = None, mask_row: torch.Tensor | None = None, padded: bool = False) -> None:
+           mask: torch.Tensor | None = None, mask_row: torch.Tensor | None = None, padded: bool = False,
+           terms: Any = None, drafts: torch.Tensor | None = None,
+           window: tuple[torch.Tensor, torch.Tensor] | None = None) -> None:
     """The fused counter-based sampler (CUDA only; the definition and the torch reference are in
     runner/cuda/sampler.py). logits [n, V] fp32; per row: `row_slot` [n] int64 into the per-slot parameter tables
     (temperature, top_p, top_k int64, min_p, seed int64) and `qpos` [n] int64, the position of the row's last query
@@ -745,11 +747,24 @@ def sample(logits: torch.Tensor, *, row_slot: torch.Tensor, qpos: torch.Tensor, 
     `mask` (int32 [m, words], over token ids) and `mask_row` (int64 [n]): grammar masks; row r samples only the
     tokens mask[mask_row[r]] allows (-1: all), column v tested by the bit of its token (ids[v] with `ids`). A row with
     no allowed column (its mask allows none of the columns, or they are all padding) gets token 0 and status 2
-    (MASK_EMPTY); a non-finite logit wins (status 1)."""
+    (MASK_EMPTY); a non-finite logit wins (status 1).
+
+    `terms` (`runner.cuda.penalties.PenaltyTables`): the penalties and logit bias of each row's slot, applied where a
+    logit is read (the reference's `apply_terms`); with `pending`, a penalised row's token counts. `window` (MTP):
+    the static block's tokens and each row's sample token, from which a verify row's drafts before it (`drafts`
+    [slots, k]) count too. None: the kernel without terms."""
     n, v = logits.shape
     if padded and ids is None:
         raise ValueError("padded ids need ids")
+    t = terms
+    if t is None:
+        targs: tuple = (None, None, None, None, None, 0, None, None, None, 0, None, 0, None, None, 0)
+    else:
+        w_tok, w_idx = window if window is not None else (None, None)
+        targs = (_p(t.terms), _p(t.rep), _p(t.pres), _p(t.freq), _p(t.cnt), t.cnt.stride(0), _p(t.bias_n),
+                 _p(t.bias_id), _p(t.bias_val), t.bias_id.stride(0), _p(drafts if window is not None else None),
+                 drafts.shape[1] if window is not None else 0, _p(w_tok), _p(w_idx), int(pending is not None))
     _check(build.load().lmk_sample(_p(logits), logits.stride(0), v, n, _p(row_slot), _p(qpos), _p(temperature),
                                    _p(top_p), _p(top_k), _p(min_p), _p(seed), _p(out), _p(status), _p(pending),
                                    _p(ids), int(padded), _p(mask), mask.stride(0) if mask is not None else 0,
-                                   _p(mask_row), _stream(logits)), "sample")
+                                   _p(mask_row), *targs, _stream(logits)), "sample")

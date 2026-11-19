@@ -373,3 +373,31 @@ def test_derive_mixed_step_row_tokens() -> None:
     assert n == 0 and "no step costs" in why
     # never binding (a full budget next to max_num_seqs rows): off
     assert derive_mixed_step_row_tokens(decode_ms=1000.0, prefill_ms=1.0, **kw)[0] == 0
+
+
+def test_penalties_and_bias_are_checked_at_add() -> None:
+    """A request with penalties or a logit bias is taken only by a scheduler whose runner applies them
+    (`penalties_vocab`), with at most 1,024 distinct, ascending bias ids in the vocabulary and a value each; its other
+    checks still run (an image span outside the prompt, with no encoder here)."""
+    from llm_mini_infer.engine.messages import AddRequest, ImageRef
+
+    def add(s: Scheduler, rid: int, **kw) -> bool:
+        s.add(AddRequest(rid=rid, frontend=0, prompt=np.arange(20, dtype=np.int32), max_tokens=4, temperature=0.0,
+                         top_p=1.0, top_k=0, min_p=0.0, seed=rid, stop_token_ids=[], **kw))
+        return (0, rid) in s.reqs
+
+    def sched(vocab: int) -> Scheduler:
+        return Scheduler(max_num_seqs=4, max_num_batched_tokens=64, max_model_len=256, page_size=4, num_pages=200,
+                         num_state_slots=5, eos_token_ids=(EOS,), penalties_vocab=vocab)
+
+    off, on = sched(0), sched(2048)
+    assert add(off, 0) and add(off, 1, repetition_penalty=1.0, bias_ids=[], bias_values=[])  # neutral
+    assert not add(off, 2, presence_penalty=0.5) and not add(off, 3, bias_ids=[4], bias_values=[1.0])
+    assert add(on, 0, repetition_penalty=1.2, frequency_penalty=-1.0, bias_ids=[0, 4, 2047], bias_values=[1, -2, 3])
+    assert add(on, 1, bias_ids=list(range(1024)), bias_values=[1.0] * 1024)
+    for rid, ids, vals in ((2, [4, 4], [1, 1]), (3, [5, 4], [1, 1]), (4, [2048], [1]), (5, [-1], [1]), (6, [4], []),
+                           (7, list(range(1025)), [1.0] * 1025)):
+        assert not add(on, rid, bias_ids=ids, bias_values=vals), rid
+    image = ImageRef(key=1, offset=30, tokens=4, grid_t=1, grid_h=2, grid_w=8, height=28, width=112, pixels=0)
+    assert not add(on, 8, presence_penalty=0.5, images=[image])  # the image check runs too
+    assert not add(on, 9, images=[image])

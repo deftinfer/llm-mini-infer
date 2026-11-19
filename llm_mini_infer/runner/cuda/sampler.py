@@ -36,6 +36,11 @@ padding column is excluded like a masked token (never sampled, in no filter), bu
 and a row whose columns are all padding is MASK_EMPTY too. Every token a row's mask allows is in the union, so sampling
 the union's columns gives the dense path's tokens and statuses exactly (tests/runner/test_sampler.py).
 
+**Penalties and the logit bias** (`runner.cuda.penalties`, `server.penalties`; vLLM's terms and order): a row with
+terms samples from `y`, its logits after `apply_terms`, in place of the logits everywhere above (greedy included), and
+its `y` and `y / T` are clamped to the finite floats; the non-finite check still reads the raw logits. Rows without
+terms are untouched.
+
 A CUDA runner samples through `draw`: the fused sampler on CUDA, this reference on CPU with a `host_plan`.
 """
 
@@ -54,6 +59,7 @@ NONFINITE = 1  # StepResult.status bit 0
 MASK_EMPTY = 2  # StepResult.status bit 1
 _PLAIN_ROWS = 8  # rows per full-vocabulary noise chunk: 8 × 248k × 8 B = 16 MB per temporary
 U_MAX = 1.0 - 2.0**-24  # the Gumbel uniform's ceiling (`gumbel`): the largest fp32 below 1
+F_MAX = float(np.finfo(np.float32).max)  # a penalised row's logits and x are clamped to [-F_MAX, F_MAX]
 
 
 def _i64(c: int) -> int:
@@ -158,16 +164,59 @@ def unpack_masks(words: torch.Tensor, vocab: int) -> torch.Tensor:
     return bits.reshape(len(words), -1)[:, :vocab].bool()
 
 
+def apply_terms(logits: torch.Tensor, cols: torch.Tensor, terms: torch.Tensor, rep: torch.Tensor, pres: torch.Tensor,
+                freq: torch.Tensor, cnt: torch.Tensor, bias_id: torch.Tensor, bias_val: torch.Tensor,
+                bias_n: torch.Tensor, window: torch.Tensor | None = None) -> torch.Tensor:
+    """The logits of rows with terms after vLLM's bias and penalties (`runner.cuda.penalties`), in fp32 op by op as
+    the kernel computes them, clamped to [-F_MAX, F_MAX]; other rows unchanged (a copy). logits [n, C]; `cols` [C] the
+    columns' token ids (-1: padding, whatever its value); per row: `terms`, `rep`, `pres`, `freq`, the slot's `cnt` row
+    [n, V], its bias table (`bias_id` ascending, `bias_val`, `bias_n`) and `window` [n, k]: the drafts before the row in
+    its verify window (-1: none), each counted once more."""
+    out = logits.clone()
+    rows = torch.nonzero(terms != 0)[:, 0]
+    if not len(rows):
+        return out
+    from .penalties import BIASED, COUNT, TERM_PEN
+
+    y = logits.index_select(0, rows)
+    tok = cols.clamp(min=0)
+    e = cnt.index_select(0, rows).index_select(1, tok)  # [r, C]: the columns' words
+    b = (e & BIASED) != 0
+    if bool(b.any()):
+        bid, bval = bias_id.index_select(0, rows).long(), bias_val.index_select(0, rows)
+        bn = bias_n.index_select(0, rows)
+        big = torch.iinfo(torch.int64).max  # past the entries: never found
+        keys = torch.where(torch.arange(bid.shape[1], device=bid.device)[None, :] < bn[:, None], bid, big)
+        at = torch.searchsorted(keys, tok[None, :].expand(len(rows), -1).contiguous()).clamp(max=bid.shape[1] - 1)
+        y = torch.where(b, y + bval.gather(1, at), y)
+    pen = ((terms.index_select(0, rows) & TERM_PEN) != 0)[:, None]
+    c = e & COUNT
+    if window is not None:
+        c = c + (window.index_select(0, rows)[:, :, None] == tok[None, None, :]).sum(1).to(c.dtype)
+    seen = (e < 0) | (c > 0)
+    r = rep.index_select(0, rows)[:, None]
+    scaled = torch.where(y > 0, y * (1.0 / r), y * r)  # 1 / rep rounded once in fp32, as vLLM's 1.0 / scale
+    y = torch.where(pen & seen, scaled, y)
+    y = torch.where(pen & (c > 0), (y - freq.index_select(0, rows)[:, None] * c.to(y.dtype)) -
+                    pres.index_select(0, rows)[:, None], y)
+    out.index_copy_(0, rows, y.clamp(-F_MAX, F_MAX))
+    return out
+
+
 def sample(logits: torch.Tensor, plan: SamplePlan, temperature: torch.Tensor, top_p: torch.Tensor,
            top_k: torch.Tensor, min_p: torch.Tensor, keys: torch.Tensor, vocab_ids: torch.Tensor,
-           mask: torch.Tensor | None = None, mask_row: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+           mask: torch.Tensor | None = None, mask_row: torch.Tensor | None = None, adjusted: torch.Tensor | None = None,
+           clamp_rows: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
     """logits [n, V] fp32; per-row parameters [n] on the device; keys [n] int64 (`row_keys`); `vocab_ids` [V] int64,
     the token id of each logit column, ascending (`arange(V)`, or a reduced vocabulary: the MTP drafter's head, whose
     noise and tokens are those of the ids), then possibly -1 entries (padding, never sampled: module docstring).
     `mask` int32 [m, W] and `mask_row` int64 [n]: each row's grammar mask over token ids (-1: none). Returns the tokens
     [n] int64 and the status [n] int64 (NONFINITE for rows with a non-finite logit, MASK_EMPTY for rows with no
-    allowed column; their token is 0)."""
+    allowed column; their token is 0). `adjusted` (`apply_terms`): the logits sampled from, in place of `logits`
+    after the non-finite check; `clamp_rows` [n] bool: the rows whose x is clamped to [-F_MAX, F_MAX] (with terms)."""
     status = (~torch.isfinite(logits).all(-1)).to(torch.int64) * NONFINITE
+    if adjusted is not None:
+        logits = adjusted
     real = vocab_ids >= 0
     rows, allowed = None, None
     if mask is not None:
@@ -189,6 +238,8 @@ def sample(logits: torch.Tensor, plan: SamplePlan, temperature: torch.Tensor, to
     for g in plan.groups:
         idx = g.idx
         x = logits.index_select(0, idx) / temperature.index_select(0, idx)[:, None]
+        if clamp_rows is not None:  # an excluded token (masked, padding) stays -inf, as the kernel skips it
+            x = torch.where(clamp_rows.index_select(0, idx)[:, None] & (x != float("-inf")), x.clamp(-F_MAX, F_MAX), x)
         if g.min_p:
             mp = min_p.index_select(0, idx)
             x = x.masked_fill(x < x.amax(-1, keepdim=True) + torch.log(mp)[:, None], float("-inf"))
@@ -220,24 +271,53 @@ def sample(logits: torch.Tensor, plan: SamplePlan, temperature: torch.Tensor, to
 def draw(logits: torch.Tensor, ids: torch.Tensor | None, padded: bool, *, cuda: bool, tables: Any,
          slots: torch.Tensor, qpos: torch.Tensor, out: torch.Tensor, status: torch.Tensor,
          pending: torch.Tensor | None, plan: SamplePlan | None, mask: tuple[torch.Tensor, torch.Tensor] | None,
-         vocab_ids: torch.Tensor) -> None:
+         vocab_ids: torch.Tensor, terms: bool = False, window: tuple[torch.Tensor, torch.Tensor] | None = None) -> None:
     """A CUDA runner's sampling of one token per row of `logits` at position qpos + 1, with the parameters and seed its
     device `tables` keep for each row's slot: the fused sampler on CUDA (`kernels.ops.sample`), the reference with the
     host `plan` on CPU. `ids`: the columns' token ids (None: `vocab_ids`, every id), padded with −1 when `padded`;
     `mask`: (the mask buffer, each row's mask in it or −1). Writes `out`, `status` (NONFINITE, MASK_EMPTY) and, when
-    given, the tokens to `pending[slot]`."""
+    given, the tokens to `pending[slot]`.
+
+    `terms` (the target's samples): the penalties and logit bias of the tables' `pen` (`runner.cuda.penalties`; None:
+    off), and with `pending` (no MTP: the sample is committed) each penalised row's token counts. `window` (MTP): the
+    static block's tokens and each row's sample token (`s_idx`), from which a verify row's place in its window comes:
+    the drafts before it (`tables.drafts`) count for its penalties."""
     tb = tables
     mbuf, mrow = mask if mask is not None else (None, None)
+    pt = tb.pen if terms else None
     if cuda:
         ops.sample(logits, row_slot=slots, qpos=qpos, temperature=tb.temperature, top_p=tb.top_p, top_k=tb.top_k,
                    min_p=tb.min_p, seed=tb.seed, out=out, status=status, pending=pending, ids=ids, mask=mbuf,
-                   mask_row=mrow, padded=padded)
+                   mask_row=mrow, padded=padded, terms=pt, drafts=tb.drafts if window is not None else None,
+                   window=window)
         return
+    cols = vocab_ids if ids is None else ids.long()
+    adj = flags = None
+    if pt is not None:
+        flags = pt.terms.index_select(0, slots)
+        if bool(flags.any()):
+            win = None
+            if window is not None:  # a verify row's sample token w (window token w is its input): drafts 0 .. w − 1
+                tk = window[0].index_select(0, window[1])
+                w = torch.where(tk < 0, -1 - tk, 0)
+                d = tb.drafts.index_select(0, slots)
+                win = torch.where(torch.arange(d.shape[1], device=d.device)[None, :] < w[:, None], d, -1)
+            adj = apply_terms(logits, cols, flags, pt.rep.index_select(0, slots), pt.pres.index_select(0, slots),
+                              pt.freq.index_select(0, slots), pt.cnt.index_select(0, slots),
+                              pt.bias_id.index_select(0, slots), pt.bias_val.index_select(0, slots),
+                              pt.bias_n.index_select(0, slots), win)
+        else:
+            flags = None
     toks, st = sample(logits, plan, tb.temperature.index_select(0, slots), tb.top_p.index_select(0, slots),
                       tb.top_k.index_select(0, slots), tb.min_p.index_select(0, slots),
-                      row_keys(tb.seed.index_select(0, slots), qpos + 1), vocab_ids if ids is None else ids.long(),
-                      mask=mbuf, mask_row=mrow)
+                      row_keys(tb.seed.index_select(0, slots), qpos + 1), cols, mask=mbuf, mask_row=mrow,
+                      adjusted=adj, clamp_rows=flags != 0 if flags is not None else None)
     out.copy_(toks)
     status.copy_(st)
     if pending is not None:
         pending.index_copy_(0, slots, toks)
+        if flags is not None:  # the committed samples of penalised rows count (`runner.cuda.penalties`)
+            from .penalties import TERM_PEN
+
+            on = ((flags & TERM_PEN) != 0) & (st == 0)
+            pt.cnt.view(-1).index_add_(0, slots * pt.vocab + toks, on.to(torch.int32))

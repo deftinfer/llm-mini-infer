@@ -288,9 +288,10 @@ class FakeRunner(FakeChecks, Runner):
                  report_unsampled: bool = False, mask_empty_at: Mapping[int, Iterable[int]] | None = None,
                  nonfinite_once: Iterable[int] = (), batch_invariant: bool = False,
                  exact_cuts: Mapping[int, Iterable[int]] | None = None, full_checks: bool = False,
-                 logprobs: bool = True):
+                 logprobs: bool = True, penalties: bool = True):
         self.vocab = vocab_size
         self.logprobs = logprobs  # takes LOGPROBS rows (module docstring)
+        self.penalties = penalties  # takes penalised and biased admissions, and ignores their terms (module docstring)
         self.full_checks = full_checks  # the reference implementations of the SCHED and KV checks (Validation)
         self.precise_rows = precise_rows  # takes PRECISE rows (the precise prefix; module docstring)
         self.draft_kv = draft_kv  # MTP: the drafter writes KV of its own (module docstring)
@@ -313,7 +314,7 @@ class FakeRunner(FakeChecks, Runner):
                                   bidirectional_images=bidirectional_images, draft_kv=draft_kv,
                                   precise_rows=precise_rows, forward_end=sample_ms > 0,
                                   sample_step_ms=float(sample_ms), batch_invariant=batch_invariant,
-                                  logprobs=logprobs)
+                                  logprobs=logprobs, penalties=penalties)
         # Batch invariance on a GDN model (module docstring, Validation): every prefill cut a whole number of grids from
         # where the prompt's computation started, but at a SAMPLE row, a PRECISE row or one of `exact_cuts` (a
         # request's hints and image cuts, by seed; checked only when given)
@@ -517,6 +518,7 @@ class FakeRunner(FakeChecks, Runner):
             self.lp_slot[slot] = bool(int(plan.admit_flags[i]) & ADMIT_LOGPROBS)
             if self.lp_slot[slot] and not self.logprobs:
                 self._fail(plan, "ADMIT_LOGPROBS, but this runner takes no LOGPROBS rows")
+            self._check_terms(plan, i, h)
             self.drafts[slot] = -1
             self.last_img[slot] = (-1, -1) if h == 0 else (-2, -2)  # a resume's last token: unknown until read
             if h:
@@ -990,9 +992,9 @@ def load_model(seconds: float) -> None:
 
 
 def make_fake_runner(model_dir: str | Path, opts: Any, mtp_k: int = 0, encoder_rows: int = 0,
-                     encoder_budget: int = 0, logprobs: bool = True) -> FakeRunner:
+                     encoder_budget: int = 0, logprobs: bool = True, penalties: bool = True) -> FakeRunner:
     """Build from the model's config.json (geometry), `dev.runner.fake` options, the MTP depth, (images) the encoder
-    cache's rows and the encoder's budget, and whether it takes LOGPROBS rows."""
+    cache's rows and the encoder's budget, and whether it takes LOGPROBS rows and penalties."""
     if opts.load_s:
         load_model(opts.load_s)
     geo = model_geometry(model_dir) if (Path(model_dir) / "config.json").exists() else {}
@@ -1010,4 +1012,5 @@ def make_fake_runner(model_dir: str | Path, opts: Any, mtp_k: int = 0, encoder_r
                       window=geo.get("window", 0), window_kv_bytes_per_token=geo.get("window_kv_bytes_per_token", 0),
                       bidirectional_images=bool(geo.get("bidirectional_images")) and encoder_rows > 0,
                       draft_kv=not geo.get("window"),  # Gemma 4's drafter (its assistant) writes no KV
-                      precise_rows=opts.precise_rows, batch_invariant=opts.batch_invariant, logprobs=logprobs)
+                      precise_rows=opts.precise_rows, batch_invariant=opts.batch_invariant, logprobs=logprobs,
+                      penalties=penalties)

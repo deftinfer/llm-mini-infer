@@ -102,7 +102,7 @@ A deployment sets the rest with `--set`, the chart's `config`, or a file mounted
 | `model.served_model_name` | the path as given | the name that clients send as `model` |
 | `model.max_model_len` | `config.json`'s position limit (8,192 if none) | the context. A derived value is lowered, with a warning, to what the KV pool holds. A set value past the position limit, or that does not fit, stops the startup, naming what fits |
 | `model.chat_template_kwargs` | `{}` | defaults for the chat template's variables |
-| `sampling.temperature`, `top_p`, `top_k`, `min_p` | `generation_config.json`'s, else 1.0, 1.0, 0 (off), 0.0 | defaults for the fields that a request leaves out |
+| `sampling.temperature`, `top_p`, `top_k`, `min_p` | `generation_config.json`'s, else 1.0, 1.0, 0 (off), 0.0 | defaults for the fields that a request leaves out (the file's penalties too, with `server.penalties`) |
 | `sampling.max_tokens` | `generation_config.json`'s `max_new_tokens`, else the room left in the context | the same |
 | `scheduler.max_num_batched_tokens` | 2048 | the tokens of one step: prefill chunks and decode rows |
 | `scheduler.max_num_seqs` | 64 | the requests that run at the same time |
@@ -139,6 +139,7 @@ A deployment sets the rest with `--set`, the chart's `config`, or a file mounted
 | `server.drain_timeout_s` | 30 | then, the time that requests in flight have to complete |
 | `server.request_id_header` | `true` | echo `X-Request-Id` |
 | `server.logprobs` | `false` | answer `logprobs` and `top_logprobs` (off: a 400); the CUDA runner then keeps a buffer of its head's logits for them |
+| `server.penalties` | `false` | answer `frequency_penalty`, `presence_penalty`, `repetition_penalty` and `logit_bias` (off: a 400), and take `generation_config.json`'s penalties as defaults; the CUDA runner then keeps an int32 per sequence slot and token, 69 MB at 64 sequences and Gemma 4's vocabulary (65 MB for Qwen3.8's) |
 | `server.keep_alive_s` | 5 | the idle time of an HTTP connection |
 | `server.stop_with_parent` | `false` | stop as on SIGTERM when the launcher's parent process exits |
 | `engine.watchdog_s` | 60 | stop an engine whose step loop is stuck this long; 0 disables it |

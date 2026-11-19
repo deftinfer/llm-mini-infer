@@ -8,7 +8,18 @@ from collections.abc import Iterable
 
 import numpy as np
 
-from ..sched.plan import CKPT_END_OF_STEP, LOGPROBS, MASKED, MROPE, PRECISE, SAMPLE, STATE_ZERO, StepPlan
+from ..sched.plan import (
+    ADMIT_PENALTIES,
+    CKPT_END_OF_STEP,
+    LOGPROBS,
+    MASKED,
+    MAX_LOGIT_BIAS,
+    MROPE,
+    PRECISE,
+    SAMPLE,
+    STATE_ZERO,
+    StepPlan,
+)
 
 MASK64 = (1 << 64) - 1
 HASH_BASE = 0x100000001B3  # odd: the rolling hash of a prefix (`context_hash`)
@@ -28,6 +39,32 @@ def _first_diff(a: list, b: list) -> int:
 
 class FakeChecks:
     """The plan checks of `FakeRunner`; they report through its `_fail`."""
+
+    def _check_terms(self, plan: StepPlan, i: int, seq_len: int) -> None:
+        """ADMIT `i`'s penalties and logit bias (`sched.plan`): taken only by a runner with them, their arrays as wide
+        as the vocabulary says, the bias ids distinct, ascending and in the vocabulary, the penalties finite (repetition
+        above 0), and a penalised admission resumed within its prompt. The fake's tokens ignore them."""
+        pen = bool(int(plan.admit_flags[i]) & ADMIT_PENALTIES)
+        nb = int(plan.admit_bias_n[i]) if len(plan.admit_bias_n) else 0
+        if not (pen or nb):
+            return
+        if not self.penalties:
+            self._fail(plan, "ADMIT with penalties or a logit bias, but this runner takes none")
+        words = -(-self.vocab // 32)
+        if (pen and plan.admit_prompt_bits.shape[1] != words) or nb > plan.admit_bias_ids.shape[1]:
+            self._fail(plan, f"ADMIT terms' widths {plan.admit_prompt_bits.shape[1:]}, {plan.admit_bias_ids.shape[1:]} "
+                             f"for a vocabulary of {self.vocab} and {nb} bias entries")
+        ids = plan.admit_bias_ids[i, :nb]
+        if not 0 <= nb <= MAX_LOGIT_BIAS or (nb and (ids[0] < 0 or ids[-1] >= self.vocab or
+                                                     (np.diff(ids) <= 0).any())):
+            self._fail(plan, f"ADMIT with a logit bias of {nb} entries that are not distinct ascending ids")
+        terms = (plan.admit_rep[i], plan.admit_pres[i], plan.admit_freq[i])
+        if not np.isfinite(terms).all() or terms[0] <= 0 or (nb and not np.isfinite(plan.admit_bias_val[i, :nb]).all()):
+            self._fail(plan, f"ADMIT with penalties {terms} that are not finite or a repetition penalty not above 0")
+        if pen and not 0 <= seq_len <= plan.admit_prompt_len[i]:
+            self._fail(plan, f"a penalised ADMIT at seq_len {seq_len}, past its prompt of {plan.admit_prompt_len[i]}")
+        if not pen and tuple(terms) != (1.0, 0.0, 0.0):
+            self._fail(plan, f"ADMIT with penalties {terms} but no ADMIT_PENALTIES")
 
     def _check_ckpts(self, plan: StepPlan) -> None:
         if not len(plan.ckpt_sched):

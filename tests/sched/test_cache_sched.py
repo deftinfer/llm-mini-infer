@@ -288,6 +288,41 @@ def test_preempted_request_readmission_hits_its_own_prefix() -> None:
     assert len(readmit) == 1 and readmit[0]["n_query"] == [1] and readmit[0]["state_copy"] == 1
 
 
+def test_a_penalised_readmission_resumes_within_its_prompt() -> None:
+    """The same preemption with penalties: the readmission resumes at its prompt's end at most (43; its outputs are
+    recomputed, and the runner counts them as it goes: `sched.plan`, ADMIT), its ADMIT carrying the bits of the
+    tokens it resumes past and its prompt length. The fake's checks refuse a penalised ADMIT past its prompt."""
+    from llm_mini_infer.sched.plan import ADMIT_PENALTIES
+
+    pen = (1.3, 0.5, 0.0)
+    specs = [Spec(rid=0, prompt_len=0, prompt=stem(7, 43), max_tokens=30, seed=31, priority=5, preempt_at=6,
+                  penalties=pen, bias={3: 2.0}),
+             Spec(rid=1, prompt_len=0, prompt=stem(8, 20), max_tokens=3, seed=32, priority=0, arrive=6)]
+    h = Harness(specs=specs, vocab=VOCAB, max_num_seqs=1, max_tokens=64, page_size=4, num_pages=1 + 40,
+                checkpoint_slots=4, grid=8, max_model_len=128, policy="priority")
+    admits: list[tuple] = []
+    launch = h.runner.launch_forward
+
+    def record(plan):
+        for i in range(len(plan.admit_slot)):
+            admits.append((int(plan.admit_seq_len[i]), int(plan.admit_flags[i]) & ADMIT_PENALTIES,
+                           int(plan.admit_prompt_len[i]), plan.admit_prompt_bits[i].copy(), int(plan.admit_bias_n[i])))
+        return launch(plan)
+
+    h.runner.launch_forward = record
+    h.run(check_every_turn=True)
+    h.check()
+    assert h.sched.num_preemptions == 1
+    first, other, again = admits
+    assert first[:3] == (0, ADMIT_PENALTIES, 43) and not first[3].any() and first[4] == 1
+    assert other[1] == 0 and other[4] == 0
+    seq, flag, plen, bits, nb = again
+    assert flag and plen == 43 and nb == 1 and 0 < seq <= 43
+    want = np.zeros(bits.size * 32, bool)
+    want[stem(7, 43)[:seq]] = True
+    assert np.array_equal(bits, np.packbits(want, bitorder="little").view("<u4"))
+
+
 def test_preemption_mid_prefill_resumes_exactly() -> None:
     """A long prompt prefilled 16 tokens per step is preempted after 48, and a higher-priority request takes its slot.
     Its readmission resumes at 48, from the live state it left as a checkpoint (without it, it would find no

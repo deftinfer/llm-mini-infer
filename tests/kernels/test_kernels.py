@@ -28,6 +28,7 @@ from ..support.sampler_cases import (
     fit_row,
     largest_noise_rows,
     target_distribution,
+    terms_tables,
 )
 
 pytestmark = pytest.mark.gpu(reason="needs a CUDA GPU and the kernel library")
@@ -556,6 +557,117 @@ def test_sampler_with_grammar_masks_matches_reference(vocab) -> None:
     ok = rows >= 0
     ok[3] = False
     assert allowed[rows[ok], a[ok]].all()
+
+
+TERMS_COMBOS = [(0.0, 1.0, 0, 0.0), (1.0, 1.0, 0, 0.0), (0.7, 0.8, 20, 0.0), (1.0, 0.95, 0, 0.0),
+                (1.3, 1.0, 50, 0.05), (1.0, 0.5, 0, 0.1), (0.9, 0.99, 3000, 0.0), (1.0, 1.0, 0, 0.2)]
+
+
+def _terms_run(logits, rng, k: int, ids=None, mask=None, mask_row=None, padded=False, reps: int = 8, vocab: int = 0):
+    """`TERMS_COMBOS` rows with penalties, a bias (1,024 entries on some), both or neither
+    (`sampler_cases.terms_tables`), each at a verify window position (k > 0): the kernel's tokens, statuses and counts
+    after it, and the reference's (`apply_terms`, then `sample`). Without a window the samples are committed (no MTP: a
+    penalised row's token counts), with one not (MTP commits after its verification), as the runners call it.
+    `vocab`: the tables' (default: the logits' width)."""
+    from llm_mini_infer.runner.cuda.penalties import TERM_PEN
+    from llm_mini_infer.runner.cuda.sampler import apply_terms
+
+    n = len(TERMS_COMBOS) * reps
+    vocab = vocab or logits.shape[1]
+    tables, drafts, w = terms_tables(rng, n, vocab, k, DEV)
+    temp, top_p, top_k, min_p = (np.array([c[i] for c in TERMS_COMBOS for _ in range(reps)]) for i in range(4))
+    temp, top_p, min_p, top_k = temp.astype(np.float32), top_p.astype(np.float32), min_p.astype(np.float32), \
+        top_k.astype(np.int64)
+    seed = rng.integers(0, 1 << 62, n).astype(np.int64)
+    qpos = rng.integers(0, 100_000, n).astype(np.int64)
+    slots = torch.arange(1, n + 1, device=DEV)
+    window = None
+    if k:  # the static block's tokens: row r's sample token is window token w[r] (-1 - w), or an explicit one (w 0)
+        w_tok = torch.as_tensor(np.where(w > 0, -1 - w, 5), device=DEV)
+        window = (w_tok, torch.arange(n, device=DEV))
+    t = lambda a, dt: torch.as_tensor(np.concatenate([[0], a]).astype(dt), device=DEV)  # noqa: E731
+    out = torch.zeros(n, dtype=torch.int64, device=DEV)
+    status = torch.zeros(n, dtype=torch.int64, device=DEV)
+    pending = torch.full((n + 1,), -1, dtype=torch.int64, device=DEV)
+    before = tables.cnt.clone()
+    ops.sample(logits, row_slot=slots, qpos=torch.as_tensor(qpos, device=DEV), temperature=t(temp, np.float32),
+               top_p=t(top_p, np.float32), top_k=t(top_k, np.int64), min_p=t(min_p, np.float32),
+               seed=t(seed, np.int64), out=out, status=status, pending=None if k else pending, ids=ids, mask=mask,
+               mask_row=mask_row, padded=padded, terms=tables, drafts=drafts if k else None, window=window)
+    got_cnt = tables.cnt.clone()
+    cols = torch.arange(logits.shape[1], device=DEV) if ids is None else ids.long()
+    win = None
+    if k:
+        wt = torch.as_tensor(w, device=DEV)
+        d = drafts.index_select(0, slots)
+        win = torch.where(torch.arange(k, device=DEV)[None, :] < wt[:, None], d, -1)
+    f = lambda a: a.index_select(0, slots)  # noqa: E731
+    flags = f(tables.terms)
+    adj = apply_terms(logits, cols, flags, f(tables.rep), f(tables.pres), f(tables.freq), before.index_select(0, slots),
+                      f(tables.bias_id), f(tables.bias_val), f(tables.bias_n), win)
+    plan = plan_sampling(temp, top_p, top_k, min_p, logits.shape[1])
+    for g in plan.groups:
+        g.idx = torch.as_tensor(g.rows, device=DEV)
+    keys = row_keys(torch.as_tensor(seed, device=DEV), torch.as_tensor(qpos + 1, device=DEV))
+    want, wst = sample(logits, plan, torch.as_tensor(temp, device=DEV), torch.as_tensor(top_p, device=DEV),
+                       torch.as_tensor(top_k, device=DEV), torch.as_tensor(min_p, device=DEV), keys,
+                       cols, mask=mask, mask_row=mask_row, adjusted=adj, clamp_rows=flags != 0)
+    want_cnt = before.clone()
+    on = ((flags & TERM_PEN) != 0) & (wst == 0) & (k == 0)
+    want_cnt.view(-1).index_add_(0, slots * tables.cnt.shape[1] + want, on.to(torch.int32))
+    params = (temp, top_p, top_k, min_p, seed, qpos)
+    return (out.cpu().numpy(), status.cpu().numpy(), got_cnt), (want.cpu().numpy(), wst.cpu().numpy(), want_cnt), \
+        flags, params
+
+
+@pytest.mark.parametrize("vocab", [248_320, 262_144])
+@pytest.mark.parametrize("k", [0, 5])
+def test_sampler_with_terms_matches_reference(vocab, k) -> None:
+    """Penalties and the logit bias (runner/cuda/penalties.py) at each real vocabulary, on every sampler path, greedy
+    included, with a verify window's drafts (k 5): token for token with the reference, the statuses alike, and the
+    counts after it (without a window a penalised row's token once; with one none). Rows without terms are the
+    kernel's without them."""
+    rng = np.random.default_rng(vocab + k)
+    torch.manual_seed(11)
+    n = len(TERMS_COMBOS) * 8
+    logits = (torch.randn(n, vocab, device=DEV) * torch.linspace(1, 8, n, device=DEV)[:, None]).to(BF).float()
+    (a, sa, ca), (b, sb, cb), flags, params = _terms_run(logits, rng, k)
+    assert sa.tolist() == sb.tolist() and not sa.any()
+    bad = np.flatnonzero(a != b)
+    assert len(bad) == 0, [(i, int(flags[i]), a[i], b[i]) for i in bad[:10]]
+    assert torch.equal(ca, cb)
+    plain = (flags == 0).cpu().numpy()
+    c, _ = _kernel_tokens(logits, *params)
+    assert np.array_equal(a[plain], c[plain])
+
+
+@pytest.mark.parametrize("vocab", [248_320, 262_144])
+def test_sampler_with_terms_under_masks_and_the_sparse_head(vocab) -> None:
+    """The same under grammar masks (a biased token the mask refuses is never sampled) and over the grammar-sparse
+    head's columns (the union's ids, padded): token for token with the reference."""
+    rng = np.random.default_rng(vocab + 1)
+    torch.manual_seed(12)
+    n = len(TERMS_COMBOS) * 8
+    allowed = np.zeros((3, vocab), bool)
+    allowed[0, rng.choice(vocab, 40, replace=False)] = True
+    allowed[1] = rng.random(vocab) < 0.5
+    allowed[2, rng.choice(vocab, 3, replace=False)] = True
+    words = np.packbits(np.pad(allowed, ((0, 0), (0, -vocab % 32))), axis=1, bitorder="little").view(np.int32)
+    mask = torch.as_tensor(words.copy(), device=DEV)
+    mask_row = torch.as_tensor(np.where(np.arange(n) % 4 == 3, -1, np.arange(n) % 3), device=DEV)
+    logits = (torch.randn(n, vocab, device=DEV) * 4).to(BF).float()
+    (a, sa, ca), (b, sb, cb), _, _ = _terms_run(logits, rng, 0, mask=mask, mask_row=mask_row)
+    assert sa.tolist() == sb.tolist() and np.array_equal(a, b) and torch.equal(ca, cb)
+    union = np.flatnonzero(allowed[:2].any(0))  # every row masked by mask 0 or 1: the sparse head's columns
+    pad = 64
+    ids = torch.as_tensor(np.concatenate([union, np.full(pad, -1)]).astype(np.int32), device=DEV)
+    rows = torch.as_tensor(np.arange(n) % 2, device=DEV)
+    sparse = (torch.randn(n, len(union) + pad, device=DEV) * 4).to(BF).float()
+    for k in (0, 5):  # the sparse head under MTP: its columns' tokens against a verify window's drafts
+        (a, sa, ca), (b, sb, cb), _, _ = _terms_run(sparse, np.random.default_rng(3 + k), k, ids=ids, mask=mask,
+                                                    mask_row=rows, padded=True, vocab=vocab)
+        assert sa.tolist() == sb.tolist() and np.array_equal(a, b) and torch.equal(ca, cb)
+        assert np.isin(a, union).all()
 
 
 # temperature, top_p, top_k, min_p: top-k and top-p cuts inside tie groups of thousands, one batch (k <= 2,048) or

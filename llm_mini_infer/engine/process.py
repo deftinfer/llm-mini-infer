@@ -76,7 +76,8 @@ def build_runner(cfg: Config) -> Runner:
         im, on = cfg.dev.images, cfg.images.enabled
         return make_fake_runner(cfg.model.path, cfg.dev.runner.fake, cfg.speculative.num_speculative_tokens or 0,
                                 encoder_rows=(im.encoder_cache_tokens or 0) if on else 0,
-                                encoder_budget=(im.encoder_budget or 0) if on else 0, logprobs=cfg.server.logprobs)
+                                encoder_budget=(im.encoder_budget or 0) if on else 0, logprobs=cfg.server.logprobs,
+                                penalties=cfg.server.penalties)
     from ..runner.cuda import make_cuda_runner
 
     return make_cuda_runner(cfg)
@@ -637,6 +638,7 @@ def engine_main(cfg: Config, ready: Connection, ipc_path: str, heartbeat: Any = 
                           forced_prefix=bool(cfg.dev.structured_output.forced_prefix),
                           eos_free_finish=bool(cfg.dev.structured_output.eos_free_finish),
                           batch_invariant=caps.batch_invariant, logprobs=caps.logprobs,
+                          penalties_vocab=caps.vocab_size if caps.penalties else 0,
                           compile_timeout_s=cfg.dev.structured_output.compile_timeout_s)
         if grammars is not None:  # the scheduler refuses the EOS-free finish where it cannot keep its outputs
             so = cfg.dev.structured_output

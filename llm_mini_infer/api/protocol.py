@@ -2,8 +2,12 @@
 
 - Unknown fields are a 400 (`forbid_unknown_fields`), and so is a body nested deeper than msgspec decodes (about
   10,000 levels: CPython's C recursion limit) or one with a string that is not UTF-8.
-- Fields we know but do not implement are accepted only at their default values (`n=1`, neutral penalties, ...) and
-  are a 400 otherwise.
+- Fields we know but do not implement are accepted only at their default values (`n=1`, `echo=false`, ...) and are
+  a 400 otherwise.
+- **`frequency_penalty`, `presence_penalty`, `repetition_penalty`, `logit_bias`**: vLLM's checks, order, messages and
+  params (`validate_chat`): `logit_bias` keys as integers (`int(key)`; the converted dict, values clamped to
+  [-100, 100], replaces the request's), the penalties' ranges, then its token ids against the vocabulary. Ours: a
+  `repetition_penalty` outside the normal float32 range, and more than `MAX_LOGIT_BIAS` entries.
 - What vLLM refuses too is refused with its message, `(parameter=P, value=V)` suffix and param
   (`validation_error`).
 - **`logprobs`, `top_logprobs`** (`logprobs_param`): vLLM's checks, messages and limit (20: the OpenAI API's, and
@@ -37,6 +41,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from typing import Any, Literal
 
@@ -194,12 +199,13 @@ class ChatCompletionRequest(_Strict):
     priority: int = 0
     cache_salt: Any = None  # a string or None: `check_cache_salt` refuses the rest with vLLM's message
     user: str | None = None
+    # Sampling (`validate_chat`); None: unset, the server's defaults fill it later
+    frequency_penalty: float | None = None
+    presence_penalty: float | None = None
+    repetition_penalty: float | None = None
+    logit_bias: dict[str, float] | None = None  # token id (a string, as JSON keys are) -> bias, clamped to +-100
     # Known, accepted only at their defaults
     n: int = 1
-    frequency_penalty: float = 0.0
-    presence_penalty: float = 0.0
-    repetition_penalty: float = 1.0
-    logit_bias: dict[str, float] | None = None
     spaces_between_special_tokens: bool = True
     continue_final_message: bool = False
     echo: bool = False
@@ -274,9 +280,9 @@ def decode_detokenize(body: bytes) -> DetokenizeRequest:
 
 
 MAX_STOP_TOKEN_IDS = 16  # distinct ones (`validate_chat`)
-_DEFAULT_ONLY = {"n": 1, "frequency_penalty": 0.0, "presence_penalty": 0.0,
-                 "repetition_penalty": 1.0, "spaces_between_special_tokens": True, "continue_final_message": False,
-                 "echo": False}
+MAX_LOGIT_BIAS = 1024  # vLLM's v2 runner's limit, which it raises in its worker; here a 400
+_DEFAULT_ONLY = {"n": 1, "spaces_between_special_tokens": True, "continue_final_message": False, "echo": False}
+_F32_MIN, _F32_MAX = 1.1754943508222875e-38, 3.4028234663852886e+38  # the smallest normal float32, the largest
 MAX_LOGPROBS = 20  # runner.base.MAX_LOGPROBS: the OpenAI API's limit, the default of vLLM's `--max-logprobs`
 
 
@@ -446,8 +452,6 @@ def validate_chat(req: ChatCompletionRequest, vocab: int, images: bool = False) 
             raise validation_error("`top_logprobs` must be a positive value or -1.", "top_logprobs", top)
         if (top == -1 or top > 0) and not req.logprobs:
             raise validation_error("when using `top_logprobs`, `logprobs` must be set to true.", "top_logprobs")
-    if req.logit_bias:
-        raise ApiError(400, "'logit_bias' is not supported yet", "logit_bias")
     rf = req.response_format
     if isinstance(rf, JsonSchemaFormat):
         if rf.json_schema is None:
@@ -467,7 +471,31 @@ def validate_chat(req: ChatCompletionRequest, vocab: int, images: bool = False) 
         from .tools import check_tools
 
         check_tools(req.tools, req.tool_choice)
+    if req.logit_bias:  # as `SamplingParams.from_optional`: keys through int(), the last of equal ids wins
+        biases: dict[int, float] = {}
+        invalid_keys = []
+        for key, bias in req.logit_bias.items():
+            try:
+                biases[int(key)] = min(100.0, max(-100.0, bias))
+            except (ValueError, TypeError):
+                invalid_keys.append(key)
+        if invalid_keys:
+            raise validation_error("logit_bias contains key(s) that cannot be converted to integer token IDs: "
+                                   f"{invalid_keys!r}", "logit_bias", invalid_keys)
+        req.logit_bias = {str(i): b for i, b in biases.items()}
     t, p = req.temperature, req.top_p  # vLLM's sampling checks, in its order, and their messages
+    for name, v in (("presence_penalty", req.presence_penalty), ("frequency_penalty", req.frequency_penalty)):
+        if v is not None and not -2.0 <= v <= 2.0:
+            raise validation_error(f"{name} must be in [-2, 2], got {v}.")
+    r = req.repetition_penalty
+    if r is not None:
+        if not math.isfinite(r):
+            raise validation_error(f"repetition_penalty must be a finite number, got {r}.")
+        if r <= 0.0:
+            raise validation_error(f"repetition_penalty must be greater than zero, got {r}.")
+        if not _F32_MIN <= r <= _F32_MAX:  # ours: the sampler keeps it in float32 and uses 1/r
+            raise validation_error("repetition_penalty must be a normal float32 number (from 1.1754944e-38 to "
+                                   f"3.4028235e+38), got {r}.")
     if t is not None and t < 0:
         raise validation_error(f"temperature must be non-negative, got {t}.", "temperature", t)
     if t is not None and t > 2:
@@ -490,6 +518,14 @@ def validate_chat(req: ChatCompletionRequest, vocab: int, images: bool = False) 
         raise validation_error("stop cannot contain an empty string.")
     if len(stops) > 16:
         raise ApiError(400, "at most 16 stop strings", "stop")
+    if req.logit_bias:  # vLLM's `verify()` checks it before stop_token_ids
+        bad = [int(k) for k in req.logit_bias if not 0 <= int(k) < vocab]
+        if bad:
+            raise validation_error(f"token_id(s) {bad} in logit_bias contain out-of-vocab token ids. Vocabulary "
+                                   f"size: {vocab}", "logit_bias", bad)
+        if len(req.logit_bias) > MAX_LOGIT_BIAS:
+            raise ApiError(400, f"Too many logit bias tokens: {len(req.logit_bias)}. The max size is "
+                                f"{MAX_LOGIT_BIAS}.", "logit_bias")
     if req.stop_token_ids:
         ids = list(dict.fromkeys(req.stop_token_ids))
         # The engine's per-slot stop table widens to the most ids a request brought, for its life, and every step

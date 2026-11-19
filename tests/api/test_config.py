@@ -682,8 +682,8 @@ def test_state_fields_are_refused_at_load(tmp_path, monkeypatch, capsys, caplog)
     from llm_mini_infer import cli, entrypoint
 
     assert config.STATE_FIELDS == ("model_source", "speculative_source", "eos_token_ids", "grammar_eos_token_ids",
-                                   "mtp_k_max", "vocab_size", "cpu_budget", "image_tokens_max", "pixel_arena",
-                                   "pool_dir", "runner_info", "reasons")
+                                   "sampling_penalties", "mtp_k_max", "vocab_size", "cpu_budget", "image_tokens_max",
+                                   "pixel_arena", "pool_dir", "runner_info", "reasons")
     groups = {f.name for f in msgspec.structs.fields(config.Config)} - set(config.STATE_FIELDS)
     assert groups == {"model", "sampling", "scheduler", "cache", "speculative", "images", "structured_output",
                       "tool_calls", "reasoning", "runner", "server", "engine", "observability", "dev"}
@@ -717,7 +717,7 @@ def test_superseded_checkpoints_are_demoted_by_default() -> None:
 
 
 def test_the_settings_split(tmp_path, monkeypatch, capsys, caplog) -> None:
-    """An operator's settings are fewer than 60, the tests' and benchmarks' live in the dev group under the same names,
+    """An operator's settings are fewer than 61, the tests' and benchmarks' live in the dev group under the same names,
     and the server's state apart. A dev setting given outside the dev group, from a file or an override, fails the load
     naming it and where it goes, and so do the cli and the entrypoint's preflight (exit 2); a dev subgroup (the fake
     runner's) is refused whole."""
@@ -727,7 +727,7 @@ def test_the_settings_split(tmp_path, monkeypatch, capsys, caplog) -> None:
     from llm_mini_infer import cli, entrypoint
 
     dev = [k.removeprefix("dev.") for k in config.leaves(config.Config) if k.startswith("dev.")]
-    assert len(config.SETTINGS) == 59 < 60 and len(dev) == 61 and not set(dev) & set(config.SETTINGS)
+    assert len(config.SETTINGS) == 60 < 61 and len(dev) == 61 and not set(dev) & set(config.SETTINGS)
     for name, value in (("runner.cuda.fused_ops", False), ("cache.num_pages", 10), ("runner.fake.step_ms", 1.0),
                         ("scheduler.mixed_step_row_tokens", 100)):
         got = config.load(None, {f"dev.{name}": value}).dev
@@ -928,3 +928,68 @@ def test_the_reasoning_settings(tmp_path) -> None:
         with pytest.raises(ValueError) as e:
             derived(qwen, **{"reasoning.effort_map": value})
         assert str(e.value) == message, value
+
+
+
+def _penalty_model(tmp: Path, **gen) -> Path:
+    """A model directory whose generation_config.json carries `gen`."""
+    tmp.mkdir(parents=True, exist_ok=True)
+    _model(tmp, 1000, 0)
+    (tmp / "generation_config.json").write_text(json.dumps(gen))
+    return tmp
+
+
+def _penalties(tmp: Path, on: bool) -> config.Config:
+    return config.derive(config.load(None, {"model.path": str(tmp), "server.penalties": on}))
+
+
+def _values(cfg: config.Config) -> tuple[float, float, float]:
+    p = cfg.sampling_penalties
+    return p["repetition_penalty"], p["presence_penalty"], p["frequency_penalty"]
+
+
+def test_penalties_off_leave_the_files_ones(tmp_path) -> None:
+    """server.penalties off (the default): generation_config.json's penalties are not taken (the reason names them),
+    the defaults stay neutral; no penalty is an operator setting."""
+    model = _penalty_model(tmp_path, temperature=0.7, repetition_penalty=1.05, presence_penalty=0.5)
+    cfg = config.derive(config.load(None, {"model.path": str(model)}))
+    assert cfg.server.penalties is False and _values(cfg) == (1.0, 0.0, 0.0)
+    assert cfg.reasons["sampling"] == "generation_config.json: temperature=0.7"
+    assert cfg.reasons["sampling.penalties"] == ("generation_config.json's repetition_penalty=1.05, "
+                                                 "presence_penalty=0.5 not taken: server.penalties off")
+    neutral = _penalty_model(tmp_path / "neutral", repetition_penalty=1.0, frequency_penalty=0.0)
+    assert "sampling.penalties" not in _penalties(neutral, False).reasons  # nothing to say
+    assert not [k for k in config.SETTINGS if k.endswith("_penalty")]
+    with pytest.raises(ValueError):
+        config.load(None, {"sampling.repetition_penalty": 1.1})
+    with pytest.raises(ValueError):
+        config.load(None, {"sampling_penalties": {"repetition_penalty": 1.1}})  # the server's state
+
+
+def test_penalties_on_take_the_files_ones(tmp_path) -> None:
+    """server.penalties on: generation_config.json's are the defaults (null dropped), listed beside the others."""
+    model = _penalty_model(tmp_path, temperature=0.7, top_p=0.9, repetition_penalty=1.05, presence_penalty=0.5,
+                           frequency_penalty=None)
+    cfg = _penalties(model, True)
+    assert _values(cfg) == (1.05, 0.5, 0.0) and "sampling.penalties" not in cfg.reasons
+    assert cfg.reasons["sampling"] == ("generation_config.json: temperature=0.7, top_p=0.9, repetition_penalty=1.05, "
+                                       "presence_penalty=0.5")
+    cfg = _penalties(_penalty_model(tmp_path / "only", frequency_penalty=-0.5), True)  # no other key: its own reason
+    assert _values(cfg) == (1.0, 0.0, -0.5)
+    assert cfg.reasons["sampling"] == "generation_config.json: frequency_penalty=-0.5"
+    assert _values(_penalties(_penalty_model(tmp_path / "bare"), True)) == (1.0, 0.0, 0.0)
+
+
+@pytest.mark.parametrize(("key", "value", "match"), [
+    ("presence_penalty", 2.5, r"presence_penalty must be in \[-2, 2\]"),
+    ("frequency_penalty", -3.0, r"frequency_penalty must be in \[-2, 2\]"),
+    ("repetition_penalty", 0.0, "repetition_penalty must be a positive normal float32"),
+    ("repetition_penalty", 1e-40, "repetition_penalty must be a positive normal float32"),
+])
+def test_a_files_penalty_out_of_range_is_refused(tmp_path, key, value, match) -> None:
+    """With server.penalties on, a value out of vLLM's range in generation_config.json fails the start (every request
+    would fail its checks); off, it is not taken."""
+    model = _penalty_model(tmp_path, **{key: value})
+    with pytest.raises(ValueError, match=match):
+        _penalties(model, True)
+    assert _values(_penalties(model, False)) == (1.0, 0.0, 0.0)

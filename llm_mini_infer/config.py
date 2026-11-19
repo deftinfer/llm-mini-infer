@@ -211,6 +211,11 @@ class ServerConfig(_Group):
     # max_num_seqs x (1 + k) x the vocabulary in fp32, taken from the KV pool (403 MB at 64 sequences, k = 5 and a
     # vocabulary of 262,144)
     logprobs: bool = False
+    # Chat completions' `frequency_penalty`, `presence_penalty`, `repetition_penalty` and `logit_bias` (vLLM's).
+    # Off (a request that sets one to a non-neutral value is a 400), the sampler runs as without them; on, the CUDA
+    # runner keeps an int32 per sequence slot and vocabulary token (the prompt, the output counts, the biased ids) and
+    # a bias table, taken from the KV pool (69 MB at 64 sequences and a vocabulary of 262,144)
+    penalties: bool = False
     # How long an idle HTTP connection stays open for its next request: uvicorn's timeout_keep_alive; its default, 5 s,
     # is that of VLLM_HTTP_TIMEOUT_KEEP_ALIVE. A proxy that pools connections to this server must close idle ones sooner
     keep_alive_s: float = 5.0
@@ -436,6 +441,8 @@ class Config(msgspec.Struct, forbid_unknown_fields=True, kw_only=True):
     speculative_source: str = ""  # the same for a downloaded speculative.model
     eos_token_ids: list[int] = []
     grammar_eos_token_ids: list[int] = []  # the engine's: the EOS ids a finished grammar allows (grammar.engine)
+    # The penalties a request leaves unset gets (`PENALTIES`' keys): generation_config.json's with server.penalties on
+    sampling_penalties: dict[str, float] = {}
     # The k the derived refine piece leaves room for (dev.cache.refine_chunk_tokens): with an assistant its largest,
     # whatever k is set, so k never changes the precise copy; else the set k (0: no drafter)
     mtp_k_max: int = 0
@@ -581,6 +588,7 @@ def derive(cfg: Config) -> Config:
         s.top_k = 0
     if s.min_p is None:
         s.min_p = 0.0
+    _derive_penalties(cfg, gen, reasons)
 
     eos = gen.get("eos_token_id", text.get("eos_token_id", hf.get("eos_token_id")))
     cfg.eos_token_ids = sorted({int(e) for e in (eos if isinstance(eos, list) else [eos]) if e is not None})
@@ -754,6 +762,32 @@ def tokenizer_eos_token(cfg: Config) -> str | None:
 
 
 QWEN3_5_TYPES = ("qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text")  # Qwen3.5 and Qwen3.8
+
+
+PENALTIES = {"repetition_penalty": 1.0, "presence_penalty": 0.0, "frequency_penalty": 0.0}  # neutral values
+
+
+def _derive_penalties(cfg: Config, gen: dict[str, Any], reasons: dict[str, str]) -> None:
+    """The penalties a request leaves unset gets (`Config.sampling_penalties`): with server.penalties on, those
+    generation_config.json sets (null dropped), as vLLM's `generation_config auto` takes them, range-checked as vLLM
+    checks a request's; the neutral values otherwise. Off, the file's are not taken (the reason says so)."""
+    on = cfg.server.penalties
+    taken = {f: float(gen[f]) for f in PENALTIES if gen.get(f) is not None}
+    cfg.sampling_penalties = {**PENALTIES, **(taken if on else {})}
+    if on and taken:
+        reasons["sampling"] = (reasons["sampling"] + ", " if "sampling" in reasons else "generation_config.json: ") + \
+            ", ".join(f"{f}={v}" for f, v in taken.items())
+    skipped = {f: v for f, v in taken.items() if v != PENALTIES[f]} if not on else {}
+    if skipped:
+        reasons["sampling.penalties"] = ("generation_config.json's " + ", ".join(f"{f}={v}" for f, v in skipped.items())
+                                         + " not taken: server.penalties off")
+    p = cfg.sampling_penalties
+    for field in ("presence_penalty", "frequency_penalty"):
+        if not -2.0 <= p[field] <= 2.0:
+            raise ValueError(f"generation_config.json's {field} must be in [-2, 2], got {p[field]}")
+    if not 1.1754943508222875e-38 <= p["repetition_penalty"] <= 3.4028234663852886e+38:  # api.protocol's bounds
+        raise ValueError("generation_config.json's repetition_penalty must be a positive normal float32 number, got "
+                         f"{p['repetition_penalty']}")
 
 
 def _derive_tool_calls(cfg: Config, hf: dict[str, Any], reasons: dict[str, str]) -> None:
