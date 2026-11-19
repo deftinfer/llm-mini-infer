@@ -33,6 +33,7 @@ from typing import Any
 import psutil
 import yaml
 
+from llm_mini_infer import leftovers
 from llm_mini_infer.output.detokenizer import Detokenizer
 from llm_mini_infer.render.messages import to_template_messages
 from llm_mini_infer.render.renderer import Renderer
@@ -42,7 +43,7 @@ from llm_mini_infer.vision import arena
 from .paths import ROOT
 
 SERVERS_ENV = "LLM_MINI_INFER_TEST_SERVERS"  # the PID files' folder, when set (`servers_dir`)
-IPC_PREFIX = "llm-mini-infer-"  # an IPC directory's name starts so (`engine.ipc.ipc_dir`)
+IPC_PREFIX = leftovers.PREFIX  # an IPC directory's name starts so (`engine.ipc.ipc_dir`)
 _LIVE: dict[int, Server] = {}  # the servers this process launched and has not stopped, by process group id
 
 
@@ -619,10 +620,11 @@ def _still_runs(p: psutil.Process) -> bool:
 def _remove_leftovers(pid: int) -> None:
     """What a launcher that died of a signal as `pid` leaves (one that exits by itself removes them): its pixel arena,
     named by its pid and its IPC directory's name (`launcher._start_images`; in /dev/shm on Linux, inside the IPC
-    directory on macOS), and that IPC directory. A server without images leaves only its IPC directory, a few
-    sockets, which nothing names: it stays. An arena this user cannot remove (another user's, in a shared /dev/shm)
-    stays, with its IPC directory."""
-    base = "/tmp" if os.path.isdir("/tmp") else tempfile.gettempdir()  # where `engine.ipc.ipc_dir` makes it
+    directory on macOS: under the tests' root, `llm_mini_infer.leftovers`), and that IPC directory. A server without
+    images leaves only its IPC directory, a few sockets, which nothing names here: it stays, for the next server's
+    start to remove (`leftovers.sweep`). An arena this user cannot remove (another user's, in a shared /dev/shm) stays,
+    with its IPC directory."""
+    base = leftovers.tmp_root()  # where `engine.ipc.ipc_dir` makes it
     head, tail = os.path.basename(arena.arena_path(base, "{}")).split("{}")  # the arena's name around its tag
     for path in glob.glob(arena.arena_path(arena.default_dir(os.path.join(base, IPC_PREFIX + "*")), f"{pid}-*")):
         name = os.path.basename(path).removeprefix(head).removesuffix(tail).removeprefix(f"{pid}-")

@@ -110,14 +110,15 @@ def alive(pid: int) -> bool:
 
 
 def shm_files() -> list[tuple[str, int]]:
+    """/dev/shm's files, its folders' too (the tests' arenas are in one: tests/conftest.py), by their path there, with
+    the bytes each holds."""
     out = []
-    try:
-        for name in sorted(os.listdir(SHM)):
+    for folder, _, names in os.walk(SHM):  # no folder (another OS), or one gone meanwhile: nothing from it
+        for name in names:
+            path = os.path.join(folder, name)
             with contextlib.suppress(OSError):
-                out.append((name, os.stat(os.path.join(SHM, name)).st_blocks * 512))
-    except OSError:
-        pass
-    return out
+                out.append((os.path.relpath(path, SHM), os.lstat(path).st_blocks * 512))
+    return sorted(out)
 
 
 class Sampler:

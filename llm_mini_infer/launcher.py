@@ -59,7 +59,7 @@ from typing import Any
 
 import zmq
 
-from . import hub
+from . import hub, leftovers
 from .config import Config, derive, effective_lines
 from .engine import ipc
 from .engine.messages import EngineFailed, Shutdown
@@ -180,7 +180,9 @@ def serve(cfg: Config) -> int:
         log.error("configuration: %s", exc)
         return 2
     cfg.pixel_arena = cfg.pool_dir = ""  # the launcher's own (load() refuses both): it removes only an arena it made
-    ipc_path = ipc.ipc_dir()
+    leftovers.sweep()  # a killed server's socket directory and arena, before this one makes its own
+    ipc_path, lock = ipc.locked_dir()
+    locks = [lock]  # this server's flocks (`leftovers`), held until its files are removed
     ctx = mp.get_context("spawn")
 
     def on_signal(signum: int, _frame: Any) -> None:
@@ -202,7 +204,7 @@ def serve(cfg: Config) -> int:
     heartbeat = ctx.RawValue("q", 0)  # the engine loop's last turn, time.monotonic_ns (engine.watchdog_s)
     code = 1
     try:
-        pool = _start_images(cfg, ctx, ipc_path)
+        pool = _start_images(cfg, ctx, ipc_path, locks)
         pool_ready = pool.start() if pool is not None else []
         recv, send = ctx.Pipe(duplex=False)
         engine = ctx.Process(target=engine_main, args=(cfg, send, ipc_path, heartbeat), name="llm-mini-infer-engine")
@@ -269,6 +271,8 @@ def serve(cfg: Config) -> int:
 
             arena.remove(cfg.pixel_arena)
         shutil.rmtree(ipc_path, ignore_errors=True)
+        for fd in locks:
+            os.close(fd)
         signal.set_wakeup_fd(-1)
         wake_r.close()
         wake_w.close()
@@ -400,20 +404,16 @@ def _kill_engine(engine: Any) -> None:
         engine.join(5)
 
 
-def _start_images(cfg: Config, ctx: Any, ipc_path: str) -> ImagePool | None:
-    """With images on: create the pixel arena, and the image pool that will spawn into it (architecture.md, "The image
-    pool")."""
+def _start_images(cfg: Config, ctx: Any, ipc_path: str, locks: list[int]) -> ImagePool | None:
+    """With images on: create the pixel arena, its lock added to `locks`, and the image pool that will spawn into it
+    (architecture.md, "The image pool")."""
     im = cfg.images
     if not im.enabled:
         return None
     from .vision import arena
 
     path = arena.arena_path(arena.default_dir(ipc_path), f"{os.getpid()}-{os.path.basename(ipc_path)}")
-    try:
-        arena.create(path, cfg.dev.images.arena_mb << 20)
-    except OSError:
-        arena.remove(path)
-        raise
+    locks.append(arena.create_locked(path, cfg.dev.images.arena_mb << 20))
     cfg.pixel_arena = path
     cfg.pool_dir = ipc_path
     return ImagePool(cfg, ctx, ipc_path, path)

@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import contextlib
 import ctypes
+import fcntl
 import os
+import shutil
+import stat
 import sys
+import tempfile
 
 import pytest
 
@@ -12,12 +17,99 @@ pytest.register_assert_rewrite("tests.support")
 # The CUDA sync check of the runners the suite builds (`llm_mini_infer.runner.cuda.sync_check`): error; this variable
 # set to warn or off for another. A runner on the CPU or the torch references never arms it
 SYNC_CHECK_ENV = "LLM_MINI_INFER_TEST_SYNC_CHECK"
+HELD = "held"  # in a test's private root (`private_tmp`): the lock its test holds while it runs
 
 
 def pytest_configure(config) -> None:
     from llm_mini_infer.runner.cuda import sync_check
 
     sync_check.DEFAULT = os.environ.get(SYNC_CHECK_ENV, "error")
+    _servers_root()
+
+
+def _servers_root() -> None:
+    """The servers' socket directories and pixel arenas go to a root of the tests' own (`llm_mini_infer.leftovers`,
+    TEST_ROOT_ENV), never to /tmp or /dev/shm, where a starting server removes a killed one's files: no test sweeps the
+    files of a server it did not start (another session's, a developer's). Set before the session's hooks and every
+    test, and inherited by xdist's workers and the servers. One per user, kept between sessions, so a killed session's
+    files are the next one's to sweep; its `shm` is a folder in /dev/shm where the host has one, so the arenas stay in
+    shared memory as a server's do. A value already set is used as given."""
+    from llm_mini_infer import leftovers
+
+    if os.environ.get(leftovers.TEST_ROOT_ENV):
+        return
+    name = f"llm-mini-tests-{os.getuid()}"
+    root = os.path.join(leftovers.tmp_root(), name)  # /tmp: a socket's path holds about 104 bytes
+    _own_folder(root)
+    if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK):
+        shm, link = os.path.join("/dev/shm", name), os.path.join(root, "shm")
+        _own_folder(shm)
+        with contextlib.suppress(FileExistsError):
+            os.symlink(shm, link)
+        if not os.path.islink(link) or os.readlink(link) != shm:
+            raise pytest.UsageError(f"{link} is not a link to {shm}: remove it, or set {leftovers.TEST_ROOT_ENV}")
+    os.environ[leftovers.TEST_ROOT_ENV] = root
+
+
+def _own_folder(path: str) -> None:
+    """`path`, made private when missing; refused unless it is a folder of this user's (another user could make it
+    first in a shared /tmp)."""
+    with contextlib.suppress(FileExistsError):
+        os.mkdir(path, 0o700)
+    st = os.lstat(path)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        raise pytest.UsageError(f"{path} is not a folder of this user's (uid {st.st_uid}), and the test servers' files "
+                                "need one: remove it, or set LLM_MINI_INFER_TEST_TMP")
+
+
+@pytest.fixture
+def private_tmp(monkeypatch):
+    """A root of this test's own for the servers' socket directories and arenas (`_servers_root`), set for the test and
+    the servers it starts, so that no other test's server sweeps what a killed one left before the test looks; with
+    an `shm` folder (in /dev/shm) where the session's root has one. Removed at the end."""
+    from llm_mini_infer import leftovers
+
+    session = os.environ[leftovers.TEST_ROOT_ENV]
+    root = tempfile.mkdtemp(prefix="t-", dir=session)
+    held = leftovers.locked_file(os.path.join(root, HELD))  # a killed session's go at its next start
+    made = [root]
+    try:
+        if os.path.isdir(os.path.join(session, "shm")):
+            made.append(tempfile.mkdtemp(prefix="t-", dir=os.path.join(session, "shm")))
+            os.symlink(made[-1], os.path.join(root, "shm"))
+        monkeypatch.setenv(leftovers.TEST_ROOT_ENV, root)
+        yield root
+    finally:
+        for path in made:
+            shutil.rmtree(path, ignore_errors=True)
+        os.close(held)
+
+
+def remove_stale_roots(session: str) -> None:
+    """The private roots (`private_tmp`) in `session` of tests whose pytest process was killed before their teardown,
+    with what their servers left there, an arena in /dev/shm among them: the roots whose lock (HELD) nobody holds. A
+    root whose test runs (another session's), or one without the lock file yet, stays."""
+    try:
+        names = sorted(name for name in os.listdir(session) if name.startswith("t-"))
+    except OSError:
+        return
+    for name in names:
+        root = os.path.join(session, name)
+        try:
+            fd = os.open(os.path.join(root, HELD), os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError:
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            shm = os.path.join(root, "shm")
+            twin = os.readlink(shm) if os.path.islink(shm) else ""
+            if os.path.dirname(twin) == os.path.join(session, "shm") and os.path.basename(twin).startswith("t-"):
+                shutil.rmtree(twin, ignore_errors=True)
+            shutil.rmtree(root, ignore_errors=True)
+        except OSError:  # held: its test runs
+            pass
+        finally:
+            os.close(fd)
 
 
 try:
@@ -94,9 +186,17 @@ def pytest_sessionfinish(session):
 
 def pytest_sessionstart(session) -> None:
     """A session starts without the servers of one that was killed (CI's serial run, after its workers' run hit its
-    limit): in xdist's controller, or a run without xdist, as at the finish below."""
+    limit), then without its tests' private roots (`remove_stale_roots`): in xdist's controller, or a run without
+    xdist, as at the finish below."""
     if not hasattr(session.config, "workerinput"):
         _sweep("sweep_stale", load=True)
+        try:
+            from llm_mini_infer import leftovers
+
+            remove_stale_roots(os.environ[leftovers.TEST_ROOT_ENV])
+        except Exception as e:  # as `_sweep`'s: a warning, never a stop
+            print(f"warning: the tests' private roots' sweep failed: {type(e).__name__}: {e}", file=sys.stderr,
+                  flush=True)
 
 
 @pytest.hookimpl(optionalhook=True)

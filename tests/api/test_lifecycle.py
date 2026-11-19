@@ -17,6 +17,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from types import SimpleNamespace
@@ -373,10 +374,11 @@ def test_a_second_signal_stops_at_once(model, tmp_path) -> None:
 
 
 @pytest.mark.serial  # a server with an image pool
-def test_orphans_stop_when_the_launcher_is_killed(model, tmp_path) -> None:
+def test_orphans_stop_when_the_launcher_is_killed(model, tmp_path, private_tmp) -> None:
     """The engine, the frontend and the image pool stop by themselves when the launcher is SIGKILLed. The launcher's
-    IPC directory (its sockets) and pixel arena, which it removes on every exit it lives through, are the test's to
-    remove here (/tmp/llm-mini-infer-*, the arena in /dev/shm on Linux)."""
+    IPC directory (its sockets) and pixel arena, which it removes on every exit it lives through, stay: under the
+    test's own root (`private_tmp`), where no other test's starting server removes them, they are the test's to
+    remove."""
     import shutil
 
     from llm_mini_infer.vision import arena
@@ -400,6 +402,39 @@ def test_orphans_stop_when_the_launcher_is_killed(model, tmp_path) -> None:
             arena.remove(pixels)
             shutil.rmtree(ipc_dir, ignore_errors=True)
         assert not os.path.exists(ipc_dir) and not os.path.exists(pixels)
+
+
+@pytest.mark.serial  # a server with an image pool
+def test_the_next_start_removes_what_a_killed_server_left(model, tmp_path, private_tmp) -> None:
+    """A server that starts beside a live one keeps its IPC directory and pixel arena (the launcher holds their locks).
+    A SIGKILLed launcher leaves both; once its orphans have exited, the next server to start removes them
+    (`llm_mini_infer.leftovers`), and logs it. An older version's leftovers, which hold no lock (a directory without
+    the lock file, an arena named -pixels), stay. Every server under the test's own root."""
+    from llm_mini_infer import leftovers
+    from llm_mini_infer.vision import arena
+
+    psutil = pytest.importorskip("psutil")
+    old_dir = tempfile.mkdtemp(prefix=leftovers.PREFIX, dir=private_tmp)
+    old_arena = os.path.join(arena.default_dir(old_dir), f"{leftovers.PREFIX}1-{os.path.basename(old_dir)}-pixels")
+    open(old_arena, "wb").close()
+    with Server(model, tmp_path, extra={"images": {}}).start() as srv:
+        cfg = json.loads(srv.get("/server_info")[1])["config"]
+        ipc_dir, pixels = cfg["pool_dir"], cfg["pixel_arena"]
+        assert ipc_dir.startswith(private_tmp) and pixels.startswith(private_tmp), cfg
+        with Server(model, tmp_path).start():
+            assert os.path.isdir(ipc_dir) and os.path.isfile(pixels)
+        children = psutil.Process(srv.proc.pid).children(recursive=True)
+        srv.proc.kill()
+        srv.proc.wait(10)
+        _, alive = psutil.wait_procs(children, timeout=15)
+        assert not alive, [p.name() for p in alive]
+        assert os.path.isdir(ipc_dir) and os.path.isfile(pixels)
+        with Server(model, tmp_path).start() as nxt:
+            assert not os.path.exists(ipc_dir) and not os.path.exists(pixels)
+        log = nxt.log_path.read_text()
+        removed = [ipc_dir] + ([pixels] if os.path.dirname(pixels) != ipc_dir else [])  # macOS: the arena in it
+        assert all(f"removed {path} (" in log for path in removed), log
+    assert os.path.isdir(old_dir) and os.path.isfile(old_arena)
 
 
 INFO = {"observability": {"log_level": "info"}}  # the launcher's `stopped (exit code N)` line, and the parent watch's
