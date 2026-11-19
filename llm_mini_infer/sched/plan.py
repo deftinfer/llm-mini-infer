@@ -22,11 +22,11 @@ Struct-of-arrays numpy views, handed to the runner by reference. Sections and th
    made with the vocabulary (`vocab`; otherwise their widths are 0 and every admission is neutral): `admit_rep`,
    `admit_pres`, `admit_freq` (neutral 1, 0, 0) and `admit_prompt_len`; `ADMIT_PENALTIES` when one of the three is not
    neutral, and then `admit_prompt_bits` [n, ceil(V / 32)] holds bit t % 32 of word t / 32 for each token t at the
-   positions [0, seq_len) (the cached prefix: never past the prompt, the scheduler caps such a request's match there),
-   rewritten whole for every such admission; `admit_bias_n` entries of `admit_bias_ids` [n, MAX_LOGIT_BIAS] (distinct,
-   ascending) and `admit_bias_val` (any admission). The runner counts what follows itself: an explicit token at a
-   position below `prompt_len` is a prompt token, any later one (a readmission's recomputed outputs, a forced prefix)
-   and every sample it commits an output token.
+   positions [0, seq_len) (the cached prefix: never past the prompt, the scheduler caps such a request's match there;
+   zero for the plan's other admissions; width 0 in a plan without a penalised one); `admit_bias_n` entries of
+   `admit_bias_ids` [n, w] (distinct, ascending; w the plan's largest count, the rest zero) and `admit_bias_val`. The
+   runner counts what follows itself: an explicit token at a position below `prompt_len` is a prompt token, any later
+   one (a readmission's recomputed outputs, a forced prefix) and every sample it commits an output token.
 3. **PAGES** `page_slot/page_index/page_id` — set `row[slot][index] = page_id` (set semantics: writing an
    existing entry replaces it). Page 0 is the null page. Rows of different slots may name the same page: shared
    pages hold a cached prefix and are read-only.
@@ -387,6 +387,7 @@ class PlanBuilder:
         self.max_query_len = 0
         self.emb_on = self.rope_on = False  # the plan has image tokens / M-RoPE rows
         self.enc = []
+        self.max_bias, self.any_pen = 0, False  # the widths of the ADMIT terms' arrays (`finish`)
 
     def add_fold(self, slot: int, n: int) -> None:
         """FOLD: apply the first n pending window records of `slot` to its live state (FOLD_ALL: every one)."""
@@ -415,7 +416,9 @@ class PlanBuilder:
         if nb:
             b.admit_bias_ids[i, :nb] = bias_ids
             b.admit_bias_val[i, :nb] = bias_val
+            self.max_bias = max(self.max_bias, nb)
         if pen:
+            self.any_pen = True
             flags |= ADMIT_PENALTIES
             seen = np.zeros(b.admit_prompt_bits.shape[1] * 32, bool)
             if seq_len:
@@ -614,9 +617,18 @@ class PlanBuilder:
         p.admit_max_len = b.admit_max_len[:na]
         p.admit_stop = b.admit_stop[:na]
         p.admit_rep, p.admit_pres, p.admit_freq = b.admit_rep[:na], b.admit_pres[:na], b.admit_freq[:na]
-        p.admit_prompt_len, p.admit_prompt_bits = b.admit_prompt_len[:na], b.admit_prompt_bits[:na]
-        p.admit_bias_n, p.admit_bias_ids, p.admit_bias_val = (b.admit_bias_n[:na], b.admit_bias_ids[:na],
-                                                              b.admit_bias_val[:na])
+        p.admit_prompt_len, p.admit_bias_n = b.admit_prompt_len[:na], b.admit_bias_n[:na]
+        w = self.max_bias  # the arrays' every entry set (plans are compared whole: tests/scripts/plandiff.py)
+        if w:
+            for i in np.flatnonzero(b.admit_bias_n[:na] < w).tolist():
+                b.admit_bias_ids[i, b.admit_bias_n[i]:w] = 0
+                b.admit_bias_val[i, b.admit_bias_n[i]:w] = 0
+        p.admit_bias_ids, p.admit_bias_val = b.admit_bias_ids[:na, :w], b.admit_bias_val[:na, :w]
+        if self.any_pen:
+            b.admit_prompt_bits[:na][(b.admit_flags[:na] & ADMIT_PENALTIES) == 0] = 0
+            p.admit_prompt_bits = b.admit_prompt_bits[:na]
+        else:
+            p.admit_prompt_bits = b.admit_prompt_bits[:na, :0]
         npg = self.n_pages
         p.page_slot = b.page_slot[:npg]
         p.page_index = b.page_index[:npg]

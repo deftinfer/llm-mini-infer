@@ -1,5 +1,6 @@
-"""The penalties' and logit bias's runs on the tiny models (tests/runner/test_cuda_penalties.py): requests through the scheduler and engine loop, each token's logits from the
-runner's hook, and the oracle, vLLM's terms written from its v2 sampler (`vllm_terms`)."""
+"""The penalties' and logit bias's runs on the tiny models (tests/runner/test_cuda_penalties.py): requests through
+the scheduler and engine loop, each token's logits from the runner's hook, and the oracle, vLLM's terms written from
+its v2 sampler (`vllm_terms`)."""
 
 from __future__ import annotations
 

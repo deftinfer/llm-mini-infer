@@ -51,9 +51,9 @@ class FakeChecks:
         if not self.penalties:
             self._fail(plan, "ADMIT with penalties or a logit bias, but this runner takes none")
         words = -(-self.vocab // 32)
-        if plan.admit_prompt_bits.shape[1:] != (words,) or plan.admit_bias_ids.shape[1:] != (MAX_LOGIT_BIAS,):
+        if (pen and plan.admit_prompt_bits.shape[1] != words) or nb > plan.admit_bias_ids.shape[1]:
             self._fail(plan, f"ADMIT terms' widths {plan.admit_prompt_bits.shape[1:]}, {plan.admit_bias_ids.shape[1:]} "
-                             f"for a vocabulary of {self.vocab}")
+                             f"for a vocabulary of {self.vocab} and {nb} bias entries")
         ids = plan.admit_bias_ids[i, :nb]
         if not 0 <= nb <= MAX_LOGIT_BIAS or (nb and (ids[0] < 0 or ids[-1] >= self.vocab or
                                                      (np.diff(ids) <= 0).any())):
