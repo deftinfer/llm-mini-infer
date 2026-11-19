@@ -159,7 +159,7 @@ RUN find /opt/llm-mini-infer/src "$CUTLASS_HOME" -type f -exec touch -d @0 {} + 
 # /opt/llm-mini-infer/kernels, whose directory is the cache key (sources, `nvcc --version`, flags). The build fails on
 # any other bytes or key, so a kernel change updates these (docs/development.md, "The kernels' recorded bytes").
 ARG KERNELS_SHA256="\
-740b09cc33ceed4a9dc0dea88dbcddb9f13ce5c9775c2383b1efb02f1b986121:120-54b7316d115e8153/libllm_mini_infer_kernels.so \
+868ebde9f40f418df36a9b1a00890c8654b37ec97d34d63384b328a4c0713a94:120-3ed797026c6de1c0/libllm_mini_infer_kernels.so \
 f3e7d12493d607e2d8887fd995c753278e450a5d47a450757d958cc7280d8d98:cutlass-120a-da5aebbd96ce381f/libllm_mini_infer_cutlass.so"
 RUN if [ "$ARCHS" = 120 ]; then \
         cd /opt/llm-mini-infer/kernels && for e in $KERNELS_SHA256; do echo "${e%%:*}  ${e#*:}"; done \
