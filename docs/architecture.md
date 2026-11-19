@@ -263,6 +263,7 @@ Block-FP8 checkpoints (one scale per 128 × 128 block) load through one path for
 - **Counter-based Gumbel-max.** The noise depends only on (seed, position, token), never on the batch; its hash is exact integer arithmetic, so CPU and CUDA draw the same uniform value (their fp32 logs may round differently). A seeded request's tokens depend on its batch only through its logits ([Batch invariance](#batch-invariance)). Ties go to the lowest token id, and top-p's mass is summed in fp64.
 - One fused kernel samples every row of a step for greedy and every filter, inside the graph. It matches the torch reference token for token, unless a top-p sum lands within about 1e-13 of its threshold.
 - A request without a seed (or with -1) draws one from a generator seeded by `scheduler.seed`.
+- **Penalties and `logit_bias`** (`server.penalties`, off by default) are vLLM's v2 runner's, in fp32 on each logit before temperature and the filters: the bias (clamped to ±100), then `repetition_penalty` over the prompt's and the output's tokens, then the frequency and presence terms over the output's. Greedy takes the argmax after them; a grammar's mask still excludes tokens, and logprobs stay raw. The runner keeps one int32 per sequence slot and token (the prompt's tokens are counted at admission and in prefill rows, the output's as they are committed) and a bias table, taken from the KV pool. Under MTP each verify position counts the drafts before it, and only the accepted tokens count afterwards; drafters sample without the terms, so only acceptance pays. A preempted request's readmission recomputes its earlier outputs, so that they are counted.
 - **Logprobs** (`server.logprobs`, off by default) are vLLM's default `raw_logprobs`: from the logits the sampler read, before temperature and the filters, with the grammar's mask applied, over the whole vocabulary. An eager pass after the step's sampling computes the values of the rows that asked, so no step that asks for none runs another kernel. The sparse head's values are the dense head's, since its union holds every token the mask allows; under MTP each delivered token is scored at its own verify position. The forced prefix's tokens and the EOS-free finish's EOS have a mask that allows them alone: their logprob is 0. `runner/cuda/logprobs.py` and `output/logprobs.py` hold the details.
 
 ### Speculative decoding
@@ -416,6 +417,6 @@ This list holds what may come. [Scope and decisions](#scope-and-decisions) lists
 - Tensor parallelism, and any engine for more than one GPU.
 - An Apple Silicon (MLX) runner.
 - Mixture-of-experts models (Gemma 4 26B-A4B, Qwen3.5 MoE), and other model families.
-- `prompt_logprobs`, penalties, `logit_bias`, `min_tokens`, a thinking budget.
+- `prompt_logprobs`, `min_tokens`, a thinking budget.
 - Validation on GPUs other than SM120.
 - A cache-aware router's KV events.

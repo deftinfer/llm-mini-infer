@@ -107,6 +107,10 @@ A `response_format` nested past 64 JSON levels gets the reference's 400, with it
 - the content format (a string or parts) is detected from the template's source as the reference detected it before it tracked `namespace(...)` aliases of `messages`;
 - an image whose header declares more than 178,956,970 pixels is a 400 before any decode; the reference answers 500;
 - a schema, the tools' included, of more than `structured_output.max_schema_bytes` (1 MiB) is a 400; the reference has no cap;
+- `logit_bias` is accepted under speculative decoding (the bias applies at every verify position); the reference refuses it there;
+- more than 1,024 `logit_bias` entries is a 400 "Too many logit bias tokens: N. The max size is 1024."; the reference's v2 runner raises that text as an engine error;
+- a `repetition_penalty` below 1.1754944e-38 or above 3.4028235e38 (float32's normal range) is a 400;
+- `--override-generation-config` has no setting: the model's penalties are taken as they are;
 - under `priority`, a request that preempts itself ends the planning of running requests for that step; the reference plans the rest.
 
 ## Deploy settings
@@ -148,6 +152,7 @@ These rules follow the reference too.
 - **Images.** More than `images.max_per_request` images get "At most N image(s) may be provided in one prompt.".
 - **Refusals** carry the reference's message, its `(parameter=P, value=V)` suffix and its `param`.
 - **Sampling checks** run in the reference's order: `temperature` in [0, 2], `top_p` in (0, 1], `top_k` −1, 0 or at least 1, `min_p` in [0, 1], `max_tokens` at least 1, a signed 64-bit `seed` (−1 for none), and no empty stop string.
+- **Penalties** need `server.penalties`; without it, a field set to a non-neutral value (`repetition_penalty` 1, the others 0, an empty or null `logit_bias` are neutral) is a 400 "penalties and logit_bias are off on this server (server.penalties)", with the field as param. `presence_penalty` and `frequency_penalty` take [-2, 2], `repetition_penalty` a finite number above 0. `logit_bias` keys go through `int()` (a bad key is a 400 naming it) and must be vocabulary ids; values are clamped to [-100, 100].
 - **Other fields.** `max_completion_tokens` wins over `max_tokens`. An empty `stream_options` is accepted without `stream`. `"model": ""` names the served model. A `top_k` at or above the vocabulary size is off.
 - **Stop ids** outside the vocabulary get the reference's 400. A repeated id counts once, and more than 16 distinct ids are a 400.
 - **Unknown model.** A 404 "The model `X` does not exist. Valid aliases: ..." names the served models, on chat, `/tokenize` and `/detokenize`.
@@ -164,6 +169,7 @@ These rules follow the reference too.
 ### Sampling, grammars and drafts
 
 - **Greedy.** Only a `temperature` of 0 is greedy, and ties go to the lowest id. A `temperature` in (0, 0.01) is raised to 0.01. The filters run in the reference's order: min-p, top-k, top-p.
+- **Penalties.** The bias is added, then `repetition_penalty` divides a positive logit and multiplies a negative one for any token of the prompt or the output, then `frequency_penalty` subtracts its value times the token's output count and `presence_penalty` subtracts once for a token in the output; the temperature and the filters follow. Logprobs are before all of them (`raw_logprobs`). A bias cannot lift a token that the grammar's mask refuses. Under speculative decoding they are exact: each verify position counts the drafts before it. With `server.penalties`, the model's `generation_config.json` penalties are the defaults, as the reference's `generation_config auto` takes them; Gemma 4 31B's and Qwen3.8 27B's set none.
 - **Logprobs' values** are the reference's `raw_logprobs`: the logits after the grammar's mask, before the temperature and the filters. Ties sort by id. Each entry's token is decoded alone, with the byte-fallback correction over up to 4 tokens, and a floor of −9999.0. The sampled token comes first.
 - **Masks** are llguidance's, as the reference's `guidance` backend computes them. A refused token is never sampled.
 - **The grammar's end.** Under `guidance`, the grammar ends on the tokenizer's EOS token. Under `auto` and `xgrammar`, it ends on the model's stop ids. Under `ignore_eos`, the output after the grammar's end is not constrained.
