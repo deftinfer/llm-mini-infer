@@ -121,6 +121,7 @@ from .heads import NO_HEADS, VARIANT_HEADS, GrammarSampling, Heads
 from .images import ImageEncoder, VisionOptions
 from .logprobs import CHUNK as LP_CHUNK
 from .logprobs import LogprobsPass
+from .penalties import PenaltyTables, apply_admit, apply_explicit, commit_mtp, stage_admit, stage_explicit
 from .sampler import draw, host_plan
 
 log = logging.getLogger(__name__)
@@ -287,7 +288,7 @@ class _Staging:
     """Pinned host arrays for one step and their device twin. Two alternate; see the module docstring."""
 
     def __init__(self, device: torch.device, cap_i: int, cap_f: int, cap_rows: int, static_size: int, out_size: int,
-                 px_bytes: int = 0):
+                 px_bytes: int = 0, cap_b: int = 0):
         pin = device.type == "cuda"
         self.px = torch.empty(px_bytes, dtype=torch.uint8, pin_memory=pin) if px_bytes else None  # ENCODE's pixels
         self.npx = self.px.numpy() if self.px is not None else None
@@ -303,11 +304,15 @@ class _Staging:
         self.di = torch.empty(cap_i, dtype=torch.int64, device=device)
         self.df = torch.empty(cap_f, dtype=torch.float32, device=device)
         self.dout = torch.empty(out_size, dtype=torch.int64, device=device)  # the step's outputs, kept
-        self.ki = self.kf = self.k32 = 0
+        # int32 words copied to the device (penalties: the prompt bitsets and bias ids of admissions)
+        self.hb = torch.empty(cap_b, dtype=torch.int32, pin_memory=pin)
+        self.nb = self.hb.numpy()
+        self.db = torch.empty(cap_b, dtype=torch.int32, device=device)
+        self.ki = self.kf = self.k32 = self.kb = 0
         self.handle: _Handle | None = None  # the step that last used this buffer
 
     def reset(self) -> None:
-        self.ki = self.kf = self.k32 = 0
+        self.ki = self.kf = self.k32 = self.kb = 0
 
     def put(self, a: np.ndarray) -> int:
         off, n = self.ki, len(a)
@@ -319,8 +324,18 @@ class _Staging:
 
     def putf(self, a: np.ndarray) -> int:
         off, n = self.kf, len(a)
+        if off + n > len(self.nf):
+            raise RuntimeError(f"float staging too small ({off + n} > {len(self.nf)})")
         self.nf[off:off + n] = a
         self.kf = off + n
+        return off
+
+    def putb(self, a: np.ndarray) -> int:
+        off, n = self.kb, len(a)
+        if off + n > len(self.nb):
+            raise RuntimeError(f"int32 word staging too small ({off + n} > {len(self.nb)})")
+        self.nb[off:off + n] = a
+        self.kb = off + n
         return off
 
     def put32(self, a: np.ndarray) -> torch.Tensor:
@@ -337,6 +352,8 @@ class _Staging:
             self.di[:self.ki].copy_(self.hi[:self.ki], non_blocking=True)
         if self.kf:
             self.df[:self.kf].copy_(self.hf[:self.kf], non_blocking=True)
+        if self.kb:
+            self.db[:self.kb].copy_(self.hb[:self.kb], non_blocking=True)
         if static is not None:
             static.block.copy_(self.hs, non_blocking=True)
 
@@ -345,6 +362,9 @@ class _Staging:
 
     def f(self, off: int, n: int) -> torch.Tensor:
         return self.df[off:off + n]
+
+    def b(self, off: int, n: int) -> torch.Tensor:
+        return self.db[off:off + n]
 
 
 class _Tables:
@@ -363,6 +383,7 @@ class _Tables:
         self.top_k = torch.zeros(slots, dtype=torch.int64, device=device)
         self.seed = torch.zeros(slots, dtype=torch.int64, device=device)
         self.rope_off = torch.zeros(slots, dtype=torch.int64, device=device)  # M-RoPE offset of device-input rows
+        self.pen: PenaltyTables | None = None  # penalties and the logit bias (`runner.cuda.penalties`), when on
         self.k = k
         if k:
             c, w = cfg, 1 + k
@@ -391,6 +412,8 @@ class _Tables:
         self.pending.fill_(-1)
         self.temperature.zero_()  # slot 0 (padding) samples greedily
         self.rope_off.zero_()
+        if self.pen is not None:
+            self.pen.reset()
         if self.k:
             self.drafts.zero_()
             self.stop.fill_(-1)
@@ -415,12 +438,14 @@ class _Mirror:
         self.min_p = np.zeros(slots, np.float32)
         self.seen = np.zeros(slots, np.int32)
         self.lp = np.zeros(slots, bool)  # admitted with ADMIT_LOGPROBS
+        self.terms = np.zeros(slots, np.int32)  # penalties and the logit bias (`runner.cuda.penalties`)
+        self.prompt_len = np.zeros(slots, np.int64)
 
 
 class _Effects:
-    __slots__ = ("fold", "n_admit", "n_free", "n_kvc", "n_pages", "n_sc", "n_zero", "o_adm", "o_admseq", "o_f",
-                 "o_free", "o_kvc", "o_maxlen", "o_pid", "o_pidx", "o_pslot", "o_ropeoff", "o_sc", "o_seed", "o_ss",
-                 "o_stop", "o_topk", "o_zero")
+    __slots__ = ("explicit", "fold", "n_admit", "n_free", "n_kvc", "n_pages", "n_sc", "n_zero", "o_adm", "o_admseq",
+                 "o_f", "o_free", "o_kvc", "o_maxlen", "o_pid", "o_pidx", "o_pslot", "o_ropeoff", "o_sc", "o_seed",
+                 "o_ss", "o_stop", "o_topk", "o_zero", "terms")
 
 
 class _Layout:
@@ -517,7 +542,8 @@ def mtp_verify(s: _Static, tb: Any, r_slot: torch.Tensor, rp: int, cr: int, st: 
     no stop token, keeps the bonus below the slot's `max_len` and the sample there has status 0 (finite, mask not
     empty). The bonus (the target's sample after the `a` accepted drafts) becomes pending, and seq_len += 1 + a.
     Explicit rows advance by n_query; a SAMPLE row's sample becomes pending. Writes each sample row's outputs (tokens
-    [cr, 1 + k], n_out, status); returns per row (a, verify rows, rows that sampled)."""
+    [cr, 1 + k], n_out, status) and, with penalties, counts the committed samples (`penalties.commit_mtp`); returns
+    per row (a, verify rows, rows that sampled)."""
     kind = s.r_kind[:rp]
     ar = s.arange64[:1 + k]
     win = (s.r_s0[:rp, None] + ar[None, :]).clamp(max=max(st - 1, 0))
@@ -540,6 +566,8 @@ def mtp_verify(s: _Static, tb: Any, r_slot: torch.Tensor, rp: int, cr: int, st: 
     adv = torch.where(ver, 1 + a, s.r_nq[:rp]) * (r_slot > 0)
     tb.seq_len.index_add_(0, r_slot, adv)
     tb.pending.index_copy_(0, r_slot, torch.where(sampled, bonus, tb.pending.index_select(0, r_slot)))
+    if tb.pen is not None:  # the committed samples count for penalised slots (`runner.cuda.penalties`)
+        commit_mtp(tb.pen, r_slot, yw, n_out, ar)
     return a, ver, sampled
 
 
@@ -614,6 +642,44 @@ def check_mirror(tables: Any, mirror: Any, cuda: bool) -> None:
         raise AssertionError("pending tokens disagree with the host mirror's sampled flags")
 
 
+def warm_terms(lens: list[int]) -> list[dict | None]:
+    """Both runners' warm-up: penalties and a logit bias on its first row (greedy) and third (top-p and min-p), so the
+    sampler's terms path and their bookkeeping run before the graphs are captured."""
+    t = [dict(rep=1.1, pres=0.5, freq=0.25, prompt_len=n, bias_ids=[1, 3], bias_val=[2.0, -1.5]) for n in lens]
+    return [t[i] if i in (0, 2) else None for i in range(len(lens))]
+
+
+def stage_terms(plan: StepPlan, st: Any, adm: np.ndarray, seq: np.ndarray, mirror: Any,
+                pen: PenaltyTables | None, max_model_len: int) -> Any:
+    """Both runners' `_stage_effects` for the ADMITs' penalties and logit bias (`runner.cuda.penalties`): checked
+    against the plan's contract (`sched.plan`), staged, and the mirror's `terms` and `prompt_len` set; None when the
+    runner has no penalties, after checking that the plan brings none."""
+    from ...sched.plan import ADMIT_PENALTIES
+
+    pen_on = (plan.admit_flags & ADMIT_PENALTIES) != 0
+    nb = plan.admit_bias_n
+    if pen is None:
+        if pen_on.any() or (len(nb) and nb.any()):
+            raise PlanError(f"step {plan.step_id}: ADMIT with penalties or a logit bias, but this runner was built "
+                            "without them (server.penalties)")
+        return None
+    plen = plan.admit_prompt_len
+    if (nb < 0).any() or (nb > plan.admit_bias_ids.shape[1]).any() or (plen < 0).any() or \
+            (plen > max_model_len).any() or (pen_on & (seq > plen)).any():
+        raise PlanError(f"step {plan.step_id}: ADMIT with bias counts {nb.tolist()} or prompt lengths {plen.tolist()} "
+                        "out of range (a penalised admission resumes within its prompt)")
+    for i in np.flatnonzero(nb).tolist():
+        ids = plan.admit_bias_ids[i, :nb[i]]
+        if ids[0] < 0 or ids[-1] >= pen.vocab or (len(ids) > 1 and (np.diff(ids) <= 0).any()):
+            raise PlanError(f"step {plan.step_id}: ADMIT with logit bias ids that are not distinct, ascending and "
+                            "in the vocabulary")
+    rp = np.stack([plan.admit_rep, plan.admit_pres, plan.admit_freq])
+    if not np.isfinite(rp).all() or (plan.admit_rep <= 0).any():
+        raise PlanError(f"step {plan.step_id}: ADMIT with penalties that are not finite, or a repetition penalty "
+                        "not above 0")
+    return stage_admit(plan, mirror, st, adm, pen.vocab)
+
+
 class CudaRunner(Runner):
     def __init__(self, model_dir: str | Path, *, device: str = "cuda", dtype: torch.dtype | None = None,
                  attention: str = "auto", gdn: str = "auto", max_num_seqs: int = 64,
@@ -625,10 +691,11 @@ class CudaRunner(Runner):
                  vision_buckets: list[int] | None = None, grammar: bool = True, pdl: bool = False,
                  always_split: bool = False, sparse_head: bool = False, sparse_head_rows: int = 1024,
                  draft_universe: bool = False, batch_invariant: bool = False, attn_split_keys: int = 0,
-                 sync_check: str | None = None, logprobs: bool = False):
+                 sync_check: str | None = None, logprobs: bool = False, penalties: bool = False):
         """`batch_invariant`: a row's bits do not depend on the rows beside it (architecture.md, "Batch invariance");
         `attn_split_keys`: then a decode row's split of its full layers' keys (0: `attn512.fixed_split_keys` of the
-        longest row). `logprobs`: takes LOGPROBS rows, its head's logits kept for them (`runner.cuda.logprobs`)."""
+        longest row). `logprobs`: takes LOGPROBS rows, its head's logits kept for them (`runner.cuda.logprobs`).
+        `penalties`: takes admissions with penalties and a logit bias (`runner.cuda.penalties`)."""
         if always_split and not grammar:
             raise ValueError("always-split graphs need the grammar masks' split (structured output)")
         self.device = torch.device(device)
@@ -652,6 +719,7 @@ class CudaRunner(Runner):
         self.S, self.B = max_num_seqs, max_num_batched_tokens
         self.logprobs = logprobs
         self.lp: LogprobsPass | None = None
+        self.penalties = penalties
         self.grammar = grammar  # MASKED rows (structured output): mask buffers and the split steps' graphs
         self.always_split = always_split  # every step with rows split, masked or not; only the split graphs
         self.inv = batch_invariant
@@ -794,7 +862,7 @@ class CudaRunner(Runner):
                 prefill_step_ms=self.stats.get("prefill_step_ms", 0.0),
                 prefill_step_tokens=self.stats.get("prefill_step_tokens", 0), precise_rows=self.fp8.precise,
                 precise_step_ms=self.stats.get("precise_step_ms", 0.0), batch_invariant=self.inv,
-                logprobs=self.logprobs)
+                logprobs=self.logprobs, penalties=self.penalties)
         return self._caps
 
     def attention_counters(self) -> AttentionCounters:
@@ -948,7 +1016,8 @@ class CudaRunner(Runner):
 
     def _builder(self) -> PlanBuilder:
         pc = self.pc
-        return PlanBuilder(pc.max_num_seqs, pc.max_num_batched_tokens, pc.page_size, pc.max_model_len, self.k)
+        return PlanBuilder(pc.max_num_seqs, pc.max_num_batched_tokens, pc.page_size, pc.max_model_len, self.k,
+                           vocab=self.cfg.vocab_size if self.penalties else 0)
 
     def _allocate(self, pc: PoolConfig) -> None:
         if self._allocated:
@@ -983,8 +1052,13 @@ class CudaRunner(Runner):
             cap_i += 2 * self.img.budget + 8 * slots + 64  # ENCODE's rows, the resumes' rows and rope deltas
         if self.logprobs:  # the LOGPROBS samples' indices
             cap_i += smax + LP_CHUNK
-        self._staging = [_Staging(dev, cap_i, 3 * slots, slots, self.static.size, self.static.out.numel(),
-                                  self.img.px_bytes if self.mm else 0) for _ in range(2)]
+        cap_f, cap_b = 3 * slots, 0
+        if self.penalties:  # the device tables (`runner.cuda.penalties`), and what a step stages for them
+            self.tables.pen = PenaltyTables(slots, cfg.vocab_size, dev)
+            pi, pf, cap_b = self.tables.pen.staging(slots, tmax)
+            cap_i, cap_f = cap_i + pi, cap_f + pf
+        self._staging = [_Staging(dev, cap_i, cap_f, slots, self.static.size, self.static.out.numel(),
+                                  self.img.px_bytes if self.mm else 0, cap_b) for _ in range(2)]
         if self.inv and self.attn_kind == "flashinfer":  # our attention's plan tables beside the chain's
             from ...kernels.attn_window import FullAttention
 
@@ -1103,7 +1177,8 @@ class CudaRunner(Runner):
         rows = [(i + 1, i + 1, lens[i]) for i in range(n)]
         # with PRECISE rows possible, the first row is one: a step of both paths (the precise prefix)
         plans = [lambda: self._synthetic(b, 1, rows, pages_from=1, params=params[:n], room=room,
-                                         precise=[self.fp8.precise and i == 0 for i in range(n)])]
+                                         precise=[self.fp8.precise and i == 0 for i in range(n)],
+                                         terms=warm_terms(lens) if self.penalties else ())]
         if n * self.L <= budget:  # with grammar masks: the split path (forward, then sampling under masks)
             plans.append(lambda: self._decode_plan(b, 2, [r[0] for r in rows], ckpt_row=0 if self.k else None,
                                                    ckpt_dst=n + 1 if self.k and n + 1 < pc.num_state_slots else 0,
@@ -1150,11 +1225,12 @@ class CudaRunner(Runner):
 
     def _synthetic(self, b: PlanBuilder, step: int, rows: list[tuple[int, int, int]], *, pages_from: int,
                    free: list[int] = (), params: Any = None, ckpts: list[tuple[int, int, int]] = (),
-                   fold: list[int] = (), room: int = 0, precise: bool | list[bool] = False) -> StepPlan:
+                   fold: list[int] = (), room: int = 0, precise: bool | list[bool] = False,
+                   terms: list[dict | None] = ()) -> StepPlan:
         """A plan admitting (slot, state slot, prompt length) rows as complete prompts (STATE_ZERO | SAMPLE), with
         optional (row, offset, destination state slot) checkpoints, FOLDs (all records) and FREEs before. Each row
         gets pages for two decode steps after it, plus `room` positions. `precise`: the rows are PRECISE (one flag per
-        row, or one for all)."""
+        row, or one for all); `terms`: a row's penalties and logit bias (`warm_terms`)."""
         b.begin()
         for s in fold:
             b.add_fold(s, FOLD_ALL)
@@ -1164,7 +1240,7 @@ class CudaRunner(Runner):
         for i, (slot, ss, n) in enumerate(rows):
             p = params[i] if isinstance(params, list) else (params or (0.0, 1.0, 0, 0.0))
             b.add_admit(slot, ss, 0, p[0], p[1], p[2], p[3], seed=1234 + slot, max_len=self.pc.max_model_len,
-                        stop=[])
+                        stop=[], **(terms[i] or {} if i < len(terms) else {}))
             npg = -(-(n + 2 + 2 * self.L + room) // self.ps)
             b.add_pages(slot, 0, list(range(page, page + npg)))
             page += npg
@@ -1657,13 +1733,13 @@ class CudaRunner(Runner):
             if st:
                 sel = s.s_idx[:st]
                 self._sample(hidden, pos.index_select(0, sel), s.s_slot[:st], s.out_tok[:st, 0], s.out_st[:st],
-                             tb.pending, splan, mask=mask, sparse=heads[0])
+                             tb.pending, splan, mask=mask, sparse=heads[0], terms=True)
             tb.seq_len.index_add_(0, r_slot, s.r_nq[:rp])
             return
         sel = s.s_idx[:st]
         if st:
             self._sample(hidden.index_select(0, sel), pos.index_select(0, sel), s.s_slot[:st], s.y[:st], s.y_st[:st],
-                         None, splan, mask=mask, sparse=heads[0])
+                         None, splan, mask=mask, sparse=heads[0], terms=True, window=(s.tok, sel))
         a, ver, _ = mtp_verify(s, tb, r_slot, rp, cr, st, k)
         kind = s.r_kind[:rp]
         ar = s.arange64[:L]
@@ -1728,11 +1804,13 @@ class CudaRunner(Runner):
 
     def _sample(self, hidden: torch.Tensor, qpos: torch.Tensor, slots: torch.Tensor, out: torch.Tensor,
                 status: torch.Tensor, pending: torch.Tensor | None, splan: Any, draft: bool = False,
-                mask: tuple[torch.Tensor, torch.Tensor] | None = None, sparse: bool = False, uni: bool = False) -> None:
+                mask: tuple[torch.Tensor, torch.Tensor] | None = None, sparse: bool = False, uni: bool = False,
+                terms: bool = False, window: tuple[torch.Tensor, torch.Tensor] | None = None) -> None:
         """Sample one token per row of `hidden` (its logits) at position qpos + 1 (`sampler.draw`, which writes
         `pending[slot]` too when given). `draft`: the logits of the drafter's head, over its token ids (`DraftHead`), or
         with `uni` the universe's (`SubsetHead`). `sparse`: the target's head scores this step's union only
-        (`_sparse_logits`), the masks read through its ids. `mask`: (the mask buffer, each row's mask in it or −1)."""
+        (`_sparse_logits`), the masks read through its ids. `mask`: (the mask buffer, each row's mask in it or −1).
+        `terms`, `window`: the target's penalties and logit bias (`sampler.draw`)."""
         if draft:
             head = self.gs.uni_head if uni else self.draft_head
             ids, padded, logits = head.ids, uni, head.logits(hidden)
@@ -1743,7 +1821,7 @@ class CudaRunner(Runner):
             ids, padded = None, False
             logits = self.model.logits(hidden, self.lp.dense if self.lp is not None else None)
         draw(logits, ids, padded, cuda=self.cuda, tables=self.tables, slots=slots, qpos=qpos, out=out, status=status,
-             pending=pending, plan=splan, mask=mask, vocab_ids=self._vocab_ids)
+             pending=pending, plan=splan, mask=mask, vocab_ids=self._vocab_ids, terms=terms, window=window)
 
     def _logprobs(self, h: _Handle, lay: _Layout, heads: Heads) -> None:
         """The step's LOGPROBS samples' values, after its sampling on `heads`, from the logits it read
@@ -1893,7 +1971,7 @@ class CudaRunner(Runner):
         device writes."""
         m, s_max = self.mirror, self.pc.max_num_seqs
         fx = _Effects()
-        fx.fold = None
+        fx.fold = fx.terms = None
         free, adm = plan.free_slot.astype(np.int64), plan.admit_slot.astype(np.int64)
         fx.n_free, fx.n_admit, fx.n_pages, fx.n_zero = len(free), len(adm), len(plan.page_id), 0
         if len(plan.fold_slot):
@@ -1911,6 +1989,7 @@ class CudaRunner(Runner):
             m.admitted[free] = m.sampled[free] = m.lp[free] = False
             m.seq_len[free] = m.slack[free] = 0
             m.resumed[free] = False
+            m.terms[free] = 0
             fx.o_free = st.put(free)
         n_states = self.pc.num_state_slots
         if fx.n_admit:
@@ -1931,6 +2010,7 @@ class CudaRunner(Runner):
             m.lp[adm] = (plan.admit_flags & ADMIT_LOGPROBS) != 0
             if self.lp is None and m.lp[adm].any():
                 raise PlanError(f"step {plan.step_id}: ADMIT_LOGPROBS, but this runner was built without logprobs")
+            fx.terms = self._stage_terms(plan, st, adm, seq)
             fx.o_adm, fx.o_ss, fx.o_admseq = st.put(adm), st.put(ss), st.put(seq)
             fx.o_topk = st.put(plan.admit_top_k)
             fx.o_seed = st.put(np.ascontiguousarray(plan.admit_seed).view(np.int64))
@@ -1961,7 +2041,13 @@ class CudaRunner(Runner):
             if (np.isin(dst, m.state_slot[m.admitted]) & ~np.isin(dst, now)).any():
                 raise PlanError(f"step {plan.step_id}: STATE_COPY into the live state of a running request")
             fx.o_sc = st.put(sc)
+        fx.explicit = stage_explicit(plan, m, st, self.cfg.vocab_size) if self.penalties else None
         return fx
+
+    def _stage_terms(self, plan: StepPlan, st: _Staging, adm: np.ndarray, seq: np.ndarray) -> Any:
+        """The ADMITs' penalties and logit bias (`runner.cuda.penalties`; None: the runner has none, and the plan must
+        not either). Both runners'."""
+        return stage_terms(plan, st, adm, seq, self.mirror, self.tables.pen, self.pc.max_model_len)
 
     def _apply_effects(self, fx: _Effects, st: _Staging) -> None:
         t = self.tables
@@ -2013,6 +2099,10 @@ class CudaRunner(Runner):
             z = st.i(fx.o_zero, fx.n_zero)
             p.conv.index_fill_(0, z, 0)
             p.rec.index_fill_(0, z, 0)
+        if fx.terms is not None:  # penalties and the logit bias: the admissions' rows, then the explicit rows' tokens
+            apply_admit(t.pen, fx.terms, st)
+        if fx.explicit is not None:
+            apply_explicit(t.pen, fx.explicit, st)
 
     def _layout(self, plan: StepPlan, st: _Staging) -> _Layout:
         """SCHED → this step's row order and kernel metadata, all on the host; advances the mirror."""
