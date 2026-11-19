@@ -976,11 +976,11 @@ class Scheduler:
             reason = "logprobs, but this runner computes none"
         elif msg.logprobs > MAX_LOGPROBS:
             reason = f"{msg.logprobs} top logprobs (at most {MAX_LOGPROBS})"
-        elif (msg.repetition_penalty, msg.presence_penalty, msg.frequency_penalty) != (1.0, 0.0, 0.0) or \
-                len(msg.bias_ids):
-            reason = self._check_penalties(msg)
         elif msg.images:
             reason = self._check_images(msg, n)
+        if reason is None and ((msg.repetition_penalty, msg.presence_penalty, msg.frequency_penalty) != (1.0, 0.0, 0.0)
+                               or len(msg.bias_ids)):
+            reason = self._check_penalties(msg)
         built = fut = None
         if reason is None and msg.grammar:
             if self.grammars is None:

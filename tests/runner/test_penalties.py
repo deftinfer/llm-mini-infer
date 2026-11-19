@@ -223,10 +223,11 @@ def test_explicit_rows_and_commits_count() -> None:
     assert sorted(torch.nonzero(w < 0)[:, 0].tolist()) == [4, 8, 9]
     assert int(w[9] & COUNT) == 2 and int(w[4] & COUNT) == 1 and int(w[8] & COUNT) == 0
     assert not bool(pt.cnt[2].any())
-    yw = torch.tensor([[7, 7, 3, 7], [5, 5, 5, 5], [6, 0, 0, 0]])
-    commit_mtp(pt, torch.tensor([1, 2, 1]), yw, torch.tensor([3, 4, 1]), torch.arange(4))
+    yw = torch.tensor([[7, 7, 3, 7], [5, 5, 5, 5], [6, 0, 0, 0], [8, 0, 0, 0]])
+    nw = torch.tensor([[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [1, 0, 0, 0]])  # the last: a non-finite sample
+    commit_mtp(pt, torch.tensor([1, 2, 1, 1]), yw, torch.tensor([3, 4, 1, 1]), nw, torch.arange(4))
     assert int(pt.cnt[1, 7] & COUNT) == 2 and int(pt.cnt[1, 3] & COUNT) == 1 and int(pt.cnt[1, 6] & COUNT) == 1
-    assert int(pt.cnt[1, 4] & COUNT) == 1 and not bool(pt.cnt[2].any())
+    assert int(pt.cnt[1, 4] & COUNT) == 1 and int(pt.cnt[1, 8] & COUNT) == 0 and not bool(pt.cnt[2].any())
 
 
 def test_the_builder_sets_the_flag() -> None:
@@ -245,3 +246,29 @@ def test_the_builder_sets_the_flag() -> None:
     for kw in (dict(rep=1.1), dict(bias_ids=[1], bias_val=[1.0])):
         with pytest.raises(ValueError, match="vocab"):
             plain.add_admit(2, 2, 0, 0.0, 1.0, 0, 0.0, 5, **kw)
+
+
+def test_the_staging_holds_a_worst_step() -> None:
+    """Every slot admitted at once, each penalised with a cached prefix and 1,024 bias entries, beside a full budget of
+    a penalised slot's explicit tokens: what `PenaltyTables.staging` reserves holds it."""
+    slots, budget = 4, 64
+    pt, m = PenaltyTables(slots + 1, V, torch.device("cpu")), mirror(slots + 1)
+    pi, pf, pb = pt.staging(slots + 1, budget)
+    st = _Staging(torch.device("cpu"), pi, pf, 8, 4, 4, cap_b=pb)
+    b = PlanBuilder(slots, budget, 4, 1024, vocab=V)
+    ids = list(range(0, 2 * MAX_LOGIT_BIAS, 2))[:MAX_LOGIT_BIAS]
+    ids = [i % V for i in ids]
+    ids = sorted(set(ids))
+    b.begin()
+    for s in range(1, slots + 1):
+        b.add_admit(s, s, 3, 0.0, 1.0, 0, 0.0, 5, rep=1.2, prompt_len=200, prompt=np.arange(3, dtype=np.int32),
+                    bias_ids=ids, bias_val=[1.0] * len(ids))
+    b.add_explicit_row(1, np.arange(budget, dtype=np.int32) % V, 3, SAMPLE)
+    plan = b.finish(1)
+    adm = plan.admit_slot.astype(np.int64)
+    fx = stage_terms(plan, st, adm, plan.admit_seq_len.astype(np.int64), m, pt, 1024)
+    e = stage_explicit(plan, m, st, V)
+    st.upload(None)
+    apply_admit(pt, fx, st)
+    apply_explicit(pt, e, st)
+    assert int(pt.bias_n[slots]) == len(ids) and int((pt.cnt[1] < 0).sum()) == budget

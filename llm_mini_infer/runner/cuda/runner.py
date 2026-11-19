@@ -567,7 +567,7 @@ def mtp_verify(s: _Static, tb: Any, r_slot: torch.Tensor, rp: int, cr: int, st: 
     tb.seq_len.index_add_(0, r_slot, adv)
     tb.pending.index_copy_(0, r_slot, torch.where(sampled, bonus, tb.pending.index_select(0, r_slot)))
     if tb.pen is not None:  # the committed samples count for penalised slots (`runner.cuda.penalties`)
-        commit_mtp(tb.pen, r_slot, yw, n_out, ar)
+        commit_mtp(tb.pen, r_slot, yw, n_out, nw, ar)
     return a, ver, sampled
 
 

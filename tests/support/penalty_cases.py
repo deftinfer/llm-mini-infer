@@ -54,20 +54,21 @@ def add_request(q: dict) -> AddRequest:
 
 def run(kind: str, model: Any, reqs: list[dict], *, k: int = 0, penalties: bool = True, budget: int = 64,
         num_pages: int = 512, max_num_seqs: int = 4, ckpt_slots: int = 0, caching: bool = True,
-        sequential: bool = False, hook: bool = True, window: int = 8, wps: int = 4,
-        make: Any = None) -> tuple[dict, dict, Scheduler]:
+        sequential: bool = False, hook: bool = True, window: int = 8, wps: int = 4, make: Any = None,
+        **kw: Any) -> tuple[dict, dict, Scheduler]:
     """`reqs` through the scheduler and engine loop until idle (`sequential`: each to completion before the next is
     added, so later ones hit earlier ones' prefixes): ({rid: (tokens, finish)}, {(rid, position): the logits there,
     the last computed}, the scheduler). `penalties`: the runner and scheduler take them (`server.penalties`); `make`:
-    the runner (default: on CPU)."""
+    the runner (default: on CPU), with `kw`."""
     if kind == "qwen":
         pc = pools(max_num_seqs=max_num_seqs, budget=budget, page_size=wps, mtp_k=k, num_pages=num_pages,
                    state_slots=max_num_seqs + 1 + ckpt_slots)
-        r = (make or cpu_runner)(model, pc, penalties=penalties)
+        r = (make or cpu_runner)(model, pc, penalties=penalties, **kw)
         extra: dict = {}
     else:
         pc = gemma_pools(max_num_seqs=max_num_seqs, budget=budget, page_size=wps, mtp_k=k, num_pages=num_pages)
-        r = (make or gemma_cpu_runner)(model[0], pc, penalties=penalties, mtp_k=k, assistant=model[1] if k else None)
+        r = (make or gemma_cpu_runner)(model[0], pc, penalties=penalties, mtp_k=k, assistant=model[1] if k else None,
+                                       **kw)
         extra = dict(window=window, window_page_size=pc.window_page_size, draft_kv=False, checkpoint_grid=wps)
     sched = Scheduler(max_num_seqs=max_num_seqs, max_num_batched_tokens=budget, max_model_len=pc.max_model_len,
                       page_size=pc.page_size, num_pages=pc.num_pages, num_state_slots=pc.num_state_slots,

@@ -65,7 +65,7 @@ class PenaltyTables:
         """What a step stages at most: int64 entries (the admissions' rows and bias indices, the explicit tokens'
         indices), fp32 entries (the three penalties, the bias values) and int32 words (bitsets, bias ids)."""
         nb = slots * MAX_LOGIT_BIAS
-        return 2 * slots + 2 * nb + max_tokens, 3 * slots + nb, slots * self.words + nb
+        return 4 * slots + 2 * nb + max_tokens, 3 * slots + nb, slots * self.words + nb
 
 
 @dataclass
@@ -186,12 +186,12 @@ def apply_explicit(pt: PenaltyTables, e: tuple[int, int, int, int], st: object) 
         flat.index_add_(0, st.i(o_q, n_q), torch.ones(n_q, dtype=torch.int32, device=flat.device))
 
 
-def commit_mtp(pt: PenaltyTables, r_slot: torch.Tensor, yw: torch.Tensor, n_out: torch.Tensor,
+def commit_mtp(pt: PenaltyTables, r_slot: torch.Tensor, yw: torch.Tensor, n_out: torch.Tensor, nw: torch.Tensor,
                ar: torch.Tensor) -> None:
     """Under MTP, after the verification (`runner.mtp_verify`; graph-safe): each row's committed samples, the first
-    `n_out` of its window's (the accepted drafts' samples and the bonus; an explicit SAMPLE row's one sample), count
-    for its slot when it is penalised. Other entries add 0."""
+    `n_out` of its window's (the accepted drafts' samples and the bonus; an explicit SAMPLE row's one sample) whose
+    status `nw` is 0, as without MTP, count for its slot when it is penalised. Other entries add 0."""
     on = (pt.terms.index_select(0, r_slot) & TERM_PEN) != 0
-    take = (ar[None, :] < n_out[:, None]) & on[:, None]
+    take = (ar[None, :] < n_out[:, None]) & on[:, None] & (nw == 0)
     idx = r_slot[:, None] * pt.vocab + yw
     pt.cnt.view(-1).scatter_add_(0, idx.reshape(-1), take.reshape(-1).to(torch.int32))
