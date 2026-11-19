@@ -7,6 +7,7 @@ keyword arguments to the pool's workers (the budget and images.max_source_pixels
 from __future__ import annotations
 
 import ast
+import os
 from pathlib import Path
 
 import pytest
@@ -101,10 +102,10 @@ def test_the_launcher_passes_the_pool_its_settings(tmp_path) -> None:
         def start(self) -> None:
             pass
 
-    readies = []
+    readies, locks = [], []
     try:
         pool = launcher._start_images(cfg, SimpleNamespace(Pipe=mp.Pipe, Process=Recorded, RawArray=mp.RawArray),
-                                      str(tmp_path))
+                                      str(tmp_path), locks)
         readies = pool.start()
         respawn = pool.spawn(1, epoch=3)  # a dead worker's respawn: the same settings, its new epoch
         readies.append(respawn)
@@ -121,6 +122,8 @@ def test_the_launcher_passes_the_pool_its_settings(tmp_path) -> None:
         for r in readies:
             r.close()
         px_arena.remove(cfg.pixel_arena)
+        for fd in locks:  # the arena's lock (llm_mini_infer.leftovers), after its removal as the launcher does
+            os.close(fd)
 
 
 def test_the_guard_sees_every_import_form(tmp_path) -> None:
