@@ -4,15 +4,18 @@ the engine comparison's arms (bench/engines/arms.py), one engine after another, 
 
     python3 bench/engines/drive.py --out DIR --model gemma|qwen --family FAMILY [--engines ours,vllm,sglang] \\
         [--rotate N] [--arm NAME ...] [--engine-bin ENGINE=PATH ...] [--inherit-env] [--client-pythonpath DIR] \\
-        [--bound-file PATH] [--meta-extra JSON] [--m-concurrency 48] [--tokenizer ID] [--skip-validity] [--dry-run]
+        [--bound-file PATH] [--meta-extra JSON] [--m-concurrency 48] [--tokenizer ID] [--context N] [--skip-validity] \\
+        [--dry-run]
     python3 bench/engines/drive.py --out DIR --family control --label start|middle|end [--python PATH]
 
 **Families** (`--family`): `smoke` (the start and the smoke checks), `A1` (closed-loop loads of the head arms), `A2`
 (the highest rate within a latency bound, needs `--bound-file`), `C` (two passes of every arm and the cost of batch
 invariance), `D` (cold and warm start, then the structured-output validity run, and the grammar cost for
 llm-mini-infer), `B` (vLLM's own draft counts), `I` (each engine in both modes, c=64 scene and chat on fresh servers:
-the cost of batch invariance), `M` (qwen only: multi-turn sessions), `Q` (the head arm of each engine in its vendor
-image), `control` (the GPU control, bench/engines/gpu_control.py).
+the cost of batch invariance), `L` (long contexts, with `--context`: family I's arms under decode, prefill and
+cached-history loads; a load whose prompt and reply do not fit the context is skipped and named), `M` (qwen only:
+multi-turn sessions), `Q` (the head arm of each engine in its vendor image), `control` (the GPU control,
+bench/engines/gpu_control.py).
 
 **Layout** under `--out`: `<model>/<family>/<unit>/` holds `server.log` (private), `startup.json`, `smoke.json`, one
 `<load>.json` per load, the `/metrics` pages around it, `gpu.csv`, `manifest.json` and, last, `done`. A unit whose
@@ -68,13 +71,16 @@ CHAT = ["--workload", "chat", "--input-tokens", "1024", "--max-tokens", "256", "
 # Each load of a server starts at its own workload index (run.py's --first-index), so no load resends a request an
 # earlier one put in the server's prefix cache; the same load starts at the same index on every engine and family (a
 # family C or B load at c=64 sends A1's c=64 requests)
-FIRST = {"c1": ["--first-index", "0"], "c16": ["--first-index", "1000000"], "c64": ["--first-index", "2000000"]}
+FIRST = {"c1": ["--first-index", "0"], "c16": ["--first-index", "1000000"], "c64": ["--first-index", "2000000"],
+         "h1k": ["--first-index", "3000000"], "h8k": ["--first-index", "3100000"], "h32k": ["--first-index", "3200000"],
+         "p32k": ["--first-index", "4000000"], "p128k": ["--first-index", "4100000"],
+         "s32k": ["--first-index", "5000000"], "s128k": ["--first-index", "5100000"]}
 VERSION_PACKAGES = ("vllm", "sglang", "sglang-kernel", "llm-mini-infer", "torch", "flashinfer-python",
                     "flashinfer-cubin", "flashinfer-jit-cache", "triton", "xgrammar", "llguidance", "transformers",
                     "deep-gemm", "sgl-kernel")
 # A start that fails with one of these lines is a refusal the engine documents, not a failure
 EXPECTED_REFUSALS = ("batch_invariant mode is not supported for GDN_ATTN",)
-FAMILIES = ("smoke", "A1", "A2", "C", "D", "B", "I", "M", "Q", "control")
+FAMILIES = ("smoke", "A1", "A2", "C", "D", "B", "I", "L", "M", "Q", "control")
 
 
 # -- the engines' startup logs -----------------------------------------------------------------------------------------
@@ -453,7 +459,7 @@ def build_units(args: argparse.Namespace) -> list[Unit]:
     bad = [e for e in engines if e not in arms.ENGINES]
     if bad:
         raise SystemExit(f"--engines: unknown {', '.join(bad)}")
-    table = arms.arms(args.model)
+    table = arms.arms(args.model, args.context)
     family = args.family
     if family == "Q":
         pool = table["A1"]
@@ -530,6 +536,58 @@ def a1_rate(ctx: Ctx, arm: arms.Arm) -> float:
     return float(rate)
 
 
+# Family L's "32k" and "128k" prompts, in tokens (`long_loads`), and the room a load keeps for the chat template
+# and the request's own head beside its prompt and reply
+LONG_TOKENS = (32_000, 130_000)
+LONG_MARGIN = 64
+
+
+def tokens_of(args: list[str], flag: str) -> int:
+    """The integer after `flag` in a load's arguments; 0 when it is absent."""
+    return int(args[args.index(flag) + 1]) if flag in args else 0
+
+
+def long_loads(context: int) -> tuple[list[LoadSpec], list[str]]:
+    """Family L's loads that fit `context` (a prompt, its shared prefix and the reply's tokens within it), and a note
+    for each load left out. Decode: one client over a prompt of 1k, 8k and 32k tokens. Chat: family I's cell at c=16,
+    and at c=64 three times, each from its own first index. Prefill: every prompt distinct, one token back, so the time
+    to first token is a cold prefill. Cached: a short turn after a long shared prefix, which the warm-up requests
+    write into the cache. A "32k" or "128k" prompt is `LONG_TOKENS`' 32,000 or 130,000 tokens, so it fits a context of
+    32,768 or 131,072 beside its reply. The loads with `--requests` end with their requests (run.py ignores
+    `--warmup`, `--duration` and `--tail` for them); the long ones replace FIXED's `--timeout` (a long prompt takes
+    longer than 120 s on a slow prefill)."""
+    k32, k128 = (str(n) for n in LONG_TOKENS)
+    decode = ["--workload", "chat", "--max-tokens", "256", "--ignore-eos", "--concurrency", "1",
+              "--warmup-requests", "2"]
+    prefill = ["--workload", "chat", "--max-tokens", "1", "--concurrency", "1", "--warmup-requests", "1"]
+    cached = ["--workload", "chat", "--input-tokens", "128", "--max-tokens", "16", "--concurrency", "1",
+              "--requests", "8", "--warmup-requests", "2"]
+    long = {"--timeout": "900"}
+    c64 = [LoadSpec(f"chat-c64{'' if r == 1 else f'-r{r}'}",
+                    [*CHAT, "--concurrency", "64", "--first-index", str(int(FIRST["c64"][1]) + 100_000 * (r - 1))])
+           for r in (1, 2, 3)]
+    every = [
+        LoadSpec("decode-c1-h1k", [*decode, "--input-tokens", "1024", "--requests", "8", *FIRST["h1k"]]),
+        LoadSpec("decode-c1-h8k", [*decode, "--input-tokens", "8192", "--requests", "6", *FIRST["h8k"]]),
+        LoadSpec("decode-c1-h32k", [*decode, "--input-tokens", k32, "--requests", "4", *FIRST["h32k"]]),
+        LoadSpec("chat-c16", [*CHAT, "--concurrency", "16", *FIRST["c16"]]),
+        *c64,
+        LoadSpec("prefill-32k", [*prefill, "--input-tokens", k32, "--requests", "3", *FIRST["p32k"]], long),
+        LoadSpec("prefill-128k", [*prefill, "--input-tokens", k128, "--requests", "3", *FIRST["p128k"]], long),
+        LoadSpec("cached-32k", [*cached, "--shared-prefix-tokens", k32, *FIRST["s32k"]], long),
+        LoadSpec("cached-128k", [*cached, "--shared-prefix-tokens", k128, *FIRST["s128k"]], long)]
+    kept, skipped = [], []
+    for spec in every:
+        need = tokens_of(spec.args, "--shared-prefix-tokens") + tokens_of(spec.args, "--input-tokens")
+        need += tokens_of(spec.args, "--max-tokens")
+        if need + LONG_MARGIN <= context:
+            kept.append(spec)
+        else:
+            skipped.append(f"load {spec.name} skipped: its prompt and reply take {need:,} tokens, the context is "
+                           f"{context:,}")
+    return kept, skipped
+
+
 def loads_for(ctx: Ctx, unit: Unit) -> list[LoadSpec]:
     """The loads of a unit, in order. Raises LookupError when A2 has no A1 rate to start from."""
     fam, args = unit.family, ctx.args
@@ -556,6 +614,11 @@ def loads_for(ctx: Ctx, unit: Unit) -> list[LoadSpec]:
     if fam == "I":
         return [LoadSpec("scene-c64", [*SCENE, "--concurrency", "64", *FIRST["c64"]]),
                 LoadSpec("chat-c64", [*CHAT, "--concurrency", "64", *FIRST["c64"]])]
+    if fam == "L":
+        kept, skipped = long_loads(unit.arm.context)
+        for note in skipped:
+            ctx.log(f"{unit.name}: {note}")
+        return kept
     if fam in ("B", "Q"):
         return [LoadSpec("scene-c1", [*SCENE, "--concurrency", "1", "--requests", "100", *FIRST["c1"]]),
                 LoadSpec("scene-c64", [*SCENE, "--concurrency", "64", *FIRST["c64"]])]
@@ -998,6 +1061,8 @@ def write_unit(ctx: Ctx, unit: Unit, udir: Path, log_path: Path, binary: str, en
     if not (udir / "startup.json").exists():
         write_json(udir / "startup.json", {"starts": oc.starts, "wiped": None, "evicted": None})
     deviations = list(arm.deviations)
+    if unit.family == "L":
+        deviations += long_loads(arm.context)[1]
     if unit.family == "D" and ctx.args.skip_validity:
         deviations.append("no structured-output validity run (--skip-validity)")
     if arm.engine == "sglang" and not ctx.args.inherit_env:  # a vendor image has no venv to compare with
@@ -1077,6 +1142,8 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--bound-file", help="family A2: the latency bound")
     ap.add_argument("--meta-extra", default="{}", help="JSON merged into every manifest")
     ap.add_argument("--m-concurrency", type=int, default=48, help="family M: conversations in flight")
+    ap.add_argument("--context", type=int, default=arms.CONTEXT, help="the context every arm serves (default: "
+                    "%(default)s); family L's loads that do not fit it are skipped")
     ap.add_argument("--tokenizer", help="the clients' tokenizer: a folder or repo id (default: the model's repo id)")
     ap.add_argument("--label", choices=("start", "middle", "end"), help="family control: the file's name")
     ap.add_argument("--python", help="family control: the interpreter that runs the control")

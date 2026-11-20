@@ -7,11 +7,11 @@ Three engines serve each model in turn on one GPU, on the loopback interface, wi
 - `vllm`: vLLM v0.33.0, from its CUDA 13 release wheel in a venv of its own;
 - `sglang`: SGLang v0.5.23, from its CUDA 13 wheels in a venv of its own.
 
-**Held equal** on every arm: the context (`CONTEXT`: llm-mini-infer's batch invariance is on by its own default at
-this length), the sequences in flight (`SEQS`; SGLang on Qwen3.8 `SGLANG_QWEN_SEQS`, a named deviation), the KV cache
-in the model's dtype, each model's default image budget, prefix caching on, structured output with llguidance and
-compact JSON, the same drafter and draft count (`k`), seed 0, no reasoning parser on vLLM or SGLang (every request
-turns thinking off). **Not held equal**, recorded per arm: the
+**Held equal** on every arm: the context (`CONTEXT` unless the run sets one: llm-mini-infer's batch invariance is on
+by its own default up to 8,184 positions, `OURS_INVARIANT_MAX_LEN`), the sequences in flight (`SEQS`; SGLang on Qwen3.8
+`SGLANG_QWEN_SEQS`, a named deviation), the KV cache in the model's dtype, each model's default image budget, prefix
+caching on, structured output with llguidance and compact JSON, the same drafter and draft count (`k`), seed 0, no
+reasoning parser on vLLM or SGLang (every request turns thinking off). **Not held equal**, recorded per arm: the
 memory budget (vLLM 0.9, llm-mini-infer 0.9 by its default, SGLang its computed static fraction), the per-step token
 budget, the FP8 GEMM kernel and the attention backend: each engine's default, unless an arm names an override.
 
@@ -28,7 +28,10 @@ import json
 import os
 from dataclasses import dataclass, field
 
-CONTEXT = 8184  # the context of every arm; llm-mini-infer's batch invariance needs at most 8,184 positions
+CONTEXT = 8184  # the default context of every arm: the longest llm-mini-infer's batch invariance is on at by default
+# llm-mini-infer's own rule (llm_mini_infer/config.py: `BATCH_INVARIANT_MAX_LEN` less 8, the `short` test): batch
+# invariance is on by default while model.max_model_len + 8 <= 32 * 256; a test pins this to the package's constant
+OURS_INVARIANT_MAX_LEN = 8184
 SEQS = 64  # sequences in flight
 HOST, PORT = "127.0.0.1", 8000
 ENGINES = ("ours", "vllm", "sglang")
@@ -90,9 +93,10 @@ class Arm:
     engine: str
     model: str  # a key of MODELS
     k: int | None = None  # None: the model's headline k
-    batch_invariant: bool | None = None  # None: the engine's default (llm-mini-infer: on at CONTEXT; the others: off)
+    batch_invariant: bool | None = None  # None: the engine's default (llm-mini-infer: on up to 8,184; the others: off)
     sets: tuple[str, ...] = ()  # llm-mini-infer: more --set values (the multi-turn cell's cache settings)
     seqs: int | None = None  # the sequences in flight; None: SEQS (a named deviation)
+    context: int = CONTEXT  # the context every engine serves (a named part of the unit's folder when not CONTEXT)
     env_set: tuple[tuple[str, str], ...] = ()  # variables set in the arm's environment (a named variant)
     attention: str | None = None  # an attention backend forced on top of the arm's own (a named fallback)
     drop: tuple[str, ...] = ()  # flags left out of the arm's command (a named deviation)
@@ -113,21 +117,26 @@ class Arm:
         parts = [self.engine]
         if self.k is not None and self.k != MODELS[self.model].k:
             parts.append(f"k{self.k}")
-        if self.batch_invariant is not None and self.batch_invariant != default_batch_invariant(self.engine):
+        if self.context != CONTEXT:
+            parts.append(f"ctx{self.context}")
+        default = default_batch_invariant(self.engine, self.context)
+        if self.batch_invariant is not None and self.batch_invariant != default:
             parts.append("bi" if self.batch_invariant else "nobi")
         if self.label:
             parts.append(self.label)
         return "-".join(parts)
 
 
-def default_batch_invariant(engine: str) -> bool:
-    """Each engine's own mode at CONTEXT: llm-mini-infer's batch invariance is on by default at a context of at most
-    8,184 positions on these block-FP8 checkpoints; vLLM's and SGLang's are off unless asked for."""
-    return engine == "ours"
+def default_batch_invariant(engine: str, context: int = CONTEXT) -> bool:
+    """Each engine's own mode at `context`: llm-mini-infer's batch invariance is on by default at a context of at most
+    8,184 positions (`OURS_INVARIANT_MAX_LEN`) on these block-FP8 checkpoints; vLLM's and SGLang's are off unless asked
+    for."""
+    return engine == "ours" and context <= OURS_INVARIANT_MAX_LEN
 
 
 def batch_invariant(arm: Arm) -> bool:
-    return default_batch_invariant(arm.engine) if arm.batch_invariant is None else arm.batch_invariant
+    default = default_batch_invariant(arm.engine, arm.context)
+    return default if arm.batch_invariant is None else arm.batch_invariant
 
 
 def argv(arm: Arm, binary: str | None = None, config: str | None = None) -> list[str]:
@@ -143,7 +152,7 @@ def argv(arm: Arm, binary: str | None = None, config: str | None = None) -> list
         cmd = [exe, "serve", "--config", config, "--set", f"model.path={m.id}"]
         if m.drafter:
             cmd += ["--set", f"speculative.model={m.drafter}"]
-        cmd += ["--set", f"model.max_model_len={CONTEXT}", "--set", f"scheduler.max_num_seqs={seqs}",
+        cmd += ["--set", f"model.max_model_len={arm.context}", "--set", f"scheduler.max_num_seqs={seqs}",
                 "--set", f"server.host={HOST}", "--set", f"server.port={PORT}",
                 "--set", f"speculative.num_speculative_tokens={k}",
                 "--set", "server.stop_with_parent=true"]  # it stops when the driver exits without stopping it
@@ -155,7 +164,7 @@ def argv(arm: Arm, binary: str | None = None, config: str | None = None) -> list
         spec: dict = {"method": "mtp", "num_speculative_tokens": k}
         if m.drafter:
             spec = {"method": "mtp", "model": m.drafter, "num_speculative_tokens": k}
-        cmd = [exe, "serve", m.id, "--host", HOST, "--port", str(PORT), "--max-model-len", str(CONTEXT),
+        cmd = [exe, "serve", m.id, "--host", HOST, "--port", str(PORT), "--max-model-len", str(arm.context),
                "--max-num-seqs", str(seqs), "--gpu-memory-utilization", "0.9", "--enable-prefix-caching",
                "--limit-mm-per-prompt", json.dumps({"image": 16}, separators=(",", ":")), "--seed", "0",
                "--enable-prompt-tokens-details",
@@ -164,7 +173,7 @@ def argv(arm: Arm, binary: str | None = None, config: str | None = None) -> list
                "--speculative-config", json.dumps(spec, separators=(",", ":"))]
     elif arm.engine == "sglang":
         cmd = [exe, "serve", "--model-path", m.id, "--host", HOST, "--port", str(PORT),
-               "--max-running-requests", str(seqs), "--context-length", str(CONTEXT), "--enable-metrics",
+               "--max-running-requests", str(seqs), "--context-length", str(arm.context), "--enable-metrics",
                "--enable-cache-report", "--random-seed", "0",
                "--grammar-backend", "llguidance", "--constrained-json-disable-any-whitespace"]
         if arm.model == "gemma":
@@ -234,33 +243,36 @@ def env(arm: Arm, binary: str | None = None, base: dict[str, str] | None = None)
     return out
 
 
-def arms(model: str) -> dict[str, list[Arm]]:
-    """The arms of each family for one model (bench/engines/drive.py runs them)."""
+def arms(model: str, context: int = CONTEXT) -> dict[str, list[Arm]]:
+    """The arms of each family for one model at one context (bench/engines/drive.py runs them)."""
     def arm(engine: str, **kw) -> Arm:
         if model == "qwen" and engine == "sglang":  # its fp32 mamba state does not fit 64 sequences
             kw.update(seqs=SGLANG_QWEN_SEQS, deviations=(*kw.get("deviations", ()), SGLANG_QWEN_DEVIATION))
-        return Arm(engine, model, **kw)
+        return Arm(engine, model, context=context, **kw)
 
     head = [arm(e) for e in ENGINES]
-    other_mode = [arm(e, batch_invariant=not default_batch_invariant(e)) for e in ENGINES]
-    own = [Arm("vllm", model, k=k) for k, _ in VLLM_OWN_K[model]]
+    other_mode = [arm(e, batch_invariant=not default_batch_invariant(e, context)) for e in ENGINES]
+    own = [Arm("vllm", model, k=k, context=context) for k, _ in VLLM_OWN_K[model]]
     # The cost of batch invariance (family I): each engine in both modes, on fresh servers; vLLM's invariance on Gemma
     # 4 with DeepGEMM off (vLLM refuses it on Qwen3.8's GDN attention)
     invariant = other_mode
     if model == "gemma":
-        nodg = Arm("vllm", model, batch_invariant=True, env_set=VLLM_NO_DEEP_GEMM, label="nodg",
+        nodg = Arm("vllm", model, batch_invariant=True, env_set=VLLM_NO_DEEP_GEMM, label="nodg", context=context,
                    deviations=(VLLM_NO_DEEP_GEMM_DEVIATION,))
         invariant = [nodg if a.engine == "vllm" else a for a in other_mode]
         other_mode = [*other_mode, nodg]
     out = {"smoke": head + other_mode, "A1": head, "A2": head, "C": head + other_mode, "D": head, "S": head,
            "B": own, "I": [a for pair in zip(head, invariant, strict=True) for a in pair]}
+    out["L"] = list(out["I"])  # the long contexts: each engine in both modes, usually ours alone (--engines ours)
     if model == "qwen":
         # The multi-turn cell: llm-mini-infer with superseded checkpoints demoted and not, at checkpoint slots below
         # the conversations in flight; vLLM's and SGLang's own caches (capacity not matched)
         slots = "dev.cache.checkpoint_slots=24"
-        out["M"] = [Arm("ours", model, sets=("dev.cache.demote_superseded=true", slots), label="demote"),
-                    Arm("ours", model, sets=("dev.cache.demote_superseded=false", slots), label="nodemote"),
-                    Arm("vllm", model), arm("sglang")]
+        out["M"] = [Arm("ours", model, sets=("dev.cache.demote_superseded=true", slots), label="demote",
+                        context=context),
+                    Arm("ours", model, sets=("dev.cache.demote_superseded=false", slots), label="nodemote",
+                        context=context),
+                    Arm("vllm", model, context=context), arm("sglang")]
     return out
 
 
