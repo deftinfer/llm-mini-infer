@@ -47,7 +47,8 @@ from pathlib import Path
 
 here = Path(__file__).resolve().parent
 args = sys.argv[1:]
-port = int(args[args.index("--port") + 1]) if "--port" in args else 8000
+port = int(args[args.index("--port") + 1]) if "--port" in args else next(
+    (int(a.split("=", 1)[1]) for a in args if a.startswith("server.port=")), 8000)  # vLLM's and SGLang's, or ours
 mode = (here / "mode").read_text().strip()
 if mode == "gdn":
     print("ValueError: batch_invariant mode is not supported for GDN_ATTN", flush=True)
@@ -84,7 +85,7 @@ class H(BaseHTTPRequestHandler):
             with lock:
                 page = ('# TYPE vllm:spec_decode_num_drafts_total counter\n'
                         f'vllm:spec_decode_num_drafts_total{{engine="0"}} {state["drafts"]}\n'
-                        f'vllm:generation_tokens_total{{engine="0"}} {state["tokens"]}\n')
+                        if mode != "nospec" else '') + f'vllm:generation_tokens_total{{engine="0"}} {state["tokens"]}\n'
             self.send(200, page, "text/plain")
         elif self.path == "/server_info":
             self.send(200, json.dumps({"config": {}}))
@@ -295,6 +296,17 @@ def test_other_start_failure_has_no_done(rig):
     assert m["status"] == "failed" and "boom" in m["status_line"] and "/opt" not in m["status_line"]
     assert not (rig.unit() / "done").exists()
     assert findings(rig, rig.unit() / "manifest.json") == []
+
+
+def test_a_server_without_verify_steps_fails_its_smoke_unless_its_arm_drafts_nothing(rig):
+    rig.mode("nospec")
+    assert rig.run() == 1
+    assert rig.manifest()["smoke"]["failures"] == ["/metrics exports no verify-step series"]
+    out = ["--out", str(rig.out), "--model", "gemma", "--family", "K", "--engines", "ours", "--engine-bin",
+           f"ours={rig.bin}", "--tokenizer", str(rig.tok), "--arm", "ours-k0", "--load", "scene-c1"]
+    assert drive.main(out) == 0  # k = 0: its smoke needs no verify step
+    m = rig.manifest("ours-k0", "K")
+    assert m["smoke"]["ok"] is True and m["smoke"]["verify_steps"] is None and m["k"] == 0
 
 
 @pytest.mark.parametrize(("mode", "failure"), [("spaces", "compact"), ("reasoning", "reasoning")])

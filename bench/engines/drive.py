@@ -763,12 +763,14 @@ def smoke(ctx: Ctx, arm: arms.Arm) -> dict[str, Any]:
     if bad:
         fails.append("a reply holds reasoning")
     a, b = hostcheck.counter(before, hostcheck.VERIFY_SERIES), hostcheck.counter(after, hostcheck.VERIFY_SERIES)
+    drafts = arm.draft_k > 0  # an arm at k = 0 drafts nothing: no verify steps to require
     if b is None:
-        fails.append("/metrics exports no verify-step series")
+        if drafts:
+            fails.append("/metrics exports no verify-step series")
     else:
         steps = b[1] - (a[1] if a and a[0] == b[0] else 0.0)
         out["verify_steps"] = steps
-        if steps <= 0:
+        if drafts and steps <= 0:
             fails.append("no verify steps over the smoke requests")
     out.update(ok=not fails, failures=fails, seconds=round(time.monotonic() - t0, 2))
     return out
