@@ -590,9 +590,13 @@ def long_loads(context: int) -> tuple[list[LoadSpec], list[str]]:
 
 def loads_for(ctx: Ctx, unit: Unit) -> list[LoadSpec]:
     """The loads of a unit, in order, only those `--load` names when it names any (a named deviation). Raises
-    LookupError when A2 has no A1 rate to start from."""
+    LookupError when A2 has no A1 rate to start from, or when `--load` names a load the unit does not have."""
     loads = family_loads(ctx, unit)
     keep = getattr(ctx.args, "load", None) or []
+    missing = sorted(set(keep) - {spec.name for spec in loads})
+    if missing:
+        raise LookupError(f"--load {', '.join(missing)}: not among family {unit.family}'s loads here "
+                          f"({', '.join(spec.name for spec in loads) or 'none'})")
     return [spec for spec in loads if spec.name in keep] if keep else loads
 
 
