@@ -151,6 +151,13 @@ def tile_positions(nq: np.ndarray, kv: np.ndarray, group: int, rows: int = ROWS)
     return q0 + t * rows // group, q0 + last
 
 
+def split_major(items: np.ndarray) -> np.ndarray:
+    """A launch's order of its items (int32, each block's item): every group's first split, then every second, ...,
+    each in the items' order. The CTAs a GPU holds at once then read the same keys, as an unsplit launch's do, where
+    group-major they would spread over a split's worth of keys each and read most of them from memory, not the L2."""
+    return np.argsort(items[:, 3] & 0xFFFF, kind="stable").astype(np.int32)
+
+
 def launches(groups: np.ndarray, cap: int) -> list[tuple[int, int, int, int]]:
     """A step's launches under the fixed split: (first item, items, first group, groups) each, consecutive groups whose
     items' indexes in their launch stay within `cap` partials (one launch when every group fits, or none splits)."""
@@ -227,6 +234,7 @@ class Attn512:
         self.rows = [torch.zeros((max_rows + 1, 4), dtype=torch.int32, device=device) for _ in range(2)]
         n_items = max_groups * MAX_SPLITS if split_keys else max_groups + max_items
         self.items = [torch.zeros((n_items, 4), dtype=torch.int32, device=device) for _ in range(2)]
+        self.orders = [torch.zeros(n_items if split_keys else 1, dtype=torch.int32, device=device) for _ in range(2)]
         self.groups = [torch.zeros((max_groups, 2), dtype=torch.int32, device=device) for _ in range(2)]
         # decode buckets: static row, item and group tables, the launch's sizes (items, groups, split), the host
         # tables per real row count (the wave split) and what the bucket's last replay's tables were made for (its
@@ -264,18 +272,21 @@ class Attn512:
             splits = self._splits(groups, int(kv_len.max()))
             items, grp = plan_items(nq, self.group, self.hkv, splits)
             parts = [(0, len(items), 0, len(grp))]
-        dr, di, dg = self.rows[parity], self.items[parity], self.groups[parity]
+        dr, di, dg, do = self.rows[parity], self.items[parity], self.groups[parity], self.orders[parity]
         dr[:len(rows)].copy_(stage(rows.reshape(-1)).view(-1, 4), non_blocking=True)
         di[:len(items)].copy_(stage(items.reshape(-1)).view(-1, 4), non_blocking=True)
         runs = []
         for i0, ni, g0, ng in parts:  # each launch's group table counts its items from its own first one
             split = bool((grp[g0:g0 + ng, 1] > 1).any())
+            ordered = split and bool(self.split_keys)
             if split:
                 rel = grp[g0:g0 + ng].copy()
                 rel[:, 0] -= i0
                 dg[g0:g0 + ng].copy_(stage(rel.reshape(-1)).view(-1, 2), non_blocking=True)
-            runs.append((i0, ni, g0, ng, int(split)))
-        meta.full_plan = (dr, di, dg, fixed_rows, tuple(runs))
+            if ordered:  # split-major (`split_major`)
+                do[i0:i0 + ni].copy_(stage(split_major(items[i0:i0 + ni])), non_blocking=True)
+            runs.append((i0, ni, g0, ng, int(split), ordered))
+        meta.full_plan = (dr, di, dg, fixed_rows, tuple(runs), do)
 
     def _graph_host(self, bucket: int, ns: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """A bucket's item and group tables for split counts `ns` per row (padding rows 1), padded to the bucket's
@@ -338,19 +349,19 @@ class Attn512:
             it.copy_(stage(items.reshape(-1)).view(-1, 4), non_blocking=True)
             gt.copy_(stage(grp.reshape(-1)).view(-1, 2), non_blocking=True)
             self.g_last[bucket] = key
-        meta.full_plan = (dr, it, gt, bucket, ((0, n_items, 0, n_groups, split),))
+        meta.full_plan = (dr, it, gt, bucket, ((0, n_items, 0, n_groups, split, False),), None)
 
     def run(self, meta: Any, layer: Any, q: torch.Tensor, out: torch.Tensor) -> None:
-        rows, items, groups, n_dec, runs = meta.full_plan
+        rows, items, groups, n_dec, runs, orders = meta.full_plan
         if meta.fix_len:  # the true KV lengths, decided on the device (module docstring)
             rows[:meta.n_rows, 3].copy_(meta.kv_len_dev[:meta.n_rows])
         kv = self.pools.fkv[layer.index]  # [pages, page_size, Hkv, 512]
         pt = meta.page_table
         lib = build.load()
-        for i0, n_items, g0, n_groups, split in runs:  # a step past the partials: its launches in stream order
+        for i0, n_items, g0, n_groups, split, ordered in runs:  # a step past the partials: its launches in order
             _check(lib.lmk_attn512(
                 _p(q), self.h, self.hkv, _p(kv), kv.stride(0), kv.shape[1], _p(pt), pt.stride(0),
                 _p(layer.k_norm.weight), _p(self.cos), _p(self.sin), self.rot, self.scale, _p(rows), _p(items[i0:]),
                 n_items, _p(groups[g0:]), n_groups, split, self.split_keys, n_dec, self.prefill_from,
-                self.prefill_keys, _p(out), _p(self.o_part) if split else _p(None),
-                _p(self.ml_part) if split else _p(None), _stream(q)), "attn512")
+                self.prefill_keys, _p(orders[i0:]) if ordered else _p(None), _p(out),
+                _p(self.o_part) if split else _p(None), _p(self.ml_part) if split else _p(None), _stream(q)), "attn512")

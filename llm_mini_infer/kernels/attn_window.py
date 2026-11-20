@@ -51,6 +51,7 @@ from .attn512 import (
     launches,
     plan_items,
     range_splits,
+    split_major,
     tile_items,
     tile_positions,
     tiles,
@@ -264,6 +265,8 @@ class FullAttention:
         self.s_items = [torch.zeros((self.max_prefill_items * MAX_SPLITS, 4), dtype=torch.int32, device=device)
                         for _ in range(2)]
         self.s_groups = [torch.zeros((self.max_prefill_items, 2), dtype=torch.int32, device=device) for _ in range(2)]
+        self.s_orders = [torch.zeros(self.max_prefill_items * MAX_SPLITS, dtype=torch.int32, device=device)
+                         for _ in range(2)]
         # decode buckets: the static row, item and group tables, and the split counts their item and group tables
         # were last built for
         self.g_tabs: dict[int, tuple[torch.Tensor, torch.Tensor, int, torch.Tensor, int]] = {}
@@ -316,12 +319,13 @@ class FullAttention:
             keep = grp[:, 1] > 0
             items[:, 0] += fixed_rows
             grp = grp[keep]
-            si, sg = self.s_items[parity], self.s_groups[parity]
+            si, sg, so = self.s_items[parity], self.s_groups[parity], self.s_orders[parity]
             si[:len(items)].copy_(stage(items.reshape(-1)).view(-1, 4), non_blocking=True)
             for i0, ni, g0, ng in launches(grp, self.max_prefill_split):
                 rel = grp[g0:g0 + ng].copy()
                 rel[:, 0] -= i0
                 sg[g0:g0 + ng].copy_(stage(rel.reshape(-1)).view(-1, 2), non_blocking=True)
+                so[i0:i0 + ni].copy_(stage(split_major(items[i0:i0 + ni])), non_blocking=True)  # (as attn512's)
                 runs.append((i0, ni, g0, ng))
         meta.attn_plan = (dr, di, n_items, dg, n_groups, pi, len(pre), tuple(runs), parity)
 
@@ -384,9 +388,9 @@ class FullAttention:
             _check(lib.lmk_attn_full_prefill(
                 _p(q), self.h, self.hkv, _p(kv), kv.stride(0), kv.stride(1), kv.shape[2], _p(pt), pt.stride(0),
                 self.scale, _p(rows), _p(p_items), n_pre, _p(out), _stream(q)), "attn_full_prefill")
-        si, sg = self.s_items[parity], self.s_groups[parity]
+        si, sg, so = self.s_items[parity], self.s_groups[parity], self.s_orders[parity]
         for i0, ni, g0, ng in runs:  # after the unsplit tiles: a straddling tile's split queries are written last
             _check(lib.lmk_attn_full_prefill_split(
                 _p(q), self.h, self.hkv, _p(kv), kv.stride(0), kv.stride(1), kv.shape[2], _p(pt), pt.stride(0),
-                self.scale, _p(rows), _p(si[i0:]), ni, _p(sg[g0:]), ng, self.prefill_from, self.prefill_keys, _p(out),
-                _p(self.o_part_p), _p(self.ml_part_p), _stream(q)), "attn_full_prefill_split")
+                self.scale, _p(rows), _p(si[i0:]), ni, _p(sg[g0:]), ng, self.prefill_from, self.prefill_keys,
+                _p(so[i0:]), _p(out), _p(self.o_part_p), _p(self.ml_part_p), _stream(q)), "attn_full_prefill_split")

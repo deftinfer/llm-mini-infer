@@ -410,7 +410,8 @@ __global__ void __launch_bounds__(PTHREADS, 1)
                                int64_t page_stride, int64_t plane_stride, int page_size, const int* __restrict__ wpt,
                                int64_t wpt_stride, int window_left, float scale, const Row* __restrict__ rows,
                                const Item* __restrict__ items, const int* __restrict__ kend, bf16* __restrict__ out,
-                               int whole, int split_keys, float* __restrict__ o_part, float* __restrict__ ml_part) {
+                               int whole, int split_keys, const int* __restrict__ order, float* __restrict__ o_part,
+                               float* __restrict__ ml_part) {
   lmk_pdl_wait();  // PDL: read nothing a predecessor writes before this (common.cuh)
   lmk_pdl_trigger();
   extern __shared__ unsigned char smem_raw[];
@@ -418,7 +419,11 @@ __global__ void __launch_bounds__(PTHREADS, 1)
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   const int g = lane >> 2, t4 = lane & 3;
   const int grp = warp >> 2, wq = warp & 3, gtid = tid & 127;
-  const Item it = items[blockIdx.x];
+  [[maybe_unused]] int idx = blockIdx.x;  // SPLIT: the item, from the launch order (as attn512's)
+  if constexpr (SPLIT) {
+    if (order) idx = order[blockIdx.x];
+  }
+  const Item it = items[SPLIT ? idx : blockIdx.x];
   if (it.row < 0) return;
   const Row rw = rows[it.row];
   const int q0 = rw.kvlen - rw.nq;
@@ -629,7 +634,7 @@ __global__ void __launch_bounds__(PTHREADS, 1)
     if (pidx >= rw.nq) continue;
     if constexpr (SPLIT) {  // a split query's state, unnormalised, for the merge; a query taken whole: nothing
       if (q0 + pidx + 1 <= whole) continue;
-      const int64_t item = blockIdx.x;
+      const int64_t item = idx;  // its partials' slot
       float* op = o_part + (item * PROWS + r) * D;
 #pragma unroll
       for (int n = 0; n < D / 8; ++n) {
@@ -768,7 +773,7 @@ LMK_API int lmk_attn_window_prefill(const void* q, int H, int Hkv, const void* k
   return lmk_launch(attn_window_prefill_kernel<false>, dim3(n_items), dim3(PTHREADS), smem, stream, (const bf16*)q, H,
                     G, Hkv, (const bf16*)kv, page_stride, plane_stride, page_size, (const int*)wpage_table,
                     wpt_stride, window_left, scale, (const Row*)rows, (const Item*)items, (const int*)kend,
-                    (bf16*)out, 0, 0, (float*)nullptr, (float*)nullptr);
+                    (bf16*)out, 0, 0, (const int*)nullptr, (float*)nullptr, (float*)nullptr);
 }
 
 // Full causal attention on the kernels above (Qwen3.8's full layers under batch invariance; kernels/attn_window.py
@@ -820,14 +825,15 @@ LMK_API int lmk_attn_full_prefill(const void* q, int H, int Hkv, const void* kv,
   return lmk_launch(attn_window_prefill_kernel<false>, dim3(n_items), dim3(PTHREADS), smem, stream, (const bf16*)q, H,
                     G, Hkv, (const bf16*)kv, page_stride, plane_stride, page_size, (const int*)page_table, pt_stride,
                     kNoWindow, scale, (const Row*)rows, (const Item*)items, (const int*)nullptr, (bf16*)out, 0, 0,
-                    (float*)nullptr, (float*)nullptr);
+                    (const int*)nullptr, (float*)nullptr, (float*)nullptr);
 }
 
 LMK_API int lmk_attn_full_prefill_split(const void* q, int H, int Hkv, const void* kv, int64_t page_stride,
                                         int64_t plane_stride, int page_size, const void* page_table, int64_t pt_stride,
                                         float scale, const void* rows, const void* items, int n_items,
-                                        const void* groups, int n_groups, int whole, int split_keys, void* out,
-                                        void* o_part, void* ml_part, cudaStream_t stream) {
+                                        const void* groups, int n_groups, int whole, int split_keys,
+                                        const void* order, void* out, void* o_part, void* ml_part,
+                                        cudaStream_t stream) {
   if (n_items <= 0) return 0;
   if (H % Hkv || page_size % KT || n_groups <= 0 || whole < 0 || split_keys < KT || split_keys % KT) return -1;
   const int G = H / Hkv, smem = (int)sizeof(PSmem);
@@ -839,7 +845,8 @@ LMK_API int lmk_attn_full_prefill_split(const void* q, int H, int Hkv, const voi
   const int st = lmk_launch(attn_window_prefill_kernel<true>, dim3(n_items), dim3(PTHREADS), smem, stream,
                             (const bf16*)q, H, G, Hkv, (const bf16*)kv, page_stride, plane_stride, page_size,
                             (const int*)page_table, pt_stride, kNoWindow, scale, (const Row*)rows, (const Item*)items,
-                            (const int*)nullptr, (bf16*)out, whole, split_keys, (float*)o_part, (float*)ml_part);
+                            (const int*)nullptr, (bf16*)out, whole, split_keys, (const int*)order, (float*)o_part,
+                            (float*)ml_part);
   if (st) return st;
   return lmk_launch(attn_window_merge_kernel<PROWS>, dim3(n_groups * PROWS), dim3(D / 4), 0, stream, H, G,
                     (const Row*)rows, (const Item*)items, (const int2*)groups, (const float*)o_part,

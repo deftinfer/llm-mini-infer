@@ -275,7 +275,7 @@ def test_attn512_split_counts_agree(qo) -> None:
         ops._check(build.load().lmk_attn512(
             ops._p(q), 32, 4, ops._p(fkv), fkv.stride(0), 16, ops._p(table), table.stride(0), ops._p(kw), ops._p(cos),
             ops._p(sin), 64, 1.0, ops._p(rr), ops._p(it), len(items), ops._p(gt), len(groups), split, 0, 0, 0, 0,
-            ops._p(got), ops._p(o_part), ops._p(ml), ops._stream(q)), "attn512")
+            ops._p(None), ops._p(got), ops._p(o_part), ops._p(ml), ops._stream(q)), "attn512")
         torch.cuda.synchronize()
         assert torch.isfinite(got).all(), splits
         assert (got.float() - want.float()).abs().max().item() < 2e-2, splits
@@ -317,7 +317,7 @@ def test_attn512_staged_tables_change_no_bit(ps, splits) -> None:
         ops._check(build.load().lmk_attn512(
             ops._p(q), 32, 4, ops._p(pool), pool.stride(0), size, ops._p(pt), pt.stride(0), ops._p(kw), ops._p(cos),
             ops._p(sin), rot, 1.0, ops._p(rr), ops._p(it), len(items), ops._p(gt), len(groups), int(splits > 1), 0, 0,
-            0, 0, ops._p(got), ops._p(o_part), ops._p(ml), ops._stream(q)), "attn512")
+            0, 0, ops._p(None), ops._p(got), ops._p(o_part), ops._p(ml), ops._stream(q)), "attn512")
         torch.cuda.synchronize()
         outs.append(got)
     assert torch.isfinite(outs[0]).all()
@@ -635,7 +635,7 @@ def _split_attn(case, *, max_rows: int, max_kv: int, qo: int = 6, split_keys: in
 
 
 def _split_run(case, a, rows: list[tuple[int, int, int, int]], *, bucket: int = 0, fixed: int | None = None,
-               graph: bool = False, gap: int = 0, qo: int = 6):
+               graph: bool = False, gap: int = 0, qo: int = 6, unordered: bool = False):
     """One step of `rows` (slot, first query position, queries, planned KV length above the true one), the first
     `fixed` (None: all) decode rows and the rest prefill rows, each decode row planned from the lowest KV length `gap`
     below its true one. With `bucket`: the decode bucket's tables (padding rows on the null page after the real ones),
@@ -669,6 +669,9 @@ def _split_run(case, a, rows: list[tuple[int, int, int, int]], *, bucket: int = 
         a.plan_graph(meta, bucket=bucket, rows=rows_np, stage=stage, real=n, lb=lb)
     else:
         a.plan(meta, parity=0, rows=rows_np, stage=stage, fixed_rows=n if fixed is None else fixed, lb=lb)
+    if unordered:  # the split launches in the items' own order, not split-major: the same bits
+        dr, di, dg, nd, runs, do = meta.full_plan
+        meta.full_plan = (dr, di, dg, nd, tuple((*r[:5], False) for r in runs), do)
     if graph:
         g = _replay_on_a_side_stream(lambda: a.run(meta, _Layer(case.kw), q, out))
         out.fill_(float("nan"))
@@ -784,8 +787,10 @@ def test_attn512_prefill_below_the_threshold_is_unsplit() -> None:
     unsplit, one = _split_run(case, whole, row, fixed=0)
     assert len(runs) == 1 and len(cut_runs) > 2 and len(one) == 1
     assert sorted(got) == sorted(cut) == sorted(unsplit) == list(range(p0, end))
+    plain, _ = _split_run(case, split, row, fixed=0, unordered=True)
     for p in range(p0, end):
         assert torch.equal(got[p], cut[p]), p  # one launch and several
+        assert torch.equal(got[p], plain[p]), p  # split-major and group-major
     for p in range(p0, 64):
         assert torch.equal(got[p], unsplit[p]), p  # p + 1 <= 64
     assert any(not torch.equal(got[p], unsplit[p]) for p in range(64, end))

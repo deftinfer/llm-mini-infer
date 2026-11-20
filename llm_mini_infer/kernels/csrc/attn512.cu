@@ -139,16 +139,17 @@ __global__ void __launch_bounds__(THREADS, 2)
     attn512_kernel(const bf16* __restrict__ q, int H, int G, int Hkv, const bf16* __restrict__ kv, int64_t page_stride,
                    int page_size, const int* __restrict__ page_table, int64_t pt_stride, const bf16* __restrict__ kw,
                    const bf16* __restrict__ cos, const bf16* __restrict__ sin, int rot, float scale,
-                   const Row* __restrict__ rows, const Item* __restrict__ items, int split_keys, int n_dec,
-                   int whole, int prefill_keys, bf16* __restrict__ out, float* __restrict__ o_part,
-                   float* __restrict__ ml_part) {
+                   const Row* __restrict__ rows, const Item* __restrict__ items, const int* __restrict__ order,
+                   int split_keys, int n_dec, int whole, int prefill_keys, bf16* __restrict__ out,
+                   float* __restrict__ o_part, float* __restrict__ ml_part) {
   lmk_pdl_wait();  // PDL: read nothing before the predecessor finishes (common.cuh)
   lmk_pdl_trigger();
   extern __shared__ unsigned char smem_raw[];
   Smem& sm = *reinterpret_cast<Smem*>(smem_raw);
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   const int g = lane >> 2, t4 = lane & 3;
-  const Item it = items[blockIdx.x];
+  const int idx = order ? order[blockIdx.x] : (int)blockIdx.x;  // the launch order (kernels/attn512.py `plan`)
+  const Item it = items[idx];
   if (it.row < 0) return;  // padding in a graph's item table
   const int n_splits = SPLIT ? max(1, it.split >> 16) : 1;  // the split count of this item's group
   const int split = it.split & 0xffff;
@@ -169,7 +170,7 @@ __global__ void __launch_bounds__(THREADS, 2)
     k_begin = split * chunk;
     k_end = min(limit, k_begin + chunk);
   }
-  const int64_t item = blockIdx.x;
+  const int64_t item = idx;  // its partials' slot
 
   // -- the Q tile: rows of 512 dims into stage 0 (swizzled), then A fragments per warp --
   for (int c = tid; c < ROWS * CHUNKS; c += THREADS) {
@@ -495,7 +496,10 @@ __global__ void attn512_merge_kernel(int H, int G, const Row* __restrict__ rows,
 // (n <= 32), and the merge combines them. `split_keys` 0: a group's n splits divide its tile's keys evenly.
 // `split_keys` a multiple of 16: the fixed split (see Work above), the rows [0, n_dec) decode rows sized from
 // `split_keys`, the rest prefill rows taking their keys whole up to `whole` keys and sized from `prefill_keys` (a
-// multiple of 16) past it. A step's launches (kernels/attn512.py) pass each their own item and group tables.
+// multiple of 16) past it. A step's launches (kernels/attn512.py) pass each their own item and group tables, and
+// `order` (or null): the item each block takes, so that a launch can walk every group's first split before any
+// group's second (the CTAs at once then read the same keys, as an unsplit launch's do); an item's partials stay at its
+// own index.
 //
 // The kernel stages each tile's cos and sin rows in shared memory when rot <= 64, and looks up a tile's page once when
 // the page size is a multiple of 16. Other shapes read both per key and give the same bits.
@@ -503,7 +507,8 @@ LMK_API int lmk_attn512(const void* q, int H, int Hkv, const void* kv, int64_t p
                         const void* page_table, int64_t pt_stride, const void* k_weight, const void* cos,
                         const void* sin, int rot, float scale, const void* rows, const void* items, int n_items,
                         const void* groups, int n_groups, int split, int split_keys, int n_dec, int whole,
-                        int prefill_keys, void* out, void* o_part, void* ml_part, cudaStream_t stream) {
+                        int prefill_keys, const void* order, void* out, void* o_part, void* ml_part,
+                        cudaStream_t stream) {
   if (n_items <= 0) return 0;
   const int G = H / Hkv;
   if (H % Hkv || ROWS % G || rot > HALF || rot % 2 || split < 0 || split > 1 || (split && n_groups <= 0) ||
@@ -519,7 +524,8 @@ LMK_API int lmk_attn512(const void* q, int H, int Hkv, const void* kv, int64_t p
     return lmk_launch(attn512_kernel<false>, dim3(n_items), dim3(THREADS), smem, stream, (const bf16*)q, H, G, Hkv,
                       (const bf16*)kv, page_stride, page_size, (const int*)page_table, pt_stride,
                       (const bf16*)k_weight, (const bf16*)cos, (const bf16*)sin, rot, scale, (const Row*)rows,
-                      (const Item*)items, 0, 0, 0, 0, (bf16*)out, (float*)nullptr, (float*)nullptr);
+                      (const Item*)items, (const int*)order, 0, 0, 0, 0, (bf16*)out, (float*)nullptr,
+                      (float*)nullptr);
   }
   static bool init_s = false;
   if (!init_s) {
@@ -529,8 +535,8 @@ LMK_API int lmk_attn512(const void* q, int H, int Hkv, const void* kv, int64_t p
   const int st = lmk_launch(attn512_kernel<true>, dim3(n_items), dim3(THREADS), smem, stream, (const bf16*)q, H, G,
                             Hkv, (const bf16*)kv, page_stride, page_size, (const int*)page_table, pt_stride,
                             (const bf16*)k_weight, (const bf16*)cos, (const bf16*)sin, rot, scale, (const Row*)rows,
-                            (const Item*)items, split_keys, n_dec, whole, prefill_keys, (bf16*)out, (float*)o_part,
-                            (float*)ml_part);
+                            (const Item*)items, (const int*)order, split_keys, n_dec, whole, prefill_keys,
+                            (bf16*)out, (float*)o_part, (float*)ml_part);
   if (st) return st;
   return lmk_launch(attn512_merge_kernel, dim3(n_groups * ROWS), dim3(128), 0, stream, H, G, (const Row*)rows,
                     (const Item*)items, (const int2*)groups, (const float*)o_part, (const float*)ml_part, (bf16*)out);

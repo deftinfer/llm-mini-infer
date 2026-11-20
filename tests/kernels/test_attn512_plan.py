@@ -177,6 +177,18 @@ def test_a_steps_split_items_past_the_partials_run_in_more_launches() -> None:
     assert am.launches(groups, 1000) == [(0, int(n.sum()), 0, len(n))]
 
 
+def test_a_split_launch_walks_every_groups_first_split_first() -> None:
+    """The launch order of split items: every group's split 0, then every split 1, ..., each in the items' order (the
+    items, and their partials' slots, stay group-major)."""
+    items, _ = am.tile_items(np.asarray([8]), G, HKV, [1, 3, 2, 3])
+    order = am.split_major(items)
+    split = items[order, 3] & 0xFFFF
+    assert sorted(order.tolist()) == list(range(len(items))) and (np.diff(split) >= 0).all()
+    for s in range(3):
+        idx = order[split == s]
+        assert (np.diff(idx) > 0).all()  # within a split, the items' own order
+
+
 def test_the_window_kernels_splits_cover_a_tile() -> None:
     """The sliding window on our kernel (answer reproducibility): a tile of 8 query positions sees at most window + 7
     keys, which meet at most ceil(that / split_keys) + 1 absolute splits (`kernels.attn_window`)."""
