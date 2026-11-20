@@ -99,13 +99,20 @@ def ipc_dir(base: str | None = None) -> str:
     return tempfile.mkdtemp(prefix=leftovers.PREFIX, dir=base or leftovers.tmp_root())
 
 
-def locked_dir() -> tuple[str, int]:
+def locked_dir() -> tuple[str, int | None]:
     """The launcher's socket directory: an `ipc_dir` with its lock file, locked (`leftovers`). Its path and the lock's
-    descriptor: close it once the directory is removed."""
+    descriptor: close it once the directory is removed. On a filesystem that refuses flock
+    (`leftovers.refuses_flock`) the directory has no lock file and the descriptor is None, with a warning: no sweep
+    removes a directory without one, while this server lives or after a kill."""
     path = ipc_dir()
+    lock = os.path.join(path, leftovers.LOCK_FILE)
     try:
-        return path, leftovers.locked_file(os.path.join(path, leftovers.LOCK_FILE))
-    except BaseException:
+        return path, leftovers.locked_file(lock)
+    except BaseException as exc:
+        if leftovers.refuses_flock(exc):  # `locked_file` removed what it made: no lock file
+            leftovers.warn_unlocked(lock, exc, "this server's socket directory has no lock file: if the server is "
+                                    "killed, no start removes the directory, which stays until it is removed by hand")
+            return path, None
         shutil.rmtree(path, ignore_errors=True)
         raise
 

@@ -620,14 +620,17 @@ def _still_runs(p: psutil.Process) -> bool:
 def _remove_leftovers(pid: int) -> None:
     """What a launcher that died of a signal as `pid` leaves (one that exits by itself removes them): its pixel arena,
     named by its pid and its IPC directory's name (`launcher._start_images`; in /dev/shm on Linux, inside the IPC
-    directory on macOS: under the tests' root, `llm_mini_infer.leftovers`), and that IPC directory. A server without
-    images leaves only its IPC directory, a few sockets, which nothing names here: it stays, for the next server's
-    start to remove (`leftovers.sweep`). An arena this user cannot remove (another user's, in a shared /dev/shm) stays,
-    with its IPC directory."""
+    directory on macOS: under the tests' root, `llm_mini_infer.leftovers`; with UNLOCKED_SUFFIX where its filesystem
+    refuses flock, `vision.arena.create_locked`), and that IPC directory. A server without images leaves only its IPC
+    directory, a few sockets, which nothing names here: it stays, for the next server's start to remove
+    (`leftovers.sweep`). An arena this user cannot remove (another user's, in a shared /dev/shm) stays, with its IPC
+    directory."""
     base = leftovers.tmp_root()  # where `engine.ipc.ipc_dir` makes it
     head, tail = os.path.basename(arena.arena_path(base, "{}")).split("{}")  # the arena's name around its tag
-    for path in glob.glob(arena.arena_path(arena.default_dir(os.path.join(base, IPC_PREFIX + "*")), f"{pid}-*")):
-        name = os.path.basename(path).removeprefix(head).removesuffix(tail).removeprefix(f"{pid}-")
+    named = arena.arena_path(arena.default_dir(os.path.join(base, IPC_PREFIX + "*")), f"{pid}-*")
+    for path in glob.glob(named) + glob.glob(named + leftovers.UNLOCKED_SUFFIX):
+        name = os.path.basename(path).removesuffix(leftovers.UNLOCKED_SUFFIX)
+        name = name.removeprefix(head).removesuffix(tail).removeprefix(f"{pid}-")
         try:
             arena.remove(path)
         except OSError:

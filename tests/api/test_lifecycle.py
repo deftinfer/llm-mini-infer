@@ -434,6 +434,7 @@ def test_the_next_start_removes_what_a_killed_server_left(model, tmp_path, priva
         log = nxt.log_path.read_text()
         removed = [ipc_dir] + ([pixels] if os.path.dirname(pixels) != ipc_dir else [])  # macOS: the arena in it
         assert all(f"removed {path} (" in log for path in removed), log
+        assert "LLM_MINI_INFER_TEST_TMP is set" not in log, log  # the harness's root: quiet (launcher._warn_test_root)
     assert os.path.isdir(old_dir) and os.path.isfile(old_arena)
 
 

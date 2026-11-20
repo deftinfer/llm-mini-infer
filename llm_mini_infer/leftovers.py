@@ -3,7 +3,9 @@
 The launcher makes two things its processes share by path (`launcher.serve`): its socket directory in /tmp
 (`engine.ipc.ipc_dir`) and, with images on, its pixel arena (`vision.arena`) in /dev/shm where that is writable, which
 holds its whole size (`dev.images.arena_mb`) in memory. It removes both on every exit it lives through. A SIGKILL (the
-OOM killer, a runtime's stop timeout) leaves them, and in a pod /dev/shm outlives a restarted container.
+OOM killer, a runtime's stop timeout) leaves them, and in a pod /dev/shm outlives a restarted container. /tmp must be
+local to the host: shared between hosts with host-local locks (NFS's nolock, local_lock), one host's sweep would remove
+another's live socket directory.
 - **A live server holds a lock on each:** an exclusive `flock` on the lock file in its socket directory (LOCK_FILE) and
   on its arena, from the moment each appears until the launcher has removed it. The kernel drops a flock when the last
   descriptor of its open file closes, which a process's death does; the launcher's children are spawned and inherit
@@ -19,6 +21,11 @@ OOM killer, a runtime's stop timeout) leaves them, and in a pod /dev/shm outlive
   version marks as its own: a directory without the lock file (an older version's, a test's, one being made) and a
   file of another name (an older version's arena ends in -pixels) stay, however old. It removes files and stops no
   process: a dead launcher's engine, frontends and pool workers stop by themselves (they watch it).
+- **A filesystem that refuses flock** (`refuses_flock`): the makers (`engine.ipc.locked_dir`,
+  `vision.arena.create_locked`) go on without the lock, with a warning: a socket directory without its lock file, an
+  arena named with UNLOCKED_SUFFIX, which no sweep removes, so a kill leaves them until they are removed by hand. Not
+  the normal names without the lock: a sweep where flock works (another server's, once a lock daemon is back) would
+  remove a live server's files.
 
 **The tests' root** (TEST_ROOT_ENV, a test hook, not a setting): the socket directories go there instead of /tmp, and
 the arenas to its `shm` when that is a writable directory, else into the socket directory, so that no test sweeps, or
@@ -43,7 +50,12 @@ PREFIX = "llm-mini-infer-"  # a socket directory's name and an arena's start wit
 LOCK_FILE = "lock"  # in a socket directory: its server's lock
 ARENA_SUFFIX = "-pixel-arena"  # an arena's name ends with it (`vision.arena.arena_path`); an older version's, -pixels
 NEW_SUFFIX = ".new"  # a file's name while `locked_file` makes it: no sweep matches it
+UNLOCKED_SUFFIX = ".nolock"  # after an arena's name where its filesystem refuses flock: no sweep matches it
+# A filesystem that refuses flock itself (NFS without its lock daemon, Lustre's noflock, CIFS, 9p): by name, as
+# EOPNOTSUPP and ENOTSUP are one number on Linux and two on macOS
+NO_FLOCK = frozenset({errno.ENOLCK, errno.ENOSYS, errno.EOPNOTSUPP, errno.ENOTSUP})
 TEST_ROOT_ENV = "LLM_MINI_INFER_TEST_TMP"
+TEST_ROOT_PREFIX = "llm-mini-tests-"  # the harness's root in tmp_root(): this prefix and the uid (tests/conftest.py)
 
 
 def tmp_root() -> str:
@@ -74,6 +86,21 @@ def locked_file(path: str) -> int:
         os.close(fd)
         raise
     return fd
+
+
+def refuses_flock(exc: BaseException) -> bool:
+    """Whether `exc`, from `locked_file`, is the filesystem refusing flock itself (NO_FLOCK), never a lock held, a
+    permission or a bad descriptor. The makers of a server's files then go on without the lock, under names no sweep
+    removes (`engine.ipc.locked_dir`, `vision.arena.create_locked`); `locked_file` itself raises. Its open or rename
+    refused with one of these errnos is taken alike: it leaves no file at `path` either."""
+    return isinstance(exc, OSError) and exc.errno in NO_FLOCK
+
+
+def warn_unlocked(path: str, exc: OSError, then: str) -> None:
+    """The one warning of a maker that goes on without the lock on `path` (`refuses_flock`): `then`, what it made
+    instead and what stays after a kill."""
+    log.warning("cannot lock %s (%s: %s): its filesystem refuses flock, so %s", path,
+                errno.errorcode.get(exc.errno, str(exc.errno)), exc.strerror, then)
 
 
 def sweep() -> None:
