@@ -555,22 +555,14 @@ def end_drafts(m: Any, drafts: list[int]) -> int:
     the grammar's EOS (architecture.md, "Structured output"): 0 when the grammar allows nothing else now, j when it
     does after the first j drafts, NEVER_ENDS when no prefix of them gets there. The target accepts a draft only if it
     is its own masked sample, so only drafts the grammar allows can lead there: llguidance's `try_consume_tokens`
-    consumes those and stops at the first it rejects (never entering its error state; it may take an EOS after the
-    stop), and they are rolled back."""
+    consumes those, stopping at the first it rejects (never entering its error state) or after the one that stops the
+    grammar, so a grammar it leaves stopped stopped at the last draft it took; they are rolled back."""
     if m.is_stopped():
         return 0
     if not drafts:
         return NEVER_ENDS
     n = m.try_consume_tokens(drafts)
-    end = NEVER_ENDS
-    if n and m.is_stopped():  # the first prefix that stopped it: n, or fewer when it took tokens past its stop
-        end = n
-        while end > 1:
-            m.rollback(1)
-            n -= 1
-            if not m.is_stopped():
-                break
-            end -= 1
+    end = n if n and m.is_stopped() else NEVER_ENDS
     if n:
         m.rollback(n)
     return end

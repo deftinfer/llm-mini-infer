@@ -115,8 +115,8 @@ def test_llguidance_masks_along_an_output_and_its_drafts(llg) -> None:
 
 def test_could_end_walks_the_drafts_with_llguidance(llg) -> None:
     """A row could deliver the EOS when the document is complete before it, or after drafts the grammar allows; how
-    many drafts it must verify for that (`end_drafts`: an EOS llguidance takes past the stop not among them); the
-    walk leaves the matcher as it was."""
+    many drafts it must verify for that (`end_drafts`: up to the one that completes the document); the walk leaves the
+    matcher as it was."""
     from tokenizers import Tokenizer
 
     tok = Tokenizer.from_file(str(QWEN / "tokenizer.json"))
