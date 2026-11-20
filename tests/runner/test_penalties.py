@@ -1,7 +1,8 @@
 """The penalties' and logit bias's pieces on CPU (`runner.cuda.penalties`, `runner.cuda.sampler`): the reference's terms
 (`apply_terms`) equal vLLM's formula (`support.penalty_cases.vllm_terms`) bit for bit, on dense and sparse columns,
 with a verify window's drafts; rows without terms are untouched; `sample` with them is `sample` on the adjusted logits,
-the non-finite check still the raw logits'; the clamp keeps every candidate finite. The bookkeeping: an admission's
+the non-finite check still the raw logits'; the clamp keeps every candidate finite, an allowed token whose y / T
+overflows among them. The bookkeeping: an admission's
 row is rewritten whole (no bit of the plan buffer's previous use leaks in), explicit rows' prompt and output tokens,
 the commits' repeats accumulate. `PlanBuilder` sets ADMIT_PENALTIES itself."""
 
@@ -162,6 +163,31 @@ def test_the_clamp_keeps_candidates_finite() -> None:
     toks, st = sample(logits, plan, *(torch.from_numpy(a) for a in p), keys, torch.arange(V), adjusted=adj,
                       clamp_rows=torch.tensor([True, True]))
     assert int(toks[0]) == 4 and int(toks[1]) in (4, 5) and not bool(st.any())
+
+
+def test_an_allowed_token_whose_x_overflows_stays_a_candidate() -> None:
+    """A repetition penalty near float32's largest takes a seen negative logit to -F_MAX, and a temperature below 1
+    takes that past it: an allowed token's x is clamped to -F_MAX, as the kernel's clampf(y / T), and only an excluded
+    token stays -inf. With every token a mask allows in that state, each sampler path (plain, top-p, top-k with min-p)
+    samples one of them with status 0, never a token the mask refuses."""
+    rows = [dict(prompt=[3, 7], outs=[], rep=1e38, pres=0.0, freq=0.0, bias={}) for _ in range(3)]
+    logits = torch.full((3, V), 1.0)
+    logits[:, 3], logits[:, 7] = -5.0, -4.0  # y * rep past F_MAX, then y / T too (logits near -1 would not be)
+    adj = terms_of(logits, tables(rows))
+    assert float(adj[0, 3]) == float(adj[0, 7]) == -F_MAX
+    allowed = np.zeros(-(-V // 32) * 32, bool)
+    allowed[[3, 7]] = True
+    mask = torch.from_numpy(np.packbits(allowed, bitorder="little").view(np.int32).copy())[None, :]
+    p = [np.full(3, 0.5, np.float32), np.array([1.0, 0.9, 1.0], np.float32), np.array([0, 0, 5], np.int64),
+         np.array([0.0, 0.0, 0.1], np.float32)]
+    plan = plan_sampling(*p, V)
+    assert sorted(g.kind for g in plan.groups) == ["plain", "sort", "topk"]
+    for g in plan.groups:
+        g.idx = torch.as_tensor(g.rows)
+    keys = row_keys(torch.tensor([1, 2, 3]), torch.tensor([9, 9, 9]))
+    toks, st = sample(logits, plan, *(torch.from_numpy(a) for a in p), keys, torch.arange(V), mask=mask,
+                      mask_row=torch.zeros(3, dtype=torch.int64), adjusted=adj, clamp_rows=torch.ones(3, dtype=bool))
+    assert set(toks.tolist()) <= {3, 7} and not bool(st.any()), (toks, st)
 
 
 def staging(cap: int = 4096) -> _Staging:
