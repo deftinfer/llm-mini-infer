@@ -27,6 +27,14 @@ def pair(tmp_path_factory):
     return target, make_tiny_assistant(d / "assistant", target, seed=6)
 
 
+def exercised(r: Run, schedule: tuple[int, ...]) -> None:
+    """The run lowered the count (steps below k verified fewer drafts) and, where its schedule goes up, raised it."""
+    s = r.sched
+    assert s.steps_by_count[1:K].sum() > 0 and s.spec_verified_per_pos[-1] < s.spec_drafts
+    if any(b > a for a, b in zip(schedule, schedule[1:] + schedule[:1])):
+        assert s.count_raises > 0
+
+
 def run(pair, k: int, reqs: list[dict], oracle=None, rng=None, **kw) -> Run:
     r = Run(pair, k, **kw)
     for q in reqs:
@@ -47,8 +55,7 @@ def test_greedy_outputs_equal_under_any_schedule_of_counts(pair, schedule) -> No
         r = run(pair, K, greedy(), oracle, rng, draft_counts=COUNTS, count_schedule=schedule)
         assert r.out == ref, (schedule, oracle is not None, rng is not None)
         counters(r.sched, K)
-        if set(schedule) - {K}:
-            assert r.sched.spec_verified_per_pos[-1] < r.sched.spec_drafts  # some steps verified fewer than k
+        exercised(r, schedule)
 
 
 @pytest.mark.parametrize("params", [(0.8, 1.0, 0), (1.0, 0.9, 20)])
@@ -58,7 +65,9 @@ def test_seeded_sampling_outputs_equal_under_any_schedule_of_counts(pair, params
             for i, p in enumerate(PROMPTS)]
     ref = run(pair, 0, reqs).out
     for schedule in SCHEDULES[2:]:
-        assert run(pair, K, reqs, draft_counts=COUNTS, count_schedule=schedule).out == ref, schedule
+        r = run(pair, K, reqs, draft_counts=COUNTS, count_schedule=schedule)
+        assert r.out == ref, schedule
+        exercised(r, schedule)
         assert run(pair, K, reqs, ref, np.random.default_rng(3), draft_counts=COUNTS,
                    count_schedule=schedule).out == ref, schedule
 
@@ -74,6 +83,7 @@ def test_stop_tokens_and_max_tokens_under_a_schedule(pair) -> None:
     for schedule in ((1, 5), (3, 2, 5)):
         r = run(pair, K, reqs, {0: base.out[0]}, draft_counts=COUNTS, count_schedule=schedule)
         assert r.out == want.out and r.finish == want.finish, schedule
+        exercised(r, schedule)
         assert r.out[0][-1] == stop and r.finish[0] == FinishReason.STOP and len(r.out[1]) == 7
 
 
@@ -97,6 +107,8 @@ def test_masked_outputs_equal_under_a_schedule_of_counts(pair, params) -> None:
         r = run(pair, k, reqs, grammars=Grammars(grammar), caching=False,
                 draft_counts=COUNTS if k else (), count_schedule=schedule)
         assert r.sched.grammars.errors == 0
+        if k:
+            exercised(r, schedule)
         outs.append((r.out, r.finish))
     assert all(o == outs[0] for o in outs[1:])
     assert outs[0][1][0] == FinishReason.STOP and outs[0][0][0][-1] == EOS
@@ -127,6 +139,7 @@ def test_counts_change_across_a_preemption_and_a_readmission(pair) -> None:
         r.sched._schedule = preempting
         r.run()
         assert r.sched.num_preemptions >= 2 and r.out == ref, schedule
+        exercised(r, schedule)
 
 
 def test_the_policy_gives_fixed_ks_outputs(pair) -> None:

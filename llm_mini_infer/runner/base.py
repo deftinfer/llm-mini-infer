@@ -32,7 +32,7 @@ Contract (architecture.md, "The step plan"; the plan's sections, effects and lif
   tokens are exactly the target's sampled sequence; acceptance also stops at the slot's commit limits (ADMIT). Every
   SAMPLE row drafts k tokens for the next step, or the plan's `draft_n` (one of `draft_counts`), and returns them
   (`StepResult.drafts`, −1 past them): the engine computes the next step's masks along them. While device-input rows of
-  a slot are in flight, the host knows its `seq_len` only as a range: each advances it by 1 to 1 + k.
+  a slot are in flight, the host knows its `seq_len` only as a range: each advances it by 1 to 1 + v (at most 1 + k).
 - **Results** are per SCHED row, in plan order (`StepResult`). `wait` must not block on anything but the device
   work of that step.
 - **NONFINITE** may be reported on any row. A runner may see a row's NaN only at a later SAMPLE row that reads it (the

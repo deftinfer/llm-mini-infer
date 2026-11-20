@@ -98,5 +98,9 @@ def run_mtp_workload(w: dict) -> None:
         event("MTP: length finish")
     if w["accept_p"] == 1.0:
         event("every draft accepted")
+    if h.sched.steps_by_count[1:w["mtp_k"]].sum():
+        event("MTP: steps below k")
+    if h.sched.count_raises:
+        event("MTP: a raise (k drafted for a higher count)")
     if any(len(s.stop_ids) > STOP_W for s in w["specs"]):
         event("more stop tokens than the runner knows")

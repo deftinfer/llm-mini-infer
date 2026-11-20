@@ -579,9 +579,9 @@ class PlanBuilder:
         `masked` and `logprobs` (bool per row): the rows that also get `MASKED`, `LOGPROBS`. `n_draft`: v, the plan's
         drafts to verify (one count for all its device rows; default k)."""
         b, i, n = self.b, self.n_sched, len(slots)
-        k = self.k if n_draft is None else n_draft
-        if not 0 <= k <= self.k or (self.n_device and k != self.v):
-            raise ValueError(f"device rows verify {k} drafts; the plan's are {self.v} (at most {self.k})")
+        k = (self.v if self.n_device else self.k) if n_draft is None else n_draft
+        if not (1 if self.k else 0) <= k <= self.k or (self.n_device and k != self.v):
+            raise ValueError(f"device rows verify {k} drafts; the plan's are {self.v} (1 to {self.k})")
         self.v = k
         b.sched_slot[i:i + n] = slots
         b.sched_n_query[i:i + n] = 1 + k

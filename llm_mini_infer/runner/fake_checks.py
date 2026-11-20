@@ -268,6 +268,8 @@ class FakeChecks:
             return 0, 0
         if d not in counts:
             self._fail(plan, f"draft_n {d}: not a count this runner takes ({sorted(counts)})")
+        if plan.draft_n and (plan.sched_tok_off >= 0).any():
+            self._fail(plan, f"draft_n {d} on a plan with explicit rows (they draft k)")
         if not dev.any():
             return k, d
         vs = np.unique(plan.sched_n_draft[dev])

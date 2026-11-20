@@ -684,7 +684,9 @@ class Scheduler:
         self.count_schedule = tuple(int(c) for c in count_schedule) if mtp_k else ()
         if any(not 1 <= c <= mtp_k for c in self.count_schedule):
             raise ValueError(f"count_schedule {list(count_schedule)}: counts between 1 and k ({mtp_k})")
+        self._counts = self.count_policy.counts if self.count_policy is not None else self.count_schedule or (mtp_k,)
         self._schedule_i = 0
+        self.count_raises = 0  # plans whose count exceeded what their rows held: they verified that and drafted k
         # The MTP drafter writes KV of its own (Qwen's MTP layer: `Capabilities.draft_kv`): a hit on a page boundary
         # copies the page of hit − 1, an image chunk's next token needs its embedding (the drafter's input there), and
         # a final chunk's pages cover the positions its drafter's chain writes past its row (`chain`: `_chunk_pages`)
@@ -1216,7 +1218,8 @@ class Scheduler:
                 if self.n_masked and len(dec) and self._end_wait(order, dec):
                     dec = dec[:0]
                 if len(dec) and (self.count_policy is not None or self.count_schedule):
-                    c = self._choose_count(len(dec))
+                    # chosen for the rows the budget leaves at the narrowest count, then cut for the count chosen
+                    c = self._choose_count(min(len(dec), budget.soft // (1 + min(self._counts))))
                     width = 1 + c
                 if len(dec) * width > budget.soft:
                     dec = dec[:budget.soft // width]
@@ -1242,6 +1245,7 @@ class Scheduler:
                         # they hold and drafts k, which every later count can verify (a raise)
                         held = int(self.held[dec].min())
                         v, d = (c, c) if c <= held else (held, self.k)
+                        self.count_raises += c > held
                     row0 = b.n_sched
                     b.add_device_rows(dec, self.masked[dec] if self.n_masked else None,
                                       self.lp[dec] >= 0 if self.n_lp else None, v)
@@ -2016,8 +2020,8 @@ class Scheduler:
                 self._unmask(slot)
                 req.matcher = None
             elif not req.ignore_eos:
-                self.may_end[slot] = could_end(req.matcher, self.drafts[slot, :self.held[slot]].tolist()
-                                               if self.k else [])
+                d = self.drafts[slot]  # the drafts this step made (−1 past them: `StepPlan.draft_n`)
+                self.may_end[slot] = could_end(req.matcher, d[d >= 0].tolist() if self.k else [])
 
     def fill_masks(self, inf: Inflight, buf: np.ndarray) -> int:
         """The masks of a plan's MASKED rows, in plan order (`plan.py`), after `process` of the step before it:

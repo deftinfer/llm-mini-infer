@@ -39,6 +39,37 @@ def test_draft_head_defaults(tmp_path) -> None:
     assert cfg.dev.speculative.draft_vocab == 0  # an override wins
 
 
+def test_the_draft_counts_per_step(tmp_path) -> None:
+    """dev.speculative.adaptive: 1, 2 and 3 below k by default (`cfg.draft_counts`, what the runner captures), Gemma 4's
+    assistant only on the GPU runner, at least one count below k; a count schedule's counts join them; off: none."""
+    import pytest
+
+    target, asst = _gemma(tmp_path / "g"), _assistant(tmp_path / "a")
+    base = {"model.path": str(target), "speculative.model": str(asst)}
+    cfg = config.derive(config.load(None, {**base, "dev.speculative.adaptive": True}))
+    assert cfg.draft_counts == [1, 2, 3] and cfg.dev.speculative.adaptive_counts == [1, 2, 3]
+    assert "below k (5)" in cfg.reasons["dev.speculative.adaptive_counts"]
+    cfg = config.derive(config.load(None, {**base, "speculative.num_speculative_tokens": 3,
+                                           "dev.speculative.adaptive": True}))
+    assert cfg.draft_counts == [1, 2]
+    cfg = config.derive(config.load(None, base))
+    assert cfg.draft_counts == [] and "off" in cfg.reasons["dev.speculative.adaptive_counts"]
+    cfg = config.derive(config.load(None, {**base, "dev.speculative.count_schedule": [4, 2, 5]}))
+    assert cfg.draft_counts == [2, 4] and "count_schedule" in cfg.reasons["dev.speculative.adaptive_counts"]
+    for over, match in (({"speculative.num_speculative_tokens": 1, "dev.speculative.adaptive": True}, "no count below"),
+                        ({"dev.speculative.adaptive": True, "dev.speculative.adaptive_counts": [5]}, "1 to k - 1"),
+                        ({"dev.speculative.count_schedule": [6]}, "from 1 to k")):
+        with pytest.raises(ValueError, match=match):
+            config.derive(config.load(None, {**base, **over}))
+    (tmp_path / "q").mkdir()
+    qwen = {"model.path": str(_model(tmp_path / "q", 248_320, 1))}
+    for over in ({"dev.speculative.adaptive": True}, {"dev.speculative.count_schedule": [1, 3]}):
+        with pytest.raises(ValueError, match="Gemma 4's assistant only"):
+            config.derive(config.load(None, {**qwen, **over}))
+    cfg = config.derive(config.load(None, {**qwen, "runner.kind": "fake", "dev.speculative.adaptive": True}))
+    assert cfg.draft_counts == [1, 2]  # the fake runner takes any count
+
+
 def test_a_drafter_model_turns_mtp_on(tmp_path) -> None:
     """Gemma 4's MTP drafter is its assistant model (`speculative.model`): k = 5 by default with one (its drafts keep
     paying deep into the chain), 0 without, and a set k stays as set; any other pairing is refused at derive time."""

@@ -103,6 +103,10 @@ def run_window_mtp_workload(w: dict, bidirectional: bool = False) -> Harness:
                 assert r.finish == FinishReason.ERROR, "the NaN request was not failed"
     if h.runner.counts["accepted"]:
         event("drafts accepted")
+    if s.steps_by_count[1:s.k].sum():
+        event("MTP: steps below k")
+    if s.count_raises:
+        event("MTP: a raise (k drafted for a higher count)")
     if s.prefix_hits:
         event("prefix hit")
     for src in ("decode", "finish", "branch"):

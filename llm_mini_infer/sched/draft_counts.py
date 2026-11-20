@@ -51,10 +51,12 @@ class DraftCounts:
         self.steps: dict[int, int] = {}  # bucket -> decode steps chosen
         self.current: dict[int, int] = {}  # bucket -> the count it runs
         self.chosen = dict.fromkeys(self.counts, 0)  # steps planned at each count (`choose`)
+        # the probe schedule and the trust in a time (the module's constants; tests shorten them)
+        self.explore_every, self.refresh_every, self.min_steps = EXPLORE_EVERY, REFRESH_EVERY, MIN_STEPS
 
     def measured(self, bucket: int, c: int) -> bool:
         e = self.cost.get((bucket, c, c))
-        return e is not None and e[1] >= MIN_STEPS
+        return e is not None and e[1] >= self.min_steps
 
     def rate(self, bucket: int, rows: int, c: int) -> float:
         """Tokens per device-ms of a step of `rows` decode rows at count c in `bucket` (its time measured)."""
@@ -79,16 +81,17 @@ class DraftCounts:
 
     def _probe(self, b: int, n: int, cur: int) -> int | None:
         """A count to run once for its measurements, or None (module docstring)."""
-        if n % EXPLORE_EVERY == EXPLORE_EVERY - 1:
+        every, refresh = self.explore_every, self.refresh_every
+        if n % every == every - 1:
             todo = [x for x in self.counts if not self.measured(b, x)]
             if todo:
                 return min(todo, key=lambda x: (abs(x - cur), x))
-        phase = n % REFRESH_EVERY
-        if phase == REFRESH_EVERY - 1 and cur != self.k:
+        phase = n % refresh
+        if phase == refresh - 1 and cur != self.k:
             return self.k
-        if phase == REFRESH_EVERY // 2 - 1:
+        if phase == refresh // 2 - 1:
             i = self.counts.index(cur)
-            side = (n // REFRESH_EVERY) % 2  # alternately the count below and the one above
+            side = (n // refresh) % 2  # alternately the count below and the one above
             j = i - 1 if (side == 0 and i > 0) or i == len(self.counts) - 1 else i + 1
             if 0 <= j < len(self.counts) and j != i:
                 return self.counts[j]

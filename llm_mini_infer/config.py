@@ -931,22 +931,26 @@ def _derive_draft_counts(cfg: Config, assistant: bool, reasons: dict[str, str]) 
         raise ValueError("dev.speculative.count_schedule: needs drafts (speculative.num_speculative_tokens > 0)")
     if any(not 1 <= c <= k for c in sched):
         raise ValueError(f"dev.speculative.count_schedule: counts from 1 to k ({k}), got {sched}")
+    if (dsp.adaptive or any(c < k for c in sched)) and not assistant and cfg.runner.kind == "cuda":
+        raise ValueError("dev.speculative.adaptive, count_schedule: Gemma 4's assistant only (speculative.model); the "
+                         "Qwen runner verifies k on every step")
     if dsp.adaptive:
         if not k:
             raise ValueError("dev.speculative.adaptive: needs drafts (speculative.num_speculative_tokens > 0)")
-        if not assistant and cfg.runner.kind == "cuda":
-            raise ValueError("dev.speculative.adaptive: Gemma 4's assistant only (speculative.model); the Qwen runner "
-                             "verifies k on every step")
         if dsp.adaptive_counts is None:
             dsp.adaptive_counts = [c for c in (1, 2, 3) if c < k]
             reasons["dev.speculative.adaptive_counts"] = (
                 f"{dsp.adaptive_counts}: 1, 2 and 3 below k ({k}), with k the counts each step chooses from")
     elif dsp.adaptive_counts is None:
         dsp.adaptive_counts = []
-        reasons["dev.speculative.adaptive_counts"] = "none: dev.speculative.adaptive is off (k on every step)"
+        reasons["dev.speculative.adaptive_counts"] = "none: dev.speculative.adaptive is off" + (
+            " (dev.speculative.count_schedule sets each step's count)" if sched else " (k on every step)")
     counts = [int(c) for c in dsp.adaptive_counts]
     if any(not 1 <= c < k for c in counts) or len(set(counts)) != len(counts):
         raise ValueError(f"dev.speculative.adaptive_counts: distinct counts from 1 to k - 1 ({k - 1}), got {counts}")
+    if dsp.adaptive and not counts:
+        raise ValueError(f"dev.speculative.adaptive: no count below k ({k}) to choose from "
+                         "(dev.speculative.adaptive_counts)")
     cfg.draft_counts = sorted(set(counts) | {c for c in sched if c < k}) if dsp.adaptive or sched else []
 
 

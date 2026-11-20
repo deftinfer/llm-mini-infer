@@ -30,7 +30,8 @@ serial device stream (`start = max(now, stream end)`, then `step_ms` plus `prefi
 it). Idle gaps on that timeline are reported in `StepResult`. With `sample_ms` > 0 every step is a forward, then a
 sampling part, whose boundary `forward_pending` reports.
 
-**MTP** (`mtp_k` k > 0). A device-input row verifies 1 + k tokens and returns n_out = 1 + a: the target's tokens are
+**MTP** (`mtp_k` k > 0). A device-input row verifies 1 + v tokens (v: the plan's count, k or one of `draft_counts`, at
+most what its slot's last SAMPLE row drafted) and returns n_out = 1 + a: the target's tokens are
 unchanged (`fake_token` at each position), and the number of accepted drafts a is drawn from (seed, first position),
 each draft accepted with probability `accept_p` while the previous ones were, then capped by the slot's commit limits: a
 stop token ADMIT carries or the token at `max_len − 1` ends the accepted run. The recurrent state commits lazily, as the
@@ -40,7 +41,8 @@ them, a `sched_next_tok` that is not the next chunk's first token, and drafter K
 slot names raise `PlanError`. **A drafter without KV** (`draft_kv=False`, Gemma 4's assistant) writes the verify window
 only, and its rollback is a truncation: a window or a hit that reads past a committed position fails the content checks.
 
-**Grammar masks and drafts.** Every MTP SAMPLE row returns k drafts (`StepResult.drafts`): the unmasked chain of what
+**Grammar masks and drafts.** Every MTP SAMPLE row returns d drafts (`StepResult.drafts`, d the plan's `draft_n` or k,
+−1 past them): the unmasked chain of what
 the target would sample, with the draft after the accepted count made wrong. A MASKED row samples under the masks the
 engine wrote (`masked_pick`), and an MTP row verifies its drafts against those masked samples. `fake_generate(...,
 matcher=)` predicts the outputs with a fresh grammar matcher (`tests/support/fake_grammar.py`), so a mask at the wrong

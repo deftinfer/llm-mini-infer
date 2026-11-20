@@ -190,6 +190,12 @@ class Harness:
                 raise
             self.sched = scheduler(False)
         self.batch_invariant = bool(self.sched.aligned or self.sched.forced_whole)
+        p = self.sched.count_policy
+        if p is not None:  # the fake reports no device time: a step's from its rows and counts, probes every 2 steps
+            observe = p.observe_cost
+            p.observe_cost = lambda rows, v, d, ns: observe(rows, v, d, int((22 + 0.15 * max(0, rows * (1 + v) - 24)
+                                                                             + 0.4 * rows * d) * 1e6))
+            p.explore_every, p.refresh_every, p.min_steps = 2, 16, 1
         self.runner = FakeRunner(vocab_size=vocab, max_positions=max_model_len, step_ms=0, sample_ms=0, spin_us=0,
                                  eos_at=eos_at, nonfinite_at=nonfinite_at, strict=strict, checkpoint_grid=grid,
                                  state_slot_bytes=153_954_304 if hybrid and not window else 0, mtp_k=mtp_k,

@@ -484,11 +484,13 @@ class GemmaRunner(Runner):
 
     def attention_counters(self) -> AttentionCounters:
         """FlashInfer's plan counters (`Runner.attention_counters`) over the sliding layers' instances: the target's
-        (`attn_w`), the drafter's (`attn_dw`, MTP) and the image spans' (`attn_wb`); none before `configure` or with
-        the torch references. The full layers' attn512 never plans again (an empty split merges harmlessly). With them,
-        the vision tower's plan waits (`vision_waits`)."""
+        (`attn_w`, and each draft count's: `_attn_v`), the drafter's (`attn_dw`, MTP) and the image spans' (`attn_wb`);
+        none before `configure` or with the torch references. The full layers' attn512 never plans again (an empty split
+        merges harmlessly). With them, the vision tower's plan waits (`vision_waits`)."""
         names = ("attn_w", "attn_dw", "attn_wb")
-        return vision_waits(sum_attention_counters(getattr(self, n, None) for n in names), getattr(self, "img", None))
+        widths = [aw for aw, _ in getattr(self, "_attn_v", {}).values()]
+        return vision_waits(sum_attention_counters([*(getattr(self, n, None) for n in names), *widths]),
+                            getattr(self, "img", None))
 
     def _measure_memory(self) -> tuple[int, int]:
         """(total, free for the KV arena): as the Qwen runner's (`runner.cuda.runner`)."""
@@ -736,7 +738,7 @@ class GemmaRunner(Runner):
             self.stats.update(attn512_resident=self.attn_f.resident, attn512_split_keys=self.attn512_split_keys)
             # The other counts' decode graphs (`draft_counts`): their rows' 1 + v queries, each width's own plans
             # (a decode bucket's tables are static), attn512's split partials shared
-            for v in self.counts:
+            for v in self.counts if self.use_graphs else ():  # eager and break steps plan on the k-wide ones
                 if self.window_split_keys:
                     aw: Any = WindowAttention(self.pools, cfg.num_heads, cfg.sliding_kv_heads, cfg.sliding_head_dim,
                                               dev, self.window, max_tokens=pc.max_num_batched_tokens,
@@ -1263,8 +1265,8 @@ class GemmaRunner(Runner):
         if h.n_sample:
             n, s = h.n_sample, self.static.s
             out = h.stage.ntok
-            toks = out[:s * L].reshape(s, L)[:n]
             nn = out[s * L:s * (L + 1)][:n] if k else np.ones(n, np.int64)
+            toks = np.where(np.arange(L)[None, :] < nn[:, None], out[:s * L].reshape(s, L)[:n], -1)  # −1 padding
             st = out[s * (L + 1):s * (L + 2)][:n]
             tokens[h.s_plan_rows] = toks
             n_out[h.s_plan_rows] = nn

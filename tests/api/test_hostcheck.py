@@ -220,11 +220,13 @@ vllm:generation_tokens_total{model_name="m",engine="0"} %(gen)s
 """
 
 
+_PAGE_BASE = {"drafts": 0, "p0": 0, "p1": 0, "busy": 0, "idle": 0, "sparse": 0, "dense": 0, "forced": 0, "kept": 0,
+              "u16": 0, "u32": 0, "u64": 0, "usum": 0, "usteps": 0, "rebuilds": 0, "freq": 0, "eos_no": 0,
+              "eos_yes": 0, "gated": 0, "rej_free": 0, "gen": 0, "failed": 0, "gerr": 0}
+
+
 def page(**kw: float) -> dict[str, float]:
-    base = {"drafts": 0, "p0": 0, "p1": 0, "busy": 0, "idle": 0, "sparse": 0, "dense": 0, "forced": 0, "kept": 0,
-            "u16": 0, "u32": 0, "u64": 0, "usum": 0, "usteps": 0, "rebuilds": 0, "freq": 0, "eos_no": 0, "eos_yes": 0,
-            "gated": 0, "rej_free": 0, "gen": 0, "failed": 0, "gerr": 0}
-    return hostcheck.prometheus(METRICS % {**base, **kw})
+    return hostcheck.prometheus(METRICS % {**_PAGE_BASE, **kw})
 
 
 def test_the_engines_window_from_its_metrics() -> None:
@@ -248,6 +250,16 @@ def test_the_engines_window_from_its_metrics() -> None:
     assert d["eos_free_finishes"] == {"no": 15, "yes": 2} and d["eos_free_gated"] == 1
     assert d["spec_first_rejections"] == {"forced": 0, "free": 30}
     assert hostcheck.engine_delta(a, a, completed=0)["union_tokens"] is None  # no union in the window
+    # with a draft count per step: each position's accepted over the verify steps that held it
+    held = "llm_mini_infer:spec_decode_num_verified_per_pos_total{position=\"%s\"} %d\n"
+    va = hostcheck.prometheus(METRICS % {**_PAGE_BASE, "drafts": 100, "p0": 50, "p1": 20}
+                              + held % ("0", 100) + held % ("1", 40))
+    vb = hostcheck.prometheus(METRICS % {**_PAGE_BASE, "drafts": 300, "p0": 230, "p1": 180}
+                              + held % ("0", 300) + held % ("1", 240))
+    assert hostcheck.engine_delta(va, vb, completed=20)["accept"]["per_pos"] == [0.9, 0.8]  # 160 of the 200 held 1
+    vb = hostcheck.prometheus(METRICS % {**_PAGE_BASE, "drafts": 300, "p0": 230, "p1": 60}
+                              + held % ("0", 300) + held % ("1", 140))
+    assert hostcheck.engine_delta(va, vb, completed=20)["accept"]["per_pos"] == [0.9, 0.4]  # 40 of 100
     # vLLM's page: acceptance per position from its counters, none of llm-mini-infer's
     v = [hostcheck.prometheus(VLLM_METRICS % kw) for kw in (dict(drafts=10, p0=8, p1=6, p2=4, gen=100),
                                                             dict(drafts=110, p0=88, p1=66, p2=44, gen=500))]
