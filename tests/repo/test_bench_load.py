@@ -230,6 +230,26 @@ def test_the_warm_up_caches_the_measured_runs_shared_prefix() -> None:
     assert tok.encode(content).ids[:20] == tok.encode(measured).ids[:20] and content != measured
 
 
+@pytest.mark.parametrize(("shared", "most"), [(0, 4), (64, 1)])
+def test_a_shared_prefix_warms_up_one_request_at_a_time(monkeypatch, shared, most) -> None:
+    """The warm-up's requests run 4 at a time, and one at a time with a shared prefix: the second then branches at the
+    prefix's end, where the server's cache writes a checkpoint, so the measured requests hit it."""
+    live, peak = [0], [0]
+
+    async def send(session, url, headers, body, timeout):
+        live[0] += 1
+        peak[0] = max(peak[0], live[0])
+        await asyncio.sleep(0.005)
+        live[0] -= 1
+        return {"status": 200}
+
+    monkeypatch.setattr(load, "send", send)
+    monkeypatch.setattr(load, "make_workload", lambda args: _count_workload(args.seed))
+    run = load.Run(None, "", {}, _count_workload(), {}, 5.0, 0.0, 1.0, 0.0, metrics_url=None)
+    asyncio.run(load.warm_up(run, argparse.Namespace(seed=0, shared_prefix_tokens=shared), 6))
+    assert peak[0] == most
+
+
 @pytest.mark.parametrize("argv", [["--workload", "catalog"], ["--workload", "scene"]])
 def test_shared_prefix_tokens_is_refused_outside_chat(argv, capsys) -> None:
     with pytest.raises(SystemExit) as exc:

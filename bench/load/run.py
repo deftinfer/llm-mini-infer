@@ -869,7 +869,9 @@ def warm_up_args(args: argparse.Namespace) -> argparse.Namespace:
 
 async def warm_up(run: Run, args: argparse.Namespace, count: int) -> None:
     """`count` unrecorded requests at concurrency min(count, 4), from the workload built with `warm_up_args`, at the
-    indexes from `WARMUP_OFFSET`: `run.offset` is not touched. A failed request ends the run."""
+    indexes from `WARMUP_OFFSET`: `run.offset` is not touched. With `--shared-prefix-tokens`, one at a time: the second
+    then branches at the prefix's end, where the server's cache writes a checkpoint, so the measured requests hit it
+    (two at once would each prefill the whole prefix, and neither leaves one there). A failed request ends the run."""
     warm = dataclasses.replace(run, workload=make_workload(warm_up_args(args)),
                                offset=WARMUP_OFFSET)
     taken = 0
@@ -884,7 +886,8 @@ async def warm_up(run: Run, args: argparse.Namespace, count: int) -> None:
                 raise SystemExit(f"warm-up request {j} failed: {rec.get('error') or rec.get('status')}")
 
     print(f"[{time.strftime('%H:%M:%S')}] {count} warm-up requests", file=sys.stderr, flush=True)
-    await asyncio.gather(*(client() for _ in range(min(count, 4))))
+    clients = 1 if getattr(args, "shared_prefix_tokens", 0) else min(count, 4)
+    await asyncio.gather(*(client() for _ in range(clients)))
 
 
 async def main_async(args: argparse.Namespace) -> dict[str, Any]:
