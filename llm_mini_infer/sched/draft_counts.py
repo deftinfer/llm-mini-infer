@@ -6,17 +6,20 @@ A count c serves a step of R decode rows with E(c) = R · (1 + s_1 + ... + s_c) 
 verify rows that accept at least j drafts (the batch's survival to draft j), at a device time C(R, c). Above the
 step's memory floor C grows with the step's tokens, so the count that delivers the most tokens per device-ms falls as
 the rows grow and as acceptance falls; a step's prefill tokens cost the same at every count, so the decode part's
-time is the one to compare. `DraftCounts` keeps:
+time is the one to compare. When the step's token budget cannot hold every row at a count, that count runs the rows
+it holds (R_c), and its rate is theirs. `DraftCounts` keeps:
 - the survival: an EMA over verify steps of each position's share, updated only where the step verified that
   position (a step at c says nothing of the drafts past c);
 - the time: per decode row bucket (`row_bucket`), and per (v, d) a step ran at, an EMA of the device time of the steps
   whose rows were all decode rows (`observe_cost`; other steps cost what their prefill tokens cost);
-- per bucket the count it runs (k at first) and its steps.
-Each choice is a function of those alone (`choose`): a bucket's counts without two measured steps are run one step each,
-every `EXPLORE_EVERY` of its steps, nearest first; every `REFRESH_EVERY` steps it runs k once (the positions its count
-does not verify) and one neighbour of its count (their times); otherwise it switches to the count with the most tokens
-per device-ms only when that beats its own by `HYSTERESIS`. Times are measured, so the schedule is not reproducible
-from run to run; no output token depends on it (architecture.md, "Speculative decoding").
+- per bucket (of the rows at the narrowest count) the count it runs (k at first) and its steps.
+Each choice is a function of those alone (`choose`): a count without two measured steps in its rows' bucket is run one
+step, every `EXPLORE_EVERY` of the bucket's steps, nearest first; every `REFRESH_EVERY` steps the bucket runs k once
+(the positions its count does not verify) and one neighbour of its count (their times); otherwise it switches to the
+count with the most tokens per device-ms only when that beats its own by `HYSTERESIS`. A count above what the rows
+hold makes a raise (the scheduler verifies what they hold and drafts k, `raised`), so the bucket's next plan runs that
+count again: it is measured there. Times are measured, so the schedule is not reproducible from run to run; no output
+token depends on it (architecture.md, "Speculative decoding").
 """
 
 from __future__ import annotations
@@ -50,7 +53,9 @@ class DraftCounts:
         self.cost: dict[tuple[int, int, int], list[float]] = {}  # (bucket, v, d) -> [device ms, steps]
         self.steps: dict[int, int] = {}  # bucket -> decode steps chosen
         self.current: dict[int, int] = {}  # bucket -> the count it runs
+        self.follow: dict[int, int] = {}  # bucket -> the count its next plan runs again (after a raise: `raised`)
         self.chosen = dict.fromkeys(self.counts, 0)  # steps planned at each count (`choose`)
+        self._last: tuple[int, int, bool] | None = None  # the last choice: (bucket, count, whether a follow)
         # the probe schedule and the trust in a time (the module's constants; tests shorten them)
         self.explore_every, self.refresh_every, self.min_steps = EXPLORE_EVERY, REFRESH_EVERY, MIN_STEPS
 
@@ -58,42 +63,55 @@ class DraftCounts:
         e = self.cost.get((bucket, c, c))
         return e is not None and e[1] >= self.min_steps
 
-    def rate(self, bucket: int, rows: int, c: int) -> float:
-        """Tokens per device-ms of a step of `rows` decode rows at count c in `bucket` (its time measured)."""
-        return rows * (1.0 + float(self.surv[:c].sum())) / self.cost[(bucket, c, c)][0]
+    def rate(self, rows: int, c: int) -> float:
+        """Tokens per device-ms of a step of `rows` decode rows at count c (its time measured in their bucket)."""
+        return rows * (1.0 + float(self.surv[:c].sum())) / self.cost[(row_bucket(rows), c, c)][0]
 
-    def choose(self, rows: int) -> int:
-        """The count for a plan with `rows` decode rows (module docstring)."""
-        b = row_bucket(rows)
+    def choose(self, rows: int, tokens: int | None = None) -> int:
+        """The count for a plan with `rows` decode rows, of which a count c runs as many as `tokens` holds at 1 + c
+        tokens a row (None: all of them at any count; module docstring)."""
+        at = {x: rows if tokens is None else min(rows, tokens // (1 + x)) for x in self.counts}
+        b = row_bucket(max(1, at[self.counts[0]]))
         n = self.steps.get(b, 0)
         self.steps[b] = n + 1
         cur = self.current.get(b, self.k)
-        c = self._probe(b, n, cur)
+        c = self.follow.pop(b, None)
+        follow = c is not None and at[c] > 0
+        if not follow:
+            c = self._probe(b, n, cur, at)
         if c is None:
-            rates = {x: self.rate(b, rows, x) for x in self.counts if self.measured(b, x)}
+            rates = {x: self.rate(at[x], x) for x in self.counts if at[x] and self.measured(row_bucket(at[x]), x)}
             if rates:
                 best = max(rates, key=lambda x: (rates[x], x))
                 if cur not in rates or rates[best] > rates[cur] * (1.0 + HYSTERESIS):
                     cur = best
             self.current[b] = c = cur
         self.chosen[c] += 1
+        self._last = (b, c, follow)
         return c
 
-    def _probe(self, b: int, n: int, cur: int) -> int | None:
+    def raised(self) -> None:
+        """The last plan chosen (`choose`) raised its count: its rows held fewer drafts, so it verified those and
+        drafted k. The bucket's next plan runs that count again, now held, and so measures it (once: a follow that
+        raises again is not followed)."""
+        if self._last is not None and not self._last[2]:
+            self.follow[self._last[0]] = self._last[1]
+
+    def _probe(self, b: int, n: int, cur: int, at: dict[int, int]) -> int | None:
         """A count to run once for its measurements, or None (module docstring)."""
         every, refresh = self.explore_every, self.refresh_every
         if n % every == every - 1:
-            todo = [x for x in self.counts if not self.measured(b, x)]
+            todo = [x for x in self.counts if at[x] and not self.measured(row_bucket(at[x]), x)]
             if todo:
                 return min(todo, key=lambda x: (abs(x - cur), x))
         phase = n % refresh
-        if phase == refresh - 1 and cur != self.k:
+        if phase == refresh - 1 and cur != self.k and at[self.k]:
             return self.k
         if phase == refresh // 2 - 1:
             i = self.counts.index(cur)
             side = (n // refresh) % 2  # alternately the count below and the one above
             j = i - 1 if (side == 0 and i > 0) or i == len(self.counts) - 1 else i + 1
-            if 0 <= j < len(self.counts) and j != i:
+            if 0 <= j < len(self.counts) and j != i and at[self.counts[j]]:
                 return self.counts[j]
         return None
 

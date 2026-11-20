@@ -63,6 +63,25 @@ class Run:
                                     seed=seed or 100 + rid, stop_token_ids=list(stop), ignore_eos=ignore_eos,
                                     grammar=grammar, images=list(images)))
 
+    def check_drafts(self) -> Run:
+        """Check every step's drafts against its plan's count (`StepPlan.draft_n`): each SAMPLE row's d drafts (k on a
+        plan with explicit rows, and on a raise), −1 past them; `drafts_checked` counts the rows checked at each d."""
+        process, k = self.sched.process, self.k
+        self.drafts_checked: dict[int, int] = {}
+
+        def checked(inf, tokens, n_out, gpu_busy_ns, status=None, drafts=None, *a, **kw):
+            if k and drafts is not None:
+                rows = (self.sched.aid[inf.slots] == inf.aids) & inf.sample
+                if status is not None:
+                    rows &= np.asarray(status) == 0
+                dr, d = np.asarray(drafts)[rows], self.sched._d(inf)
+                assert (dr[:, :d] >= 0).all() and (dr[:, d:] == -1).all(), (inf.step_id, d, dr.tolist())
+                self.drafts_checked[d] = self.drafts_checked.get(d, 0) + int(rows.sum())
+            return process(inf, tokens, n_out, gpu_busy_ns, status, drafts, *a, **kw)
+
+        self.sched.process = checked
+        return self
+
     def run(self, oracle: dict[int, list[int]] | None = None, rng: np.random.Generator | None = None) -> Run:
         n = 0
         while self.core.busy and n < 3000:

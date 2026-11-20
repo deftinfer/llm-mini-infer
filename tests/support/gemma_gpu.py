@@ -50,11 +50,14 @@ def pair(tmp_path_factory):
 def gpu_run(pair, k: int, graphs: bool = True, **kw) -> Run:
     r = Run(pair, k, make=lambda t, pc, **rk: cuda_runner(t, pc, graphs, **rk), window=W, wps=16, **kw)
     r.modes = []
+    r.decode_rows = []  # each step of decode rows only: (its mode, rows, the drafts they verify)
     mode = r.r._mode
 
     def spy(lay, split=False):
         m = mode(lay, split)
         r.modes.append(m[0])
+        if lay.n_dev == lay.n:
+            r.decode_rows.append((m[0], lay.n, lay.v))
         return m
 
     r.r._mode = spy

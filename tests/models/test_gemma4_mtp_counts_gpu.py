@@ -39,19 +39,37 @@ def fixed(pair):
 @pytest.mark.parametrize("schedule", [(1,), (2, 1), (1, 5), (5, 1, 3, 2)])
 def test_schedules_in_graphs_give_the_eager_and_a_fixed_ks_tokens(pair, fixed, schedule) -> None:
     """Every count's decode graphs replay (the raise steps' at (v, k) too); the same tokens eagerly, in graphs and at a
-    fixed k, up to a near tie, with the assistant's drafts and an oracle's (a random number right)."""
+    fixed k, up to a near tie, with the assistant's drafts and an oracle's (a random number right); every step drafts
+    what its plan says, −1 past it (`Run.check_drafts`: a graph replayed at another d fails it)."""
     out, ref, n = fixed
-    eager = run_prompts(gpu_run(pair, K, graphs=False, draft_counts=COUNTS, count_schedule=schedule))
+    eager = run_prompts(gpu_run(pair, K, graphs=False, draft_counts=COUNTS, count_schedule=schedule).check_drafts())
     assert "decode" not in eager.modes
-    graphs = run_prompts(gpu_run(pair, K, draft_counts=COUNTS, count_schedule=schedule))
+    graphs = run_prompts(gpu_run(pair, K, draft_counts=COUNTS, count_schedule=schedule).check_drafts())
     assert graphs.modes.count("decode") > 20
     assert agree(graphs.out, eager.out, reference(pair[0], eager.out)) > 0.8 * n
     assert agree(graphs.out, out, ref) > 0.8 * n
-    oracle = run_prompts(gpu_run(pair, K, draft_counts=COUNTS, count_schedule=schedule), out,
+    oracle = run_prompts(gpu_run(pair, K, draft_counts=COUNTS, count_schedule=schedule).check_drafts(), out,
                          np.random.default_rng(len(schedule)))
     assert agree(oracle.out, out, ref) > 0.8 * n and oracle.sched.spec_accepted > 0
     for r in (eager, graphs, oracle):
         counters(r.sched, K)
+        assert r.drafts_checked.get(K) and any(r.drafts_checked.get(d) for d in COUNTS), r.drafts_checked
+
+
+@pytest.mark.parametrize("schedule", [(1,), (2, 1)])
+def test_a_tight_budget_runs_a_lower_counts_extra_rows_in_graphs(pair, fixed, schedule) -> None:
+    """A budget of 20 tokens holds 3 decode rows at k (3 × 6) and all 4 below it: each count's own decode buckets
+    reach 4 rows (`GemmaRunner._dbuckets`), so its 4-row steps replay graphs instead of running eagerly; the tokens are
+    the eager ones and a fixed k's, up to a near tie."""
+    out, ref, n = fixed
+    graphs = run_prompts(gpu_run(pair, K, draft_counts=COUNTS, count_schedule=schedule, budget=20).check_drafts())
+    assert max(graphs.r.decode_buckets) == 3 and all(max(graphs.r._dbuckets(v)) == 4 for v in COUNTS)
+    four = [m for m, rows, v in graphs.decode_rows if rows == 4 and v < K]
+    assert len(four) > 10 and set(four) == {"decode"}, graphs.decode_rows
+    eager = run_prompts(gpu_run(pair, K, graphs=False, draft_counts=COUNTS, count_schedule=schedule, budget=20))
+    assert agree(graphs.out, eager.out, reference(pair[0], eager.out)) > 0.8 * n
+    assert agree(graphs.out, out, ref) > 0.8 * n
+    counters(graphs.sched, K)
 
 
 def test_the_policy_in_graphs_gives_a_fixed_ks_tokens(pair) -> None:

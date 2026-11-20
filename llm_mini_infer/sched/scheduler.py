@@ -677,9 +677,9 @@ class Scheduler:
         self.row_tokens = mixed_step_row_tokens  # decode rows x prefill tokens of a step (0: off)
         self.k = mtp_k
         self.reserve = reserve_positions(steps_in_flight, mtp_k)  # at k, whatever count a step runs (the largest)
-        # The draft count per step (`speculative.adaptive`, `sched.draft_counts`): the counts below k a plan may verify
-        # and draft (`Capabilities.draft_counts`; empty: k on every step), or a schedule of counts cycled per plan with
-        # decode rows (`dev.speculative.count_schedule`: tests)
+        # The draft count per step (`dev.speculative.adaptive`, `sched.draft_counts`): the counts below k a plan may
+        # verify and draft (`Capabilities.draft_counts`; empty: k on every step), or a schedule of counts cycled per
+        # plan with decode rows (`dev.speculative.count_schedule`: tests)
         self.count_policy = DraftCounts(draft_counts, mtp_k) if mtp_k and draft_counts else None
         self.count_schedule = tuple(int(c) for c in count_schedule) if mtp_k else ()
         if any(not 1 <= c <= mtp_k for c in self.count_schedule):
@@ -1217,10 +1217,19 @@ class Scheduler:
                 dec = dec[self.n_out[dec] + self.pending[dec] + self.k * self.dev_inflight[dec] < self.max_out[dec]]
                 if self.n_masked and len(dec) and self._end_wait(order, dec):
                     dec = dec[:0]
-                if len(dec) and (self.count_policy is not None or self.count_schedule):
-                    # chosen for the rows the budget leaves at the narrowest count, then cut for the count chosen
-                    c = self._choose_count(min(len(dec), budget.soft // (1 + min(self._counts))))
-                    width = 1 + c
+                fit = budget.soft // (1 + min(self._counts))  # the rows the budget holds at the narrowest count
+                if len(dec) and fit and (self.count_policy is not None or self.count_schedule):
+                    # one count for all the rows, at most what each holds; a count above that verifies what they hold
+                    # and drafts k, which every later count can verify (a raise). Decided on every row, then cut for
+                    # the width it gives: the rows the cut (or a preemption) keeps hold at least as many
+                    c = self._choose_count(min(len(dec), fit), budget.soft)
+                    held = int(self.held[dec].min())
+                    v, d = (c, c) if c <= held else (held, self.k)
+                    if c > held:
+                        self.count_raises += 1
+                        if not self.count_schedule:
+                            self.count_policy.raised()
+                    width = 1 + v
                 if len(dec) * width > budget.soft:
                     dec = dec[:budget.soft // width]
             if len(dec):
@@ -1240,12 +1249,6 @@ class Scheduler:
                 elif short.size:
                     self._grow_rows(dec[short], need[short], None if needw is None else needw[short])
                 if len(dec):
-                    if self.count_policy is not None or self.count_schedule:
-                        # one count for all its rows, at most what each holds; a count above that verifies what
-                        # they hold and drafts k, which every later count can verify (a raise)
-                        held = int(self.held[dec].min())
-                        v, d = (c, c) if c <= held else (held, self.k)
-                        self.count_raises += c > held
                     row0 = b.n_sched
                     b.add_device_rows(dec, self.masked[dec] if self.n_masked else None,
                                       self.lp[dec] >= 0 if self.n_lp else None, v)
@@ -1310,13 +1313,14 @@ class Scheduler:
         self._last_inf = inf  # the EOS-free finish's gate reads the step in flight (`_eos_free`)
         return plan, inf
 
-    def _choose_count(self, rows: int) -> int:
-        """The draft count of a plan with `rows` decode rows: the dev schedule's next, else the policy's."""
+    def _choose_count(self, rows: int, tokens: int) -> int:
+        """The draft count of a plan with `rows` decode rows and `tokens` of budget for them: the dev schedule's next,
+        else the policy's."""
         if self.count_schedule:
             c = self.count_schedule[self._schedule_i % len(self.count_schedule)]
             self._schedule_i += 1
             return c
-        return self.count_policy.choose(rows)
+        return self.count_policy.choose(rows, tokens)
 
     def _end_wait(self, order: np.ndarray, dec: np.ndarray) -> bool:
         """Whether this plan skips its decode rows `dec` (architecture.md, "Structured output"): each has a row in
@@ -1997,14 +2001,16 @@ class Scheduler:
         log.error("request %s: its grammar rejected a token %s", req.label, when)
 
     def _advance_grammars(self, s: np.ndarray, rows: np.ndarray, tok: np.ndarray, n_new: np.ndarray | None,
-                          finish: np.ndarray) -> None:
-        """Advance the matchers of masked slots over the tokens their rows delivered (`rows`: indices into `s`).
-        A finishing row needs nothing; an EOS under ignore_eos terminates the grammar (`advance_matcher`; unmasked
-        after); a token the grammar rejects finishes the request with an error (`finish`, in place). Otherwise, without
-        ignore_eos, `may_end` is computed for the slot's next sample row (`could_end`; `self.drafts` already holds its
-        window's drafts)."""
+                          finish: np.ndarray, inf: Inflight) -> None:
+        """Advance the matchers of masked slots over the tokens their rows delivered (`rows`: indices into `s`) by
+        step `inf`. A finishing row needs nothing; an EOS under ignore_eos terminates the grammar (`advance_matcher`;
+        unmasked after); a token the grammar rejects finishes the request with an error (`finish`, in place).
+        Otherwise, without ignore_eos, `may_end` is computed for the slot's next sample row (`could_end`;
+        `self.drafts` already holds its window's drafts: those it verifies, the plan in flight's count when that plan
+        holds its row)."""
         eos = self.grammars.eos
         off = np.cumsum(n_new) - n_new if n_new is not None else None
+        nxt = self._last_inf if self._last_inf is not inf else None  # planned after `inf`, before this process
         for i in rows.tolist():
             if finish[i]:
                 continue
@@ -2021,6 +2027,8 @@ class Scheduler:
                 req.matcher = None
             elif not req.ignore_eos:
                 d = self.drafts[slot]  # the drafts this step made (−1 past them: `StepPlan.draft_n`)
+                if self.k and nxt is not None and self.mark[slot] == self._mark_id:
+                    d = d[:self._v(nxt)]  # its row in the plan in flight verifies that plan's count
                 self.may_end[slot] = could_end(req.matcher, d[d >= 0].tolist() if self.k else [])
 
     def fill_masks(self, inf: Inflight, buf: np.ndarray) -> int:
@@ -2670,7 +2678,7 @@ class Scheduler:
         if self.n_masked:
             rows = np.flatnonzero(self.masked[s])
             if len(rows):
-                self._advance_grammars(s, rows, tok, delivered, finish)
+                self._advance_grammars(s, rows, tok, delivered, finish, inf)
         # Output tokens the frontend receives with these (`Req.unrep`): before a row's, the forced prefix its
         # final chunk took (or a preemption's unreported tokens); after them, the EOS an EOS-free finish appends
         pre = post = None

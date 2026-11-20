@@ -28,15 +28,19 @@ def pair(tmp_path_factory):
 
 
 def exercised(r: Run, schedule: tuple[int, ...]) -> None:
-    """The run lowered the count (steps below k verified fewer drafts) and, where its schedule goes up, raised it."""
+    """The run lowered the count (steps below k verified fewer drafts) and, where its schedule goes up, raised it; its
+    steps drafted what their plans said (`Run.check_drafts`), below k and at k."""
     s = r.sched
     assert s.steps_by_count[1:K].sum() > 0 and s.spec_verified_per_pos[-1] < s.spec_drafts
     if any(b > a for a, b in zip(schedule, schedule[1:] + schedule[:1])):
         assert s.count_raises > 0
+    assert r.drafts_checked.get(K) and any(r.drafts_checked.get(d) for d in range(1, K)), r.drafts_checked
 
 
 def run(pair, k: int, reqs: list[dict], oracle=None, rng=None, **kw) -> Run:
     r = Run(pair, k, **kw)
+    if k:
+        r.check_drafts()
     for q in reqs:
         r.add(**q)
     return r.run(oracle, rng)
@@ -123,7 +127,7 @@ def test_counts_change_across_a_preemption_and_a_readmission(pair) -> None:
     reqs = [dict(rid=i, prompt=p, max_tokens=30) for i, p in enumerate(PROMPTS)]
     ref = run(pair, 0, reqs).out
     for schedule in ((1, 5, 2, 3), (2,)):
-        r = Run(pair, K, draft_counts=COUNTS, count_schedule=schedule)
+        r = Run(pair, K, draft_counts=COUNTS, count_schedule=schedule).check_drafts()
         for q in reqs:
             r.add(**q)
         plan, turn = r.sched._schedule, [0]
@@ -150,4 +154,30 @@ def test_the_policy_gives_fixed_ks_outputs(pair) -> None:
     assert r.out == ref
     chosen = r.sched.count_policy.chosen
     assert chosen[K] and sum(1 for n in chosen.values() if n) >= 2, chosen  # k first, then its probes
+    assert r.drafts_checked.get(K)
     counters(r.sched, K)
+
+
+def test_a_tight_budget_lowers_the_count_for_more_rows(pair) -> None:
+    """A budget of 20 tokens holds 3 decode rows at k (3 × 6) and all 4 below it: the count is decided on every row
+    before the cut, at the width it runs, so steps below k carry all 4 rows and none exceeds the budget; the outputs
+    are MTP off's."""
+    reqs = greedy(max_tokens=24)
+    ref = run(pair, 0, reqs, budget=20).out
+    for schedule in ((1,), (3, 1), (2, 5, 1)):
+        r = Run(pair, K, draft_counts=COUNTS, count_schedule=schedule, budget=20).check_drafts()
+        launch, plans = r.r.launch_forward, []
+
+        def spy(plan, *a, launch=launch, plans=plans, **kw):
+            dev = plan.sched_tok_off < 0
+            plans.append((plan.n_query_tokens, int(dev.sum()), int(plan.sched_n_draft[dev].max(initial=0)),
+                          plan.draft_n or K))
+            return launch(plan, *a, **kw)
+
+        r.r.launch_forward = spy
+        for q in reqs:
+            r.add(**q)
+        r.run()
+        assert r.out == ref, schedule
+        exercised(r, schedule)
+        assert max(t for t, *_ in plans) <= 20 and any(n == 4 and v < K for _, n, v, _ in plans), schedule

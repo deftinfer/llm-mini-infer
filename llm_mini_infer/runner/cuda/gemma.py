@@ -378,6 +378,10 @@ class GemmaRunner(Runner):
                               fp8_gemm=fp8_gemm, fp8_cold_prefill=fp8_cold_prefill, stats=self.stats)
         rows = min(max_num_seqs, max_num_batched_tokens // self.L)  # a decode step's tokens are within the budget
         self.decode_buckets = sorted(b for b in (decode_buckets or default_decode_buckets(rows)) if 0 < b <= rows)
+        self._buckets_v: dict[int, list[int]] = {}  # each count's below k: as many rows as its width leaves
+        for v in self.counts:
+            r = min(max_num_seqs, max_num_batched_tokens // (1 + v))
+            self._buckets_v[v] = sorted(b for b in (decode_buckets or default_decode_buckets(r)) if 0 < b <= r)
         self.token_buckets = sorted(b for b in (token_buckets or default_token_buckets(max_num_batched_tokens))
                                     if 0 < b <= max_num_batched_tokens)
         t1 = time.perf_counter()
@@ -714,7 +718,9 @@ class GemmaRunner(Runner):
             from ...kernels.attn_window import WindowAttention
             from ...kernels.flashinfer import WORKSPACE_BYTES, FlashInferWindowAttention
 
-            max_rows = max(self.decode_buckets) if self.use_graphs else 0
+            # the most rows a decode graph has, at any width (the drafter's one query a row at every count)
+            max_rows = max(self.decode_buckets + [b for bs in self._buckets_v.values() for b in bs]) \
+                if self.use_graphs else 0
             # a decode row's window pages at most: the window before its first query (planned from the lowest
             # possible one under MTP, which may lie k below the true one), its 1 + k queries, a page boundary
             wpages = -(-(self.window + self.ps + 2 * self.L) // self.ps) + 1
@@ -737,18 +743,18 @@ class GemmaRunner(Runner):
                                        max_kv=self.max_model_len + L)
             self.stats.update(attn512_resident=self.attn_f.resident, attn512_split_keys=self.attn512_split_keys)
             # The other counts' decode graphs (`draft_counts`): their rows' 1 + v queries, each width's own plans
-            # (a decode bucket's tables are static), attn512's split partials shared
+            # (a decode bucket's tables are static), the k-wide instances' split partials shared
             for v in self.counts if self.use_graphs else ():  # eager and break steps plan on the k-wide ones
                 if self.window_split_keys:
                     aw: Any = WindowAttention(self.pools, cfg.num_heads, cfg.sliding_kv_heads, cfg.sliding_head_dim,
                                               dev, self.window, max_tokens=pc.max_num_batched_tokens,
                                               max_rows=pc.max_num_seqs, qo_per_row=1 + v,
-                                              split_keys=self.window_split_keys)
+                                              split_keys=self.window_split_keys, share=self.attn_w)
                 else:
                     aw = FlashInferWindowAttention(self.pools, cfg.num_heads, cfg.sliding_kv_heads,
-                                                   cfg.sliding_head_dim, dt, dev, self.window, max_rows=max_rows,
-                                                   max_pages=wpages, workspace=workspace, qo_per_row=1 + v,
-                                                   upper_bounds=True)
+                                                   cfg.sliding_head_dim, dt, dev, self.window,
+                                                   max_rows=max(self._dbuckets(v), default=0), max_pages=wpages,
+                                                   workspace=workspace, qo_per_row=1 + v, upper_bounds=True)
                 af = Attn512(self.pools, self.rotary, cfg.num_heads, cfg.full_kv_heads, cfg.full_rope_angles, dev,
                              max_tokens=pc.max_num_batched_tokens, max_rows=pc.max_num_seqs, qo_per_row=1 + v,
                              split_keys=self.attn512_split_keys, max_kv=self.max_model_len + L, share=self.attn_f)
@@ -1029,7 +1035,7 @@ class GemmaRunner(Runner):
                     self._capture_one((name, t, self.k, self.k),
                                       lambda rows=rows: self._synthetic(b, 1, rows, pages_from=1))
             for v in (self.k, *sorted(self.counts, reverse=True)):  # each count's decode graphs (`_key`)
-                for n in sorted(self.decode_buckets, reverse=True):
+                for n in sorted(self._dbuckets(v), reverse=True):
                     for name in graph_names("decode", **naming):
                         fwd = name.endswith("_f")  # a split step's forward: one for every d
                         for d in (self.k,) if fwd or v == self.k else (v, self.k):  # steady, or a raise (`sched.plan`)
@@ -1300,6 +1306,10 @@ class GemmaRunner(Runner):
     def forward_pending(self, h: _Handle) -> bool:
         return forward_running(h)
 
+    def _dbuckets(self, v: int) -> list[int]:
+        """The decode buckets of rows verifying v drafts: k's, or a count's own (more rows when the budget binds)."""
+        return self._buckets_v.get(v, self.decode_buckets)
+
     def _mode(self, lay: _Layout, split: bool = False) -> tuple[str, int]:
         if not self.use_graphs or self.logits_hook is not None or not self._graphs or \
                 self.fp8.precise_step(lay.n_precise):
@@ -1311,7 +1321,7 @@ class GemmaRunner(Runner):
                                       (kind, b, v, d) in self._graphs)
 
         if lay.n_dev == lay.n and lay.n_sample == lay.n:
-            b = _bucket(self.decode_buckets, lay.n)
+            b = _bucket(self._dbuckets(lay.v), lay.n)
             if have("decode", b, lay.v, lay.dn):
                 return "decode", b
         t = _bucket(self.token_buckets, lay.T)

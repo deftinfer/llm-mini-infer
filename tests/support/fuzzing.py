@@ -143,7 +143,7 @@ def run_example(suite: str, example: Any) -> None:
         from .workloads import run_cache_workload as run
     elif suite == "radix":
         from .radix_model import run_scenario as run
-    elif suite == "mtp":
+    elif suite in ("mtp", "mtp_counts"):
         from .mtp_workloads import run_mtp_workload as run
     elif suite == "images":
         from .workloads import run_image_workload as run
@@ -163,7 +163,7 @@ def run_example(suite: str, example: Any) -> None:
         from .nan_cases import run_nan_workload as run
     elif suite in ("structured_window", "structured_hybrid"):
         from .forced_cases import run_switches_workload as run
-    elif suite in ("window_mtp", "arena_mtp", "gemma_images_mtp"):
+    elif suite in ("window_mtp", "arena_mtp", "arena_mtp_counts", "gemma_images_mtp"):
         from .window_mtp import run_window_mtp_workload
 
         def run(ex: Any) -> None:
