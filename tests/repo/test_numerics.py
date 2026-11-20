@@ -134,6 +134,54 @@ def test_attn_cases() -> None:
     assert nk.decode_bucket(5, [1, 2, 4, 8, 16]) == 8 and nk.decode_bucket(16, [1, 16]) == 16
 
 
+def test_attn_timing_grid() -> None:
+    """The default grid's steps and their exact lengths, the Ms a step runs at, the on path's split per M."""
+    from llm_mini_infer.kernels.attn512 import MAX_SPLITS, fixed_split_keys, fixed_splits
+
+    a = nk.build_parser().parse_args(["attn-timing"])
+    ms, k = nfo.parse_ids(a.max_model_lens), a.k
+    cases = nk.timing_cases(nfo.parse_ids(a.short_chunks), nfo.parse_ids(a.histories), a.long_chunk,
+                            nfo.parse_ids(a.long_histories), nfo.parse_ids(a.decode_rows),
+                            nfo.parse_ids(a.decode_histories), k)
+    by = {c.name: c for c in cases}
+    assert len(cases) == len(by) == 2 * 3 + 2 + 2 * 3 and ms == [8184, 32768, 131072, 262144]
+    assert all(not c.uncertain for c in cases)
+    c = by["prefill-short-256-h131072"]
+    assert (c.n_dec, c.nq.tolist(), c.ub.tolist()) == (0, [256], [131072 + 256])
+    c = by["prefill-long-2048-h0"]
+    assert (c.n_dec, c.nq.tolist(), c.lb.tolist()) == (0, [2048], [2048]) and nk.case_history(c) == 0
+    c = by["decode-64-h32768"]
+    assert c.n_dec == 64 and (c.nq == 4).all() and (c.ub == 32768 + 4).all() and nk.case_history(c) == 32768
+    np.testing.assert_array_equal(c.starts, np.arange(64) * 4)
+    for c in cases:  # prefill rows once (M = any); verify rows at every M, skipped where a row is past M + 1 + k
+        got = nk.timing_ms(c, ms, k)
+        if not c.n_dec:
+            assert got == [(None, False)]
+        else:
+            assert [m for m, _ in got] == ms
+            assert all(skip == (int(c.ub.max()) > m + 1 + k) for m, skip in got)
+    assert nk.timing_ms(by["decode-1-h1024"], ms, k, per_m=False) == [(None, False)]
+    assert nk.timing_ms(by["decode-1-h32768"], ms, k) == [(8184, True), (32768, False), (131072, False),
+                                                           (262144, False)]
+    for m in ms:
+        c = by["decode-1-h1024"]
+        assert nk.on_max_kv(c, m, k) == m + 1 + k and nk.on_split_keys(c, m, k) == fixed_split_keys(m + 1 + k)
+        assert int(fixed_splits(m + 1 + k, nk.on_split_keys(c, m, k))) <= MAX_SPLITS
+    c = by["decode-1-h1024"]
+    assert nk.on_split_keys(c, 8184, k) == 256 and nk.on_split_keys(c, 262144, k) > 256
+    assert nk.on_max_kv(by["prefill-short-64-h8192"], None, k) == 8192 + 64
+
+
+def test_timing_ratios() -> None:
+    def rec(impl: str, mode: str, us: float | None, m: int | None = None) -> dict:
+        return {"case": "c", "impl": impl, "mode": mode, "m": m, **({} if us is None else {"median_us": us})}
+
+    recs = [rec("off", "eager", 50.0), rec("off", "graph", 20.0), rec("on", "eager", 25.0, 8184),
+            rec("on", "graph", 30.0, 8184), rec("on", "eager", None, 32768), rec("on", "bucket", 5.0, 8184)]
+    nk.timing_ratios(recs)
+    assert [r.get("ratio") for r in recs[2:]] == [0.5, 1.5, None, None]
+
+
 def test_rel_errors() -> None:
     ref = torch.tensor([3.0, -4.0])
     e = nk.rel_errors(ref + torch.tensor([0.3, 0.4]), ref)
@@ -146,7 +194,7 @@ def test_command_line() -> None:
     """Every subcommand parses with its defaults (on any machine: torch and FlashInfer load inside them); gdn-race's
     sequences end in partial 64-row chunks."""
     p = nk.build_parser()
-    for cmd in ("smid", "gdn-race", "gdn-accuracy", "attn-accuracy", "nan-leak", "timing"):
+    for cmd in ("smid", "gdn-race", "gdn-accuracy", "attn-accuracy", "nan-leak", "timing", "attn-timing"):
         assert callable(p.parse_args([cmd]).func)
     assert all(n % 64 for n in nfo.parse_ids(p.parse_args(["gdn-race"]).lens))
     assert nfo.parse_ids("0-3,7, 14") == [0, 1, 2, 3, 7, 14]
@@ -502,7 +550,8 @@ def test_help(module: str) -> None:
     top = subprocess.run([sys.executable, "-m", f"tests.scripts.{module}", "--help"], cwd=root, env=env,
                          capture_output=True, text=True, timeout=120)
     assert top.returncode == 0 and "usage: python3 -m tests.scripts." in top.stdout, top.stderr
-    subs = {"numerics_kernels": ["smid", "gdn-race", "gdn-accuracy", "attn-accuracy", "nan-leak", "timing"],
+    subs = {"numerics_kernels": ["smid", "gdn-race", "gdn-accuracy", "attn-accuracy", "nan-leak", "timing",
+                                 "attn-timing"],
             "numerics_forced": ["refs", "run"],
             "numerics_fp32": ["layers", "chain", "drafter", "target", "all", "report"]}[module]
     main = importlib.import_module(f"tests.scripts.{module}").main
