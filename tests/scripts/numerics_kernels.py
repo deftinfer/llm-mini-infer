@@ -60,12 +60,11 @@ from typing import Any
 
 import numpy as np
 
-from llm_mini_infer.config import BATCH_INVARIANT_MAX_LEN
-
 from ..support.paths import ROOT
 from .numerics_forced import HelpFormatter, md, parse_ids, results_dir
 from .numerics_fp32 import recurrence
 
+BENCH_CONTEXT = 8184  # the engine benchmark's context (bench/engines/arms.py CONTEXT)
 DEV = "cuda"
 GDN_HK, GDN_HV, GDN_D = 16, 48, 128  # Qwen3.8 27B's GDN layers: q/k heads, v heads, head dim
 KEYS = ("q", "k", "v", "a", "b")  # a GDN row's per-token inputs (`_gdn_seq`'s names: a the decay alpha, b beta)
@@ -2100,7 +2099,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--true", default="rand,lb", help="true lengths: lb, rand, ub")
     p.add_argument("--logit-std", type=float, default=2.0, help="the spread of q·k × scale")
     p.add_argument("--bad", type=float, default=0.05, help="a (row, query)'s relative RMS error counted bad above")
-    p.add_argument("--max-model-len", type=int, default=BATCH_INVARIANT_MAX_LEN - 8,
+    p.add_argument("--max-model-len", type=int, default=BENCH_CONTEXT,
                    help="sizes the fixed splits and the page tables")
     p.add_argument("--max-num-seqs", type=int, default=128, help="decode rows at most (the graph buckets)")
     p.add_argument("--max-tokens", type=int, default=4096, help="a step's tokens at most (our kernels' tables)")
@@ -2111,7 +2110,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = add("timing", cmd_timing, "GDN prefill timings: checkpoints, routes, padding")
     p.add_argument("--iters", type=int, default=50, help="timed calls a variant")
     p.add_argument("--warmup", type=int, default=5, help="untimed calls before them")
-    p.add_argument("--single", default=f"512,1024,2048,4096,{BATCH_INVARIANT_MAX_LEN - 8}",
+    p.add_argument("--single", default=f"512,1024,2048,4096,{BENCH_CONTEXT}",
                    help="single-sequence lengths")
     p.add_argument("--padded", default="1000,300,2000,70,700;100,128,70,300,200",
                    help="packed mixes for the padded call (;-separated)")

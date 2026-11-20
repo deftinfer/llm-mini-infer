@@ -589,7 +589,15 @@ def long_loads(context: int) -> tuple[list[LoadSpec], list[str]]:
 
 
 def loads_for(ctx: Ctx, unit: Unit) -> list[LoadSpec]:
-    """The loads of a unit, in order. Raises LookupError when A2 has no A1 rate to start from."""
+    """The loads of a unit, in order, only those `--load` names when it names any (a named deviation). Raises
+    LookupError when A2 has no A1 rate to start from."""
+    loads = family_loads(ctx, unit)
+    keep = getattr(ctx.args, "load", None) or []
+    return [spec for spec in loads if spec.name in keep] if keep else loads
+
+
+def family_loads(ctx: Ctx, unit: Unit) -> list[LoadSpec]:
+    """The loads of a unit's family, in order (`loads_for`)."""
     fam, args = unit.family, ctx.args
     if fam in ("smoke", "D"):
         return []
@@ -1061,6 +1069,8 @@ def write_unit(ctx: Ctx, unit: Unit, udir: Path, log_path: Path, binary: str, en
     if not (udir / "startup.json").exists():
         write_json(udir / "startup.json", {"starts": oc.starts, "wiped": None, "evicted": None})
     deviations = list(arm.deviations)
+    if getattr(ctx.args, "load", None):
+        deviations.append(f"only the loads {', '.join(ctx.args.load)} (--load)")
     if unit.family == "L":
         deviations += long_loads(arm.context)[1]
     if unit.family == "D" and ctx.args.skip_validity:
@@ -1142,6 +1152,8 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--bound-file", help="family A2: the latency bound")
     ap.add_argument("--meta-extra", default="{}", help="JSON merged into every manifest")
     ap.add_argument("--m-concurrency", type=int, default=48, help="family M: conversations in flight")
+    ap.add_argument("--load", action="append", default=[], metavar="NAME",
+                    help="run only this load of the family (repeatable; a named deviation)")
     ap.add_argument("--context", type=int, default=arms.CONTEXT, help="the context every arm serves (default: "
                     "%(default)s); family L's loads that do not fit it are skipped")
     ap.add_argument("--tokenizer", help="the clients' tokenizer: a folder or repo id (default: the model's repo id)")

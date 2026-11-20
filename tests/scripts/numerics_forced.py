@@ -15,8 +15,8 @@ the model and process-wide flags).
 **The engine** (`Engine`) is the server's, in-process: the runner, its pools sized as `engine.process` sizes them from
 the memory the runner reports (its memory profile; `--memory-gb` skips it), the scheduler with the server's settings and
 the engine loop. The defaults are the server's for these checkpoints with structured output on, but one: k = 3 drafts on
-both models (`--k`; the server drafts 5 with an assistant). The server's: `model.max_model_len` at batch invariance's
-default range (`config.BATCH_INVARIANT_MAX_LEN` - 8), steps of 2,048 tokens, 64 sequences, pages of 16 positions (Gemma
+both models (`--k`; the server drafts 5 with an assistant). The server's: `model.max_model_len` at the engine
+benchmark's context (8,184), steps of 2,048 tokens, 64 sequences, pages of 16 positions (Gemma
 4: window pages of 16, full pages of as many bytes), the sparse head, always-split graphs, PDL, the forced prefix and
 the EOS-free finish, the precise prefix (`runner.cuda.fp8_cold_prefill` reuse; it acts on cache hits only), the
 mixed-step bound derived from the profile's step costs (off with `--memory-gb`), images on where the checkpoint has a
@@ -121,12 +121,10 @@ from typing import Any
 
 import numpy as np
 
-from llm_mini_infer.config import BATCH_INVARIANT_MAX_LEN
-
 from ..support.forced import Forced, ForcedMatcher
 from ..support.paths import RESULTS, ROOT
 
-MAX_LEN = BATCH_INVARIANT_MAX_LEN - 8  # model.max_model_len: batch invariance's default range
+MAX_LEN = 8184  # model.max_model_len: the engine benchmark's context (bench/engines/arms.py CONTEXT)
 SOFT_TOKENS = 280  # Gemma 4's images.max_soft_tokens: the checkpoint's own budget
 CHAT_TOKENS = 2048  # the chat workload's prompt tokens
 MAX_TOKENS = 384  # a reference answer's tokens at most

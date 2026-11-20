@@ -11,6 +11,7 @@ import socket
 import stat
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -580,24 +581,29 @@ def test_a_longer_context_is_in_every_engines_flags_and_the_unit_name():
     assert qwen[qwen.index("--max-model-len") + 1] == "65536"
 
 
-def test_ours_is_not_invariant_by_default_past_its_limit_and_family_i_and_l_pair_it_with_forced_on():
-    assert arms.default_batch_invariant("ours") and arms.default_batch_invariant("ours", 8184)
-    assert not arms.default_batch_invariant("ours", 8185)
-    assert not arms.default_batch_invariant("vllm") and not arms.default_batch_invariant("sglang", 32768)
+def test_ours_is_invariant_by_default_on_gemma_and_on_qwen_up_to_its_limit_and_family_i_and_l_pair_it_with_the_other():
+    default = arms.default_batch_invariant
+    assert default("ours", 8184, "gemma") and default("ours", 262144, "gemma")
+    assert default("ours", 32768, "qwen") and not default("ours", 32769, "qwen")
+    assert not default("vllm", 8184, "gemma") and not default("sglang", 32768, "gemma")
     for family in ("I", "L"):
         ours = [a for a in arms.arms("gemma", 32768)[family] if a.engine == "ours"]
-        assert [a.name for a in ours] == ["ours-ctx32768", "ours-ctx32768-bi"]
-        assert [arms.batch_invariant(a) for a in ours] == [False, True]
-        assert "dev.runner.cuda.batch_invariant=true" in arms.argv(ours[1], "/x/bin")
+        assert [a.name for a in ours] == ["ours-ctx32768", "ours-ctx32768-nobi"]
+        assert [arms.batch_invariant(a) for a in ours] == [True, False]
+        assert "dev.runner.cuda.batch_invariant=false" in arms.argv(ours[1], "/x/bin")
         assert not any("batch_invariant" in x for x in arms.argv(ours[0], "/x/bin"))
         assert [a.name for a in arms.arms("gemma", 32768)[family] if a.engine == "vllm"] == [
             "vllm-ctx32768", "vllm-ctx32768-bi-nodg"]
+    for context, names in ((32768, ["ours-ctx32768", "ours-ctx32768-nobi"]),
+                           (65536, ["ours-ctx65536", "ours-ctx65536-bi"])):
+        ours = [a for a in arms.arms("qwen", context)["I"] if a.engine == "ours"]  # on at 32,768, off past it
+        assert [a.name for a in ours] == names
 
 
 def test_the_invariance_limit_is_the_packages():
     from llm_mini_infer import config
 
-    assert arms.OURS_INVARIANT_MAX_LEN == config.BATCH_INVARIANT_MAX_LEN - 8
+    assert arms.OURS_INVARIANT_MAX_LEN == {"gemma": None, "qwen": config.QWEN_INVARIANT_MAX_LEN}
 
 
 def test_family_l_keeps_the_loads_that_fit_the_context():
@@ -640,9 +646,22 @@ def test_family_l_dry_run_names_the_skipped_loads_and_the_manifest_does_too(rig,
     assert drive.main([*argv, "--dry-run"]) == 0
     out = capsys.readouterr().out
     assert [ln.split(":")[0] for ln in out.splitlines() if ln.startswith("L ")] == ["L ours-ctx32768",
-                                                                                  "L ours-ctx32768-bi"]
+                                                                                  "L ours-ctx32768-nobi"]
     assert "load prefill-32k:" in out and "load prefill-128k:" not in out and "prefill-128k skipped" in out
     assert not rig.out.exists()
+
+
+def test_load_keeps_only_the_named_loads():
+    args = drive.parser().parse_args(["--out", "x", "--model", "gemma", "--family", "L", "--context", "262144",
+                                      "--load", "prefill-128k", "--load", "cached-128k"])
+    unit = drive.build_units(args)[0]
+    assert [s.name for s in drive.loads_for(SimpleNamespace(args=args), unit)] == ["prefill-128k", "cached-128k"]
+
+
+def test_a_manifest_names_the_loads_kept(rig):
+    rig.mp.setattr(drive, "loads_for", lambda ctx, unit: [])
+    assert rig.run("--context", "32768", "--arm", "vllm-ctx32768", "--load", "chat-c64", family="L") == 0
+    assert "only the loads chat-c64 (--load)" in rig.manifest("vllm-ctx32768", "L")["deviations"]
 
 
 def test_a_family_l_manifest_records_the_context_and_the_skipped_loads(rig):

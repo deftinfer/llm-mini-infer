@@ -7,12 +7,12 @@ Three engines serve each model in turn on one GPU, on the loopback interface, wi
 - `vllm`: vLLM v0.33.0, from its CUDA 13 release wheel in a venv of its own;
 - `sglang`: SGLang v0.5.23, from its CUDA 13 wheels in a venv of its own.
 
-**Held equal** on every arm: the context (`CONTEXT` unless the run sets one: llm-mini-infer's batch invariance is on
-by its own default up to 8,184 positions, `OURS_INVARIANT_MAX_LEN`), the sequences in flight (`SEQS`; SGLang on Qwen3.8
-`SGLANG_QWEN_SEQS`, a named deviation), the KV cache in the model's dtype, each model's default image budget, prefix
-caching on, structured output with llguidance and compact JSON, the same drafter and draft count (`k`), seed 0, no
-reasoning parser on vLLM or SGLang (every request turns thinking off). **Not held equal**, recorded per arm: the
-memory budget (vLLM 0.9, llm-mini-infer 0.9 by its default, SGLang its computed static fraction), the per-step token
+**Held equal** on every arm: the context (`CONTEXT` unless the run sets one: llm-mini-infer's batch invariance is on by
+its own default on Gemma 4 at any context, on Qwen3.8 up to `OURS_INVARIANT_MAX_LEN`), the sequences in flight (`SEQS`;
+SGLang on Qwen3.8 `SGLANG_QWEN_SEQS`, a named deviation), the KV cache in the model's dtype, each model's default image
+budget, prefix caching on, structured output with llguidance and compact JSON, the same drafter and draft count (`k`),
+seed 0, no reasoning parser on vLLM or SGLang (every request turns thinking off). **Not held equal**, recorded per arm:
+the memory budget (vLLM 0.9, llm-mini-infer 0.9 by its default, SGLang its computed static fraction), the per-step token
 budget, the FP8 GEMM kernel and the attention backend: each engine's default, unless an arm names an override.
 
 **The environment** of each arm is clean: a short list of the container's own variables (`INHERIT`), the engine's
@@ -28,10 +28,10 @@ import json
 import os
 from dataclasses import dataclass, field
 
-CONTEXT = 8184  # the default context of every arm: the longest llm-mini-infer's batch invariance is on at by default
-# llm-mini-infer's own rule (llm_mini_infer/config.py: `BATCH_INVARIANT_MAX_LEN` less 8, the `short` test): batch
-# invariance is on by default while model.max_model_len + 8 <= 32 * 256; a test pins this to the package's constant
-OURS_INVARIANT_MAX_LEN = 8184
+CONTEXT = 8184  # the default context of every arm (batch invariance is on by default at it on both models)
+# The longest context llm-mini-infer's batch invariance is on at by default, per model (llm_mini_infer/config.py:
+# `QWEN_INVARIANT_MAX_LEN`, pinned by a test; None: any context)
+OURS_INVARIANT_MAX_LEN = {"gemma": None, "qwen": 32768}
 SEQS = 64  # sequences in flight
 HOST, PORT = "127.0.0.1", 8000
 ENGINES = ("ours", "vllm", "sglang")
@@ -93,7 +93,7 @@ class Arm:
     engine: str
     model: str  # a key of MODELS
     k: int | None = None  # None: the model's headline k
-    batch_invariant: bool | None = None  # None: the engine's default (llm-mini-infer: on up to 8,184; the others: off)
+    batch_invariant: bool | None = None  # None: the engine's default (see `default_batch_invariant`)
     sets: tuple[str, ...] = ()  # llm-mini-infer: more --set values (the multi-turn cell's cache settings)
     seqs: int | None = None  # the sequences in flight; None: SEQS (a named deviation)
     context: int = CONTEXT  # the context every engine serves (a named part of the unit's folder when not CONTEXT)
@@ -119,7 +119,7 @@ class Arm:
             parts.append(f"k{self.k}")
         if self.context != CONTEXT:
             parts.append(f"ctx{self.context}")
-        default = default_batch_invariant(self.engine, self.context)
+        default = default_batch_invariant(self.engine, self.context, self.model)
         if self.batch_invariant is not None and self.batch_invariant != default:
             parts.append("bi" if self.batch_invariant else "nobi")
         if self.label:
@@ -127,15 +127,16 @@ class Arm:
         return "-".join(parts)
 
 
-def default_batch_invariant(engine: str, context: int = CONTEXT) -> bool:
-    """Each engine's own mode at `context`: llm-mini-infer's batch invariance is on by default at a context of at most
-    8,184 positions (`OURS_INVARIANT_MAX_LEN`) on these block-FP8 checkpoints; vLLM's and SGLang's are off unless asked
-    for."""
-    return engine == "ours" and context <= OURS_INVARIANT_MAX_LEN
+def default_batch_invariant(engine: str, context: int, model: str) -> bool:
+    """Each engine's own mode for `model` at `context`: llm-mini-infer's batch invariance is on by default on these
+    block-FP8 checkpoints at any context on Gemma 4, up to `OURS_INVARIANT_MAX_LEN` on Qwen3.8; vLLM's and SGLang's
+    are off unless asked for."""
+    limit = OURS_INVARIANT_MAX_LEN[model]
+    return engine == "ours" and (limit is None or context <= limit)
 
 
 def batch_invariant(arm: Arm) -> bool:
-    default = default_batch_invariant(arm.engine, arm.context)
+    default = default_batch_invariant(arm.engine, arm.context, arm.model)
     return default if arm.batch_invariant is None else arm.batch_invariant
 
 
@@ -251,7 +252,7 @@ def arms(model: str, context: int = CONTEXT) -> dict[str, list[Arm]]:
         return Arm(engine, model, context=context, **kw)
 
     head = [arm(e) for e in ENGINES]
-    other_mode = [arm(e, batch_invariant=not default_batch_invariant(e, context)) for e in ENGINES]
+    other_mode = [arm(e, batch_invariant=not default_batch_invariant(e, context, model)) for e in ENGINES]
     own = [Arm("vllm", model, k=k, context=context) for k, _ in VLLM_OWN_K[model]]
     # The cost of batch invariance (family I): each engine in both modes, on fresh servers; vLLM's invariance on Gemma
     # 4 with DeepGEMM off (vLLM refuses it on Qwen3.8's GDN attention)

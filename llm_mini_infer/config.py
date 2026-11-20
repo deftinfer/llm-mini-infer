@@ -386,10 +386,13 @@ class DevCudaConfig(_Group):
     memory_history: str | None = None
     # Batch invariance (answer reproducibility; architecture.md, "Batch invariance"): a row's bits do not depend on the
     # rows beside it, its MTP verify window's offset or the step's kind. Default: on for Gemma 4, and for Qwen3.8 with a
-    # block-FP8 checkpoint, when model.max_model_len is at most 8,184 (BATCH_INVARIANT_MAX_LEN less 8) and the token
-    # budget, the chunk cap and dev.cache.page_size allow it (`_invariance_blocked`). Forced on past that length, a
-    # query's bits still depend on its position and keys alone (its attention splits come from its position)
+    # block-FP8 checkpoint while model.max_model_len is at most 32,768 (QWEN_INVARIANT_MAX_LEN), when the token
+    # budget, the chunk cap and dev.cache.page_size allow it (`_invariance_blocked`)
     batch_invariant: bool | None = None
+    # With batch invariance, the full layers' prefill split (architecture.md, "Batch invariance"): a prefill query with
+    # more keys than this splits them by a size from its position. Default: 8,192 (`kernels.attn512.PREFILL_FROM`); at
+    # model.max_model_len or more no query splits (for measurements)
+    prefill_split_from: int | None = None
 
 
 class DevRunnerConfig(_Group):
@@ -970,8 +973,10 @@ def _derive_grammar_tokens(cfg: Config, reasons: dict[str, str]) -> None:
                          f"ids ({ids}), so the sample decides which: use backend guidance")
 
 
-# dev.runner.cuda.batch_invariant's default context
-BATCH_INVARIANT_MAX_LEN = 32 * 256
+# dev.runner.cuda.batch_invariant's longest default context on Qwen3.8 (Gemma 4: any): past it a long prompt's prefill
+# on our full-attention kernel (`kernels.attn_window.FullAttention`, 64-row tiles) falls more than 10% behind
+# FlashInfer's, so the default leaves the switch to be set
+QWEN_INVARIANT_MAX_LEN = 32_768
 
 
 # Our kernels read and write BF16 (the Qwen runner's take any tensor they are given): fp32 on CUDA takes their torch
@@ -988,7 +993,6 @@ def _derive_kernels(cfg: Config, hf: dict[str, Any], reasons: dict[str, str]) ->
     if cfg.runner.kind == "cuda" and o.device.split(":")[0] == "cuda" and o.dtype == "float32" and o.fused_ops:
         raise ValueError(FP32_KERNELS)
     gemma = hf.get("model_type") in GEMMA4_TYPES or (hf.get("text_config") or {}).get("model_type") in GEMMA4_TYPES
-    short = (cfg.model.max_model_len or 0) + 8 <= BATCH_INVARIANT_MAX_LEN
     if o.pdl is None:
         o.pdl = True
         reasons["dev.runner.cuda.pdl"] = "on: each kernel of ours and each FP8 GEMM may start as the one before it ends"
@@ -1001,7 +1005,10 @@ def _derive_kernels(cfg: Config, hf: dict[str, Any], reasons: dict[str, str]) ->
     elif o.always_split and not so.enabled:
         raise ValueError("dev.runner.cuda.always_split: needs structured output (its graphs are the grammar masks' "
                          "split)")
-    _derive_batch_invariance(cfg, hf, gemma, short, reasons)
+    _derive_batch_invariance(cfg, hf, gemma, reasons)
+    if o.prefill_split_from is not None and (o.prefill_split_from < 1 or not o.batch_invariant):
+        raise ValueError(f"dev.runner.cuda.prefill_split_from {o.prefill_split_from}: at least 1, with "
+                         "dev.runner.cuda.batch_invariant on (the split is its kernels')")
     if cfg.engine.plan_at_boundary and cfg.runner.kind == "cuda" and not gemma:
         raise ValueError("engine.plan_at_boundary: Gemma 4 only on CUDA (the Qwen runner's prefill and mixed steps "
                          "launch breakable graphs whose eager GDN and attention breaks take 15-22 ms of host time on a "
@@ -1011,14 +1018,14 @@ def _derive_kernels(cfg: Config, hf: dict[str, Any], reasons: dict[str, str]) ->
                          "forward and a sampling)")
 
 
-def _derive_batch_invariance(cfg: Config, hf: dict[str, Any], gemma: bool, short: bool,
-                             reasons: dict[str, str]) -> None:
+def _derive_batch_invariance(cfg: Config, hf: dict[str, Any], gemma: bool, reasons: dict[str, str]) -> None:
     """The default of `dev.runner.cuda.batch_invariant` (architecture.md, "Batch invariance"; the rule: its comment in
     `DevCudaConfig`). Raises when it is set on and `_invariance_blocked` gives a reason."""
     o = cfg.dev.runner.cuda
-    long = (f"off: model.max_model_len {cfg.model.max_model_len} is past {BATCH_INVARIANT_MAX_LEN - 8:,}, the "
-            "longest context it is on at by default; forced on, a query's bits still depend on its position and keys "
-            "alone; set it to take that")
+    short = (cfg.model.max_model_len or 0) <= QWEN_INVARIANT_MAX_LEN
+    long = (f"off: model.max_model_len {cfg.model.max_model_len} is past {QWEN_INVARIANT_MAX_LEN:,}, where a long "
+            "prompt's prefill on our full-attention kernel falls more than 10% behind FlashInfer's; forced on, a "
+            "query's bits still depend on its position and keys alone; set it to take that")
     from .sched.plan import CKPT_GRID
 
     # The Qwen runner cuts its prompts on the GDN prefill's 64-token grid too; its MTP layer writes KV of its own, so
@@ -1026,11 +1033,10 @@ def _derive_batch_invariance(cfg: Config, hf: dict[str, Any], gemma: bool, short
     cant = _invariance_blocked(cfg, 1 if gemma else CKPT_GRID, draft_kv=not gemma)
     if gemma:
         if o.batch_invariant is None:
-            o.batch_invariant = short and not cant
+            o.batch_invariant = not cant
             reasons["dev.runner.cuda.batch_invariant"] = (
                 "on: Gemma 4; a row's attention, sparse head and image bits do not depend on the rows beside it (nor "
-                "its FP8 projections': CUTLASS at every M)" if o.batch_invariant else long if not short else
-                f"off: {cant}")
+                "its FP8 projections': CUTLASS at every M)" if o.batch_invariant else f"off: {cant}")
         elif o.batch_invariant and cant:
             raise ValueError(f"dev.runner.cuda.batch_invariant: {cant}")
         return

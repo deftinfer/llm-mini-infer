@@ -25,7 +25,7 @@ On one RTX PRO 6000 Blackwell Server Edition at 600 W, serving Gemma 4 31B FP8 w
 
 The hosts `p1`, `p2` and `p3` are three machines with the same GPU model at 600 W. vLLM and SGLang ran from their wheels with their documented recipe flags, and their speed rows ran with invariance off, their default. KV capacity, the tokens of one step, the FP8 kernel and the attention backend are not matched. SGLang's deterministic mode gave nearly every image one answer, so its stability is not compared. The author of llm-mini-infer wrote the harness, and results move with versions. [docs/benchmarks.md](docs/benchmarks.md) gives Qwen3.8, every condition and what not to conclude.
 
-To reproduce these numbers, run the image with `--set model.max_model_len=8184`: the benchmark did, with the image's configuration file. The quickstart runs at the model's own context limit, where batch invariance is off.
+To reproduce these numbers, run the image with `--set model.max_model_len=8184`: the benchmark did, with the image's configuration file.
 
 ## Quickstart
 
@@ -98,7 +98,7 @@ The GPU is SM120. A GeForce RTX 50 card (at most 32 GB) is too small for these c
 - **One thread drives the GPU.** The scheduler, the cache, the grammar masks and the runner share one Python thread, which plans step N+1 while step N runs. Other processes do HTTP, tokenizing and image decoding.
 - **A radix prefix cache for hybrid and sliding-window models.** The prefill pass writes state checkpoints at prompt ends and branch points. A client can ask for one at any message's end (`cache_control`).
 - **Grammar-aware sampling.** When every sampled row has a mask and the masks allow at most 1,024 tokens, the LM head scores only those. With the image's `guidance` backend, tokens that a grammar forces at its start need no sampling steps ([grammar-aware heads](docs/architecture.md#grammar-aware-heads)).
-- **Reproducible answers.** Sampling noise depends only on a request's seed and position. With `model.max_model_len` at 8,184 or less (not the default), and on Qwen3.8 an FP8 checkpoint, the kernels are [batch-invariant](docs/architecture.md#batch-invariance), so a request's output can be independent of its batch ([measured](#performance)).
+- **Reproducible answers.** Sampling noise depends only on a request's seed and position. On Gemma 4, and on Qwen3.8 with an FP8 checkpoint up to a `model.max_model_len` of 32,768, the kernels are [batch-invariant](docs/architecture.md#batch-invariance), so a request's output can be independent of its batch ([measured](#performance)).
 - **Exact images.** CPU processes decode and resize images with the reference processors' exact integer path. The GPU caches each image's embeddings.
 
 ## The API

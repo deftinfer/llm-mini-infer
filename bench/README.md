@@ -67,7 +67,7 @@ python3 bench/engines/drive.py --out results/engines --model gemma --family A1
 | cached tokens in `usage` | always | `--enable-prompt-tokens-details` | `--enable-cache-report` |
 | verify steps in `/metrics` | always | always | `--enable-metrics` |
 | draft count k | `--set speculative.num_speculative_tokens=k` | `--speculative-config` with `"num_speculative_tokens": k` | `--speculative-num-steps k --speculative-eagle-topk 1 --speculative-num-draft-tokens k+1` |
-| batch invariance | on by default at a context of at most 8,184 (`dev.runner.cuda.batch_invariant`) | `VLLM_BATCH_INVARIANT=1` | `--enable-deterministic-inference` |
+| batch invariance | on by default (Qwen3.8: up to a context of 32,768; `dev.runner.cuda.batch_invariant`) | `VLLM_BATCH_INVARIANT=1` | `--enable-deterministic-inference` |
 | llguidance, compact JSON | the image's configuration | `--structured-outputs-config '{"backend":"guidance","disable_any_whitespace":true}'` | `--grammar-backend llguidance --constrained-json-disable-any-whitespace` |
 
 `run.py`'s options for this: `--requests N` (a closed loop of exactly N requests, after `--warmup-requests` from another seed), `--first-index` (several runs against one server never resend a request), `--find-rate LO,HI --bound-file PATH` (the highest Poisson rate within a latency bound), `--meta` (the arm, in the report) and `--think` (a session's pauses between turns). Tokens per verify step have one definition for every engine: the completion tokens after the first, over the server's verify steps (`spec` in each load). llm-mini-infer also delivers tokens no verify step makes (a grammar's forced tokens), so compare acceptance on the chat workload.
