@@ -734,15 +734,19 @@ def test_attn512_query_sizes_are_batch_invariant() -> None:
 
 def test_attn512_prefill_split_is_chunk_invariant() -> None:
     """A prefill query takes its keys whole up to `prefill_from` and splits them past it at absolute multiples of its
-    own size (`prefill_keys` · 2^m): one prompt's positions 40..700 (`prefill_from` 64, 32 keys a split) give the same
-    bits for each query as one prefill row and as consecutive chunks of other lengths and offsets (a chunk of one
-    token, a chunk that cuts a tile of 16 query rows between two positions, chunks that begin before and past 64),
-    each chunk alone and beside decode rows (verify rows first) and another prefill row; and within BF16 rounding of
-    the reference. The step's split items pass the partial buffer: the chunk runs in several launches."""
+    own size (`prefill_keys` · 2^m): one prompt's positions 40..700 (`prefill_from` 64, 16 keys a split, 32 past 512,
+    where 32 splits of 16 run out) give the same bits for each query as one prefill row and as consecutive chunks of
+    other lengths and offsets (a chunk of one token, a chunk that cuts a tile of 16 query rows between two positions,
+    chunks that begin before and past 64), each chunk alone and beside decode rows (verify rows first) and another
+    prefill row; and within BF16 rounding of the reference. The step's split items pass the partial buffer: the chunk
+    runs in several launches."""
+    from llm_mini_infer.kernels.attn512 import split_size
+
     ps, qo, p0, end = 16, 6, 40, 701
     lens = [end, 1100, 900, 400]
     case = _split_case(lens, seed=53)
-    a = _split_attn(case, max_rows=16, max_kv=1200)
+    a = _split_attn(case, max_rows=16, max_kv=1200, prefill_keys=16)
+    assert split_size(511, 16) == 16 and split_size(end - 1, 16) == 32  # the prompt crosses the doubling
     dec = [(2, lens[1] - qo, qo, 0), (3, lens[2] - qo, qo, 3)]  # decode rows, the second planned above its length
     side = (4, 100, 50, 0)  # another prefill row
 

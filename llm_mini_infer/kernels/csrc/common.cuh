@@ -71,9 +71,10 @@ __device__ __forceinline__ int lmk_split_class_end(int p, int keys, int whole) {
   return p + 1 <= whole ? whole - 1 : lmk_split_size(p, keys) * LMK_MAX_SPLITS - 1;
 }
 
-// The union [lo, hi) of split j's ranges over the consecutive positions [p0, p1] (one size class at a time, each
-// class's largest range at its last position); lo = hi = 0 when empty.
-__device__ __forceinline__ void lmk_split_union(int p0, int p1, int j, int keys, int whole, int& lo, int& hi) {
+// The hull [lo, hi) of split j's ranges over the consecutive positions [p0, p1]: the least interval holding them all
+// (one size class at a time, each class's largest range at its last position; across a size boundary it spans the gap
+// between the classes' ranges, which every row masks); lo = hi = 0 when empty.
+__device__ __forceinline__ void lmk_split_hull(int p0, int p1, int j, int keys, int whole, int& lo, int& hi) {
   lo = 0x7fffffff;
   hi = 0;
   for (int p = p0; p <= p1;) {

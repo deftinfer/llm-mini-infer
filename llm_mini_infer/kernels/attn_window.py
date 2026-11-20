@@ -217,7 +217,8 @@ class FullAttention:
     rows, as `WindowAttention`'s do (module docstring): a tile whose queries all hold at most `prefill_from` keys, or
     that holds one such query, on the unsplit kernel, whose code stays the unsplit path's; a tile with a query past
     that, also in its splits (sizes from `prefill_keys`), each split an item whose partials the prefill merge combines
-    in split order for those queries only. A step's split items past the partials run in more launches."""
+    in split order for those queries only. `prefill_from` is at least `prefill_keys`, so a query past it takes two
+    splits or more and every tile holding it splits. A step's split items past the partials run in more launches."""
 
     name = "attn_window"
     replans = kept = unsplit = 0  # as `WindowAttention`'s
@@ -236,6 +237,10 @@ class FullAttention:
             if keys < KT or keys % KT:
                 raise ValueError(f"attention on attn_window's kernels: a {what} split of {keys} keys (a multiple of "
                                  f"{KT})")
+        if prefill_from < prefill_keys:  # so a query past it takes 2 splits or more, and every tile holding it splits
+            raise ValueError(f"attention on attn_window's kernels: prefill queries whole up to {prefill_from} keys, "
+                             f"below the prefill split's {prefill_keys} (a query between them would take one split, "
+                             "on the unsplit kernel or in the splits by its tile)")
         self.max_splits = int(range_splits(0, max_kv - 1, split_keys))  # at most MAX_SPLITS
         self.pools = pools
         self.h, self.hkv, self.scale = num_heads, num_kv_heads, scale
@@ -276,11 +281,12 @@ class FullAttention:
     def staging_bound(max_rows: int, max_tokens: int, group: int, kv_heads: int, qo_per_row: int, split_keys: int,
                       max_kv: int) -> int:
         """The int32 staging one step's plan takes at most (its row, item, group and prefill item tables, the prefill
-        split's items and groups), for the runner's page-locked buffer."""
+        split's items, their split-major orders and its groups), for the runner's page-locked buffer."""
         groups = max(1, max_rows) * tiles(qo_per_row, group) * kv_heads
         prefill = (-(-max_tokens * group // PROWS) + max_rows) * kv_heads
         n_splits = int(range_splits(0, max_kv - 1, split_keys))
-        return 4 * (max_rows + 1) + 4 * groups * n_splits + 2 * groups + 4 * prefill * (1 + MAX_SPLITS) + 2 * prefill
+        return 4 * (max_rows + 1) + 4 * groups * n_splits + 2 * groups + 4 * prefill * (1 + MAX_SPLITS) + \
+            prefill * MAX_SPLITS + 2 * prefill
 
     def plan(self, meta: Any, *, parity: int, rows: np.ndarray, stage: Any, fixed_rows: int = 0,
              lb: np.ndarray | None = None) -> None:

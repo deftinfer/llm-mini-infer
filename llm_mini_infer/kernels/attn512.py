@@ -26,8 +26,9 @@ keys [j × S, (j + 1) × S) of its size S, whatever the batch, the tile, the chu
 length. A group (row, tile, KV head) takes the most splits any position its rows may hold needs (`range_splits`: under
 MTP a decode row's queries lie anywhere from its lowest possible length to its planned one, and the count drops where
 the size doubles); a split past a row's keys is empty, and the merge skips it. A tile whose rows straddle a size
-boundary loops the union of its rows' ranges, each row masked to its own. A step whose split items pass the partials
-runs them in more launches (`plan`'s launches), each its groups' items and merge: the same arithmetic either way.
+boundary loops the hull of its rows' ranges (the gap between two size classes' ranges masked too), each row masked to
+its own. A step whose split items pass the partials runs them in more launches (`plan`'s launches), each its groups'
+items and merge: the same arithmetic either way.
 
 **CUDA graphs** (decode buckets): every row has `qo_per_row` queries (one, or the 1 + k of an MTP verify row). The
 captured launches read static row, item and group tables of a bucket's capacity (padding items exit at once); before
@@ -243,6 +244,14 @@ class Attn512:
         self.g_tabs: dict[int, tuple[torch.Tensor, torch.Tensor, int, int, int]] = {}
         self.g_host: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = {}
         self.g_last: dict[int, Any] = {}
+
+    @staticmethod
+    def staging_bound(max_rows: int, max_tokens: int, group: int, kv_heads: int) -> int:
+        """The int32 staging one step's item and group tables take at most, for the runner's page-locked buffer: every
+        group's `MAX_SPLITS` items (4 int32 each; the wave split's fewer) and, under the fixed split, their split-major
+        orders (1 each), with a margin of 4 rows' items, and the group table (2 each)."""
+        groups = (tiles(max_tokens, group) + max_rows) * kv_heads
+        return 4 * (groups * MAX_SPLITS + 4 * max_rows) + groups * MAX_SPLITS + 2 * groups
 
     def _splits(self, n_groups: int, max_kv: int) -> int:
         s = choose_splits(n_groups, max_kv, self.sms, self.resident)

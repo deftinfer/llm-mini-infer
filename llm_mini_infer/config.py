@@ -391,7 +391,7 @@ class DevCudaConfig(_Group):
     batch_invariant: bool | None = None
     # With batch invariance, the full layers' prefill split (architecture.md, "Batch invariance"): a prefill query with
     # more keys than this splits them by a size from its position. Default: 8,192 (`kernels.attn512.PREFILL_FROM`); at
-    # model.max_model_len or more no query splits (for measurements)
+    # model.max_model_len or more no query splits (for measurements). Qwen3.8: at least 2,048, its split's base
     prefill_split_from: int | None = None
 
 
@@ -1009,6 +1009,13 @@ def _derive_kernels(cfg: Config, hf: dict[str, Any], reasons: dict[str, str]) ->
     if o.prefill_split_from is not None and (o.prefill_split_from < 1 or not o.batch_invariant):
         raise ValueError(f"dev.runner.cuda.prefill_split_from {o.prefill_split_from}: at least 1, with "
                          "dev.runner.cuda.batch_invariant on (the split is its kernels')")
+    if o.prefill_split_from is not None and not gemma:
+        from .kernels.attn_window import FULL_PREFILL_KEYS
+
+        if o.prefill_split_from < FULL_PREFILL_KEYS:
+            raise ValueError(f"dev.runner.cuda.prefill_split_from {o.prefill_split_from}: at least "
+                             f"{FULL_PREFILL_KEYS:,} on Qwen3.8 (its prefill split's base: a query between them would "
+                             "take one split, whole or in the splits by its tile; `kernels.attn_window.FullAttention`)")
     if cfg.engine.plan_at_boundary and cfg.runner.kind == "cuda" and not gemma:
         raise ValueError("engine.plan_at_boundary: Gemma 4 only on CUDA (the Qwen runner's prefill and mixed steps "
                          "launch breakable graphs whose eager GDN and attention breaks take 15-22 ms of host time on a "

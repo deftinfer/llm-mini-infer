@@ -602,7 +602,7 @@ def test_qwen_batch_invariance(tmp_path) -> None:
 def test_the_prefill_split_threshold_needs_batch_invariance(tmp_path) -> None:
     """dev.runner.cuda.prefill_split_from (the full layers' prefill split under batch invariance) is left unset by
     default (the kernels' PREFILL_FROM), takes a positive value with batch invariance on and refuses one without it or
-    below 1."""
+    below 1; on Qwen3.8 one below its prefill split's base (2,048), where a query could take one split either way."""
     g = str(_gemma(tmp_path / "g"))
 
     def derive(**kw) -> config.Config:
@@ -615,6 +615,16 @@ def test_the_prefill_split_threshold_needs_batch_invariance(tmp_path) -> None:
         with pytest.raises(ValueError, match=r"^dev\.runner\.cuda\.prefill_split_from \d+: at least 1, with "
                                              r"dev\.runner\.cuda\.batch_invariant on"):
             derive(**bad)
+    assert derive(**{key: 1}).dev.runner.cuda.prefill_split_from == 1  # Gemma 4: per query, any threshold
+    (tmp_path / "q").mkdir()
+    q = _model(tmp_path / "q", 248_320, 1)  # Qwen3.8 with a block-FP8 checkpoint: on by default
+    conf = json.loads((q / "config.json").read_text())
+    conf["quantization_config"] = {"quant_method": "fp8", "weight_block_size": [128, 128]}
+    (q / "config.json").write_text(json.dumps(conf))
+    qwen = {"model.path": str(q)}
+    assert config.derive(config.load(None, {**qwen, key: 2048})).dev.runner.cuda.prefill_split_from == 2048
+    with pytest.raises(ValueError, match=r"^dev\.runner\.cuda\.prefill_split_from 2047: at least 2,048 on Qwen3\.8"):
+        config.derive(config.load(None, {**qwen, key: 2047}))
 
 
 def test_the_budget_for_batch_invariance_is_the_schedulers(tmp_path) -> None:

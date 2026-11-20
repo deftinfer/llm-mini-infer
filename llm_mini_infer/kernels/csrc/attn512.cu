@@ -13,7 +13,7 @@
 // chunk = ceil(limit / n) rounded up to 16, where limit is the tile's causal end. With `split_keys` > 0 (the fixed
 // split) each query row has its own size from its absolute position p (`split_size`: a decode row's from `split_keys`,
 // a prefill row's from `prefill_keys` once its p + 1 keys pass `whole`, below which it takes them whole), and split s
-// holds its keys [s × size, (s + 1) × size). The CTA walks the union of its rows' ranges and masks each row to its own,
+// holds its keys [s × size, (s + 1) × size). The CTA walks the hull of its rows' ranges and masks each row to its own,
 // so a query's result depends on its keys alone, not on the split count, its tile, its chunk or the batch
 // (kernels/attn512.py, the fixed split).
 //
@@ -160,11 +160,11 @@ __global__ void __launch_bounds__(THREADS, 2)
   const int p_last = min((f0 + ROWS - 1) / G, rw.nq - 1);
   const int limit = min(rw.kvlen, q0 + p_last + 1);  // the keys this tile may see
   int k_begin = 0, k_end = limit;
-  // the fixed split: this row's base and whole (a decode row's, or a prefill row's), the tile's rows' ranges' union
+  // the fixed split: this row's base and whole (a decode row's, or a prefill row's), the tile's rows' ranges' hull
   const bool fixed = SPLIT && n_splits > 1 && split_keys > 0;
   const int keys = it.row < n_dec ? split_keys : prefill_keys, whole_r = it.row < n_dec ? 0 : whole;
   if (fixed) {  // a split past the tile's keys is empty: m = −inf, l = 0, and the merge skips it
-    lmk_split_union(q0 + f0 / G, q0 + p_last, split, keys, whole_r, k_begin, k_end);
+    lmk_split_hull(q0 + f0 / G, q0 + p_last, split, keys, whole_r, k_begin, k_end);
   } else if (n_splits > 1) {  // the wave split
     const int chunk = ((limit + n_splits - 1) / n_splits + KT - 1) / KT * KT;
     k_begin = split * chunk;

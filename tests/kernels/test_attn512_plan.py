@@ -4,6 +4,8 @@ tests/kernels/test_gemma_kernels.py's (GPU)."""
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -199,3 +201,91 @@ def test_the_window_kernels_splits_cover_a_tile() -> None:
     for window, split in ((1024, 256), (64, 16), (1000, 48)):
         most = max(len(range(lo // split, (lo + window + 7 - 1) // split + 1)) for lo in range(0, 4 * split))
         assert most <= splits_per_tile(window, 8, split), (window, split, most)
+
+
+def _counting_stage() -> tuple[list[int], object]:
+    """A plan's `stage` that counts the int32 it puts in the runner's page-locked staging (`put32`)."""
+    import torch
+
+    used = [0]
+
+    def stage(a):
+        a = np.ascontiguousarray(a, dtype=np.int32).reshape(-1)
+        used[0] += a.size
+        return torch.from_numpy(a.copy())
+
+    return used, stage
+
+
+def _steps(budget: int, rows: int, qo: int, ctx: int) -> list[tuple[np.ndarray, int]]:
+    """A step's rows at a context of `ctx` (slot, first token, queries, KV length after): a prefill chunk of the whole
+    budget ending at several points, alone and after `rows` − 1 verify rows of `qo` queries at the context."""
+    out = []
+    for end in sorted({budget, ctx // 4, ctx // 2, ctx - 1000, ctx}):
+        out.append((np.array([[0, 0, budget, max(end, budget)]], np.int32), 0))
+        n_dec = rows - 1
+        chunk = budget - n_dec * qo
+        dec = [[1 + i, i * qo, qo, ctx] for i in range(n_dec)]
+        out.append((np.array([*dec, [0, n_dec * qo, chunk, max(end, chunk)]], np.int32), n_dec))
+    return out
+
+
+@pytest.mark.parametrize("budget", [2048, 8192, 32768])
+@pytest.mark.parametrize("prefill_from", [2048, 8192])
+def test_a_full_attention_plan_stages_within_its_bound(budget, prefill_from) -> None:
+    """Qwen3.8's full layers (24 query, 4 KV heads; 64 rows of 1 + 3 queries) at a context of 262,144: a prefill
+    chunk of the whole budget ending anywhere, alone or after the verify rows, stages no more int32 than
+    `FullAttention.staging_bound`, which sizes the runner's page-locked staging (the prefill split's split-major orders
+    counted: a tile there takes 31 or 32 splits)."""
+    import torch
+
+    from llm_mini_infer.kernels.attn_window import FullAttention
+
+    rows, qo, ctx = 64, 4, 262_144
+    fa = FullAttention(None, 24, 4, 256, torch.device("cpu"), max_tokens=budget, max_rows=rows, max_kv=ctx + qo,
+                       scale=1.0, qo_per_row=qo, prefill_from=prefill_from)
+    bound = FullAttention.staging_bound(rows, budget, 6, 4, qo, fa.split_keys, ctx + qo)
+    for step, fixed in _steps(budget, rows, qo, ctx):
+        used, stage = _counting_stage()
+        fa.plan(SimpleNamespace(), parity=0, rows=step, stage=stage, fixed_rows=fixed)
+        assert used[0] <= bound, (step[-1].tolist(), fixed, used[0], bound)
+
+
+def test_full_attention_refuses_a_threshold_below_its_prefill_split() -> None:
+    """A query between `prefill_from` and `prefill_keys` would take one split, on the unsplit kernel or in the splits by
+    the tile it lands in (bits that follow its tile-mates): FullAttention refuses such a pair."""
+    import torch
+
+    from llm_mini_infer.kernels.attn_window import FullAttention
+
+    def make(prefill_from: int, prefill_keys: int) -> FullAttention:
+        return FullAttention(None, 24, 4, 256, torch.device("cpu"), max_tokens=256, max_rows=4, max_kv=4096,
+                             scale=1.0, prefill_from=prefill_from, prefill_keys=prefill_keys)
+
+    make(64, 16), make(2048, 2048)
+    with pytest.raises(ValueError, match=r"prefill queries whole up to 2047 keys, below the prefill split's 2048"):
+        make(2047, 2048)
+
+
+@pytest.mark.parametrize("budget", [2048, 8192])
+def test_an_attn512_plan_stages_within_its_bound(budget, monkeypatch) -> None:
+    """Gemma 4's full layers (32 query, 4 KV heads; 64 rows of 1 + 5 queries) at a context of 262,144 under the fixed
+    split: a prefill chunk alone or after the verify rows stages no more int32 than its row table and
+    `Attn512.staging_bound` (the split-major orders counted), what the Gemma runner sizes its staging by; also with a
+    prefill split of 16 keys (every group at 32 splits)."""
+    import torch
+
+    from llm_mini_infer.kernels import build
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda d: SimpleNamespace(multi_processor_count=SMS))
+    monkeypatch.setattr(build, "load", lambda: None)
+    rot = SimpleNamespace(cos={"full_attention": None}, sin={"full_attention": None})
+    rows, qo, ctx = 64, 6, 262_144
+    bound = 4 * (rows + 1) + am.Attn512.staging_bound(rows, budget, G, HKV)
+    for pkeys in (am.PREFILL_KEYS, 16):
+        a = am.Attn512(None, rot, G * HKV, HKV, 128, torch.device("cpu"), max_tokens=budget, max_rows=rows,
+                       qo_per_row=qo, split_keys=am.SPLIT_KEYS, max_kv=ctx + qo, prefill_keys=pkeys)
+        for step, fixed in _steps(budget, rows, qo, ctx):
+            used, stage = _counting_stage()
+            a.plan(SimpleNamespace(), parity=0, rows=step, stage=stage, fixed_rows=fixed)
+            assert used[0] <= bound, (pkeys, step[-1].tolist(), fixed, used[0], bound)

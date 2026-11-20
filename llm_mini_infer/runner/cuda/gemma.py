@@ -684,10 +684,11 @@ class GemmaRunner(Runner):
             cap_i += (STOP_W + 2) * slots + 8 * slots
         if self.logprobs:  # the LOGPROBS samples' indices
             cap_i += smax + LP_CHUNK
-        groups = (-(-pc.max_num_batched_tokens * (cfg.num_heads // cfg.full_kv_heads) // 16) + slots) * \
-            cfg.full_kv_heads
-        n32 = 16 * slots + 64 + 8 * (slots + 1) + 4 * (groups * 32 + 4 * slots)  # FlashInfer plans; rows; items
-        n32 += 2 * groups  # attn512's group table (a prefill group may split: `kernels.attn512`)
+        from ...kernels.attn512 import Attn512
+
+        n32 = 16 * slots + 64 + 8 * (slots + 1)  # FlashInfer plans; rows
+        n32 += Attn512.staging_bound(slots, pc.max_num_batched_tokens, cfg.num_heads // cfg.full_kv_heads,
+                                     cfg.full_kv_heads)  # attn512's items, orders and groups (`kernels.attn512`)
         if self.window_split_keys and self.attn_kind == "flashinfer":  # our sliding kernel's tables
             from ...kernels.attn_window import WindowAttention
 

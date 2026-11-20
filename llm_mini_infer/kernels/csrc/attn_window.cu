@@ -33,7 +33,7 @@
 //
 // **Full attention's sizes** (`attn_window_kernel<true>`, Qwen3.8's full layers, no window): a decode query at absolute
 // position p splits its keys at multiples of its own size, `split_keys` · 2^m (common.cuh `lmk_split_size`), so a tile
-// whose rows straddle a size boundary walks the union of their ranges and masks each row to its own.
+// whose rows straddle a size boundary walks the hull of their ranges and masks each row to its own.
 //
 // **Prefill rows** (`attn_window_prefill_kernel`: the many queries of a prompt; whole, no split). A tile is 64 query
 // rows (32 positions on Gemma 4). It reads the window's keys once for 4 times the queries. The decode CTA re-reads
@@ -157,8 +157,8 @@ __global__ void __launch_bounds__(THREADS, 2)
   const int hi = min(rw.kvlen, p_last + 1);
   int k_begin = lo & ~(KT - 1), k_end = hi;  // KV tiles at absolute multiples of KT
   if (n_splits > 1) {  // split s: empty past hi (m = −inf, l = 0; the merge skips it)
-    if constexpr (CLASSES) {  // full attention only (lo = 0): the union of the tile's rows' own split j (common.cuh)
-      lmk_split_union(p_first, p_last, j, split_keys, 0, k_begin, k_end);
+    if constexpr (CLASSES) {  // full attention only (lo = 0): the hull of the tile's rows' own split j (common.cuh)
+      lmk_split_hull(p_first, p_last, j, split_keys, 0, k_begin, k_end);
     } else {
       const int s = lo / split_keys + j;
       k_begin = max(k_begin, s * split_keys);
@@ -429,10 +429,10 @@ __global__ void __launch_bounds__(PTHREADS, 1)
   const int q0 = rw.kvlen - rw.nq;
   const int f0 = it.tile * PROWS;  // flattened f -> query position f / G, head kvh * G + f % G
   [[maybe_unused]] const int j = it.split & 0xffff;  // SPLIT: this item's split
-  [[maybe_unused]] int s_lo = 0, s_hi = 0;  // SPLIT: the union of the split queries' ranges in split j
+  [[maybe_unused]] int s_lo = 0, s_hi = 0;  // SPLIT: the hull of the split queries' ranges in split j
   if constexpr (SPLIT) {
     const int p0 = max(q0 + f0 / G, whole), p1 = q0 + min((f0 + PROWS - 1) / G, rw.nq - 1);
-    if (p0 <= p1) lmk_split_union(p0, p1, j, split_keys, whole, s_lo, s_hi);
+    if (p0 <= p1) lmk_split_hull(p0, p1, j, split_keys, whole, s_lo, s_hi);
   }
   for (int c = tid; c < PROWS * CHUNKS; c += PTHREADS) {  // the Q tile is the first cp.async group
     const int r = c / CHUNKS, ch = c % CHUNKS;
