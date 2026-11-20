@@ -112,7 +112,7 @@ def counters(s: Scheduler, k: int, masked: bool = False) -> np.ndarray:
     """A run's acceptance counters add up: every verify row counts its k drafts (with a grammar, only those it takes:
     `Scheduler.spec_draft_tokens`), the accepted ones are a prefix of them (the count per position does not grow with
     the position, the first at most the rows) and sum to the accepted total. Returns the counts per position."""
-    per, offered = s.spec_accepted_per_pos, s.spec_offered_per_pos
+    per, offered = s.spec_accepted_per_pos, s.spec_verified_per_pos
     assert len(per) == k and s.spec_drafts > 0
     assert 0 <= s.spec_accepted <= s.spec_draft_tokens <= s.spec_drafts * k
     if not masked:

@@ -70,6 +70,14 @@ def arena_mtp_workloads(draw):
 
 
 @st.composite
+def arena_mtp_count_workloads(draw):
+    """`arena_mtp_workloads` (Gemma 4's: a drafter without KV, one arena near its bound) with a draft count per step."""
+    from .mtp_workloads import with_counts
+
+    return with_counts(draw, draw(arena_mtp_workloads()))
+
+
+@st.composite
 def gemma_images_mtp_workloads(draw):
     """`window_workloads.gemma_image_workloads` (bidirectional spans, encoder budgets, hints inside spans) with MTP."""
     return with_mtp(draw, draw(gemma_image_workloads()), stops=False)

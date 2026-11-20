@@ -855,7 +855,8 @@ class Scheduler:
         self.spec_draft_tokens = 0
         self.spec_accepted = 0
         self.spec_accepted_per_pos = np.zeros(max(1, mtp_k), np.int64)
-        self.spec_offered_per_pos = np.zeros(max(1, mtp_k), np.int64)  # verify rows that verified each position
+        self.spec_verified_per_pos = np.zeros(max(1, mtp_k), np.int64)  # verify rows whose window held each position
+        self.steps_by_count = np.zeros(mtp_k + 1, np.int64)  # plans of decode rows by the drafts they verified
         self.num_overruns = 0  # MTP rows whose device commit ran past a finish the runner did not know (KV-only finish)
         # ... their tokens past that finish, in spec_accepted but never delivered; and the tokens readmissions' final
         # prefill chunks sampled (a request's next token after a preemption, from no verify row). Σ over requests of
@@ -1247,6 +1248,11 @@ class Scheduler:
                     self.pending[dec] += 1
                     self.mark[dec] = self._mark_id
                     budget.decode_rows(len(dec), 1 + v, self.row_tokens, self.grid)
+                    if self.k:
+                        self.steps_by_count[v] += 1
+                        if self.count_policy is not None or self.count_schedule:
+                            log.debug("step %d: %d decode rows verify %d drafts (count %d)", self.step_id + 1,
+                                      len(dec), v, c)
                     if self.ckpt_interval and self.cache is not None:
                         self._decode_checkpoints(dec, row0, decode_ckpts)
                     self.dev_inflight[dec] += 1
@@ -2704,7 +2710,7 @@ class Scheduler:
             int(np.maximum(v - inf.invalid[rows], acc).sum())
         self.spec_accepted += int(acc.sum())
         self.spec_accepted_per_pos[:v] += (acc[:, None] > np.arange(v)[None, :]).sum(axis=0)
-        self.spec_offered_per_pos[:v] += len(rows)
+        self.spec_verified_per_pos[:v] += len(rows)
         if self.count_policy is not None:
             self.count_policy.observe_accept(v, acc)
         if inf.wpop is not None:

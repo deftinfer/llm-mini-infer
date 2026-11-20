@@ -858,8 +858,15 @@ def engine_delta(a: dict[str, float], b: dict[str, float], completed: int) -> di
     verify, gen = counter(b, VERIFY_SERIES), counter(b, GENERATION_SERIES)
     out["verify_steps"] = round(verify[1] - total(a, verify[0])) if verify else None
     pa, pb = (by_label(s, "vllm:spec_decode_num_accepted_tokens_per_pos_total", "position") for s in (a, b))
+    # each position's acceptance over the verify steps that held it: all of them at a fixed k, fewer with
+    # dev.speculative.adaptive (llm_mini_infer:spec_decode_num_verified_per_pos; another engine: its drafts)
+    va, vb = (by_label(s, "llm_mini_infer:spec_decode_num_verified_per_pos_total", "position") for s in (a, b))
+    def share(p: str) -> float:
+        held = vb[p] - va.get(p, 0.0) if p in vb else drafts
+        return round((pb[p] - pa.get(p, 0.0)) / held, 3) if held > 0 else 0.0
+
     if drafts > 0:
-        per = [round((pb[p] - pa.get(p, 0.0)) / drafts, 3) for p in sorted(pb, key=int)]
+        per = [share(p) for p in sorted(pb, key=int)]
         out["accept"] = {"drafts": round(drafts), "per_pos": per, "tokens_per_verify": round(1 + sum(per), 3),
                          "verify_steps_per_request": round(drafts / completed, 2) if completed else None}
     busy, idle = d("llm_mini_infer:gpu_busy_seconds_total"), d("llm_mini_infer:gpu_idle_seconds_total")

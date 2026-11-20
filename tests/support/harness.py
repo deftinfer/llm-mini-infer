@@ -124,7 +124,8 @@ class Harness:
                  draft_kv: bool = True, precise: str = "fp8", refine_after: int = 1, precise_cost: float = 1.0,
                  refine_min: int = 0, report_unsampled: bool = False, refine_chunk_tokens: int = 0,
                  precise_cap: int = 0, forced_prefix: bool = False, eos_free_finish: bool = False,
-                 batch_invariant: bool | None = None):
+                 batch_invariant: bool | None = None, count_schedule: tuple[int, ...] | list[int] = (),
+                 adaptive: bool = False):
         """`bidirectional` (Gemma 4's images): image spans attend bidirectionally, positions are 1-D (no M-RoPE).
         `draft_kv` (MTP): False for a drafter that writes no KV (Gemma 4's assistant). `precise`, `refine_after`,
         `precise_cost`, `refine_min`: the precise prefix's policy (the fake takes PRECISE rows unless it is "fp8");
@@ -136,7 +137,9 @@ class Harness:
         precise copy's chunking. `forced_prefix`, `eos_free_finish`: the scheduler's grammar switches (off by default,
         as its own). `batch_invariant`: the scheduler's batch invariance (its cuts, the strict fake checking them
         against the requests' hints); None: off, unless `BATCH_INVARIANT_ENV` asks for it wherever the workload's
-        budget lets a prefill progress under it (a pass of the fuzz campaign or the plan-diff harness with it on)."""
+        budget lets a prefill progress under it (a pass of the fuzz campaign or the plan-diff harness with it on).
+        `count_schedule` (MTP): the scheduler's dev schedule of draft counts; `adaptive`: its policy over every count
+        below k (`sched.draft_counts`), which the fake takes all of."""
         self.vocab = vocab
         self.mrope = bool(encoder_rows) and not bidirectional
         self.grammar = FakeGrammar(vocab, (EOS,))
@@ -177,7 +180,8 @@ class Harness:
                              draft_kv=draft_kv, precise=precise, refine_after=refine_after, refine_min=refine_min,
                              precise_cost=precise_cost, refine_chunk_tokens=refine_chunk_tokens,
                              forced_prefix=forced_prefix, eos_free_finish=eos_free_finish, batch_invariant=inv,
-                             logprobs=True, penalties_vocab=vocab)
+                             logprobs=True, penalties_vocab=vocab, count_schedule=tuple(count_schedule),
+                             draft_counts=tuple(range(1, mtp_k)) if adaptive else ())
 
         try:
             self.sched = scheduler(want)

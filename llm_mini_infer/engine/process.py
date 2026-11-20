@@ -214,6 +214,8 @@ class EngineLoop:
                            spec_drafts=s.spec_drafts, spec_draft_tokens=s.spec_draft_tokens,
                            spec_accepted=s.spec_accepted,
                            spec_accepted_per_pos=[int(x) for x in s.spec_accepted_per_pos] if s.k else [],
+                           spec_verified_per_pos=[int(x) for x in s.spec_verified_per_pos] if s.k else [],
+                           spec_steps_by_count=[int(x) for x in s.steps_by_count] if s.k else [],
                            attention_replans=a.replans, attention_plans_kept=a.kept, attention_plans_unsplit=a.unsplit,
                            vision_plan_waits=a.vision_waits,
                            grammar_head_sparse=h.sparse, grammar_head_dense_off=h.dense_off,

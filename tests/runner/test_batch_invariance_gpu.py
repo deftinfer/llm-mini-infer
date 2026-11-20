@@ -135,6 +135,21 @@ def test_a_requests_bits_do_not_depend_on_the_requests_beside_it(runs, case) -> 
     assert alone.heads.sparse > 0 and beside.heads.sparse > 0 and moved > 0  # columns that moved kept their bits
 
 
+def test_a_requests_bits_do_not_depend_on_the_draft_counts(runs) -> None:
+    """A draft count per step (`dev.speculative.adaptive`; forced schedules, `count_schedule`): request 0 alone at a
+    fixed k, alone under a schedule, and beside requests 1-3 under others (verify rows 2, 3 and 4 wide; lowering, and
+    raising through a step that verifies what its rows hold and drafts k) has the same hidden states' and logits' bits
+    every time: a row's bits depend neither on the rows beside it nor on its window's width."""
+    alone = runs("text", False)
+    for beside, schedule in ((False, (1, 3, 2)), (True, (1, 3, 2)), (True, (2, 1, 1, 3))):
+        other = runs("text", beside, draft_counts=(1, 2), count_schedule=schedule)
+        common = same_states(alone, other, "text")
+        n, _, differ = logits_compared(alone, other, common)
+        assert n >= len(common) and not differ, \
+            f"{schedule}: {len(differ)} of {n} logits differ, the first at {differ[:1]}"
+        assert other.heads.sparse > 0
+
+
 def test_the_forced_prefix_is_taken_whole(runs) -> None:
     """With the forced prefix (an answer's first 4 tokens forced), the final chunk takes them whole, alone and beside:
     their positions and the first sample after them run in the prefill row either way."""

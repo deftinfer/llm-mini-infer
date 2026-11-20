@@ -1,8 +1,8 @@
-"""The draft count per step (`dev.speculative.adaptive`, `sched.draft_counts`) in GemmaRunner on CPU (the torch reference
-backends, fp32): whatever count each step verifies and drafts, a greedy or seeded request gives the tokens it gives at a
-fixed k (architecture.md, "Speculative decoding"). Schedules of counts are forced (`count_schedule`): lowering, raising
-(a step that verifies what its rows hold and drafts k), and the policy's own choices; with the assistant's drafts and an
-oracle's (`Run._oracle`)."""
+"""The draft count per step (`dev.speculative.adaptive`, `sched.draft_counts`) in GemmaRunner on CPU (the torch
+reference backends, fp32): whatever count each step verifies and drafts, a greedy or seeded request gives the tokens it
+gives at a fixed k (architecture.md, "Speculative decoding"). Schedules of counts are forced (`count_schedule`):
+lowering, raising (a step that verifies what its rows hold and drafts k), and the policy's own choices; with the
+assistant's drafts and an oracle's (`Run._oracle`)."""
 
 from __future__ import annotations
 
@@ -48,7 +48,7 @@ def test_greedy_outputs_equal_under_any_schedule_of_counts(pair, schedule) -> No
         assert r.out == ref, (schedule, oracle is not None, rng is not None)
         counters(r.sched, K)
         if set(schedule) - {K}:
-            assert r.sched.spec_offered_per_pos[-1] < r.sched.spec_drafts  # some steps verified fewer than k
+            assert r.sched.spec_verified_per_pos[-1] < r.sched.spec_drafts  # some steps verified fewer than k
 
 
 @pytest.mark.parametrize("params", [(0.8, 1.0, 0), (1.0, 0.9, 20)])
@@ -103,9 +103,9 @@ def test_masked_outputs_equal_under_a_schedule_of_counts(pair, params) -> None:
 
 
 def test_counts_change_across_a_preemption_and_a_readmission(pair) -> None:
-    """Requests preempted mid-decode (with a decode step in flight) and readmitted from the cache while the counts change
-    every step: a readmitted slot holds no drafts until its final chunk's SAMPLE row drafts (`Scheduler.held`), and no
-    step verifies more than its rows hold (the runner checks it); the outputs are MTP off's."""
+    """Requests preempted mid-decode (with a decode step in flight) and readmitted from the cache while the counts
+    change every step: a readmitted slot holds no drafts until its final chunk's SAMPLE row drafts (`Scheduler.held`),
+    and no step verifies more than its rows hold (the runner checks it); the outputs are MTP off's."""
     from llm_mini_infer.sched.scheduler import RUNNING
 
     reqs = [dict(rid=i, prompt=p, max_tokens=30) for i, p in enumerate(PROMPTS)]
