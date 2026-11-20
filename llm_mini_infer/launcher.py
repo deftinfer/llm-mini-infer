@@ -159,6 +159,17 @@ def _watch_parent(cfg: Config, parent: int, signals: list[int]) -> threading.Thr
     return t
 
 
+def _warn_test_root() -> None:
+    """The tests' root (`leftovers.TEST_ROOT_ENV`, a test hook) set to a path with no folder named as the test
+    harness's root (TEST_ROOT_PREFIX and the uid: tests/conftest.py, whose servers stay quiet): a warning, as the
+    server's files go there and its sweep ran there."""
+    root = os.environ.get(leftovers.TEST_ROOT_ENV)
+    if root and f"{leftovers.TEST_ROOT_PREFIX}{os.getuid()}" not in os.path.normpath(root).split(os.sep):
+        log.warning("%s is set (%s), a test hook: this server's socket directory and pixel arena go there, and a "
+                    "killed server's files were looked for there, not in /tmp and /dev/shm; unset it outside the tests",
+                    leftovers.TEST_ROOT_ENV, root)
+
+
 def serve(cfg: Config) -> int:
     parent = os.getppid()  # first: a parent that exits while the server starts is still the one watched
     setup_logging(cfg.observability.log_level, "launcher")
@@ -181,8 +192,9 @@ def serve(cfg: Config) -> int:
         return 2
     cfg.pixel_arena = cfg.pool_dir = ""  # the launcher's own (load() refuses both): it removes only an arena it made
     leftovers.sweep()  # a killed server's socket directory and arena, before this one makes its own
+    _warn_test_root()
     ipc_path, lock = ipc.locked_dir()
-    locks = [lock]  # this server's flocks (`leftovers`), held until its files are removed
+    locks = [] if lock is None else [lock]  # this server's flocks (`leftovers`), held until its files are removed
     ctx = mp.get_context("spawn")
 
     def on_signal(signum: int, _frame: Any) -> None:
@@ -405,16 +417,19 @@ def _kill_engine(engine: Any) -> None:
 
 
 def _start_images(cfg: Config, ctx: Any, ipc_path: str, locks: list[int]) -> ImagePool | None:
-    """With images on: create the pixel arena, its lock added to `locks`, and the image pool that will spawn into it
-    (architecture.md, "The image pool")."""
+    """With images on: create the pixel arena, its lock added to `locks` (none where its filesystem refuses flock: then
+    under another name, `vision.arena.create_locked`), and the image pool that will spawn into it (architecture.md,
+    "The image pool")."""
     im = cfg.images
     if not im.enabled:
         return None
     from .vision import arena
 
     path = arena.arena_path(arena.default_dir(ipc_path), f"{os.getpid()}-{os.path.basename(ipc_path)}")
-    locks.append(arena.create_locked(path, cfg.dev.images.arena_mb << 20))
-    cfg.pixel_arena = path
+    path, lock = arena.create_locked(path, cfg.dev.images.arena_mb << 20)
+    if lock is not None:
+        locks.append(lock)
+    cfg.pixel_arena = path  # the name it was made under: the engine's, the pool's and the removal's at exit
     cfg.pool_dir = ipc_path
     return ImagePool(cfg, ctx, ipc_path, path)
 

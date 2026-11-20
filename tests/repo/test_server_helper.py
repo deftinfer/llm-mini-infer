@@ -44,7 +44,7 @@ if "arena" in how:  # what a launcher with images makes, as it makes them (launc
 
     ipc_path, lock = ipc.locked_dir()  # the locks held until it exits (llm_mini_infer.leftovers)
     pixels = arena.arena_path(arena.default_dir(ipc_path), f"{os.getpid()}-{os.path.basename(ipc_path)}")
-    pixels_lock = arena.create_locked(pixels, 4096)
+    pixels, pixels_lock = arena.create_locked(pixels, 4096)
     print("arena", ipc_path, pixels, flush=True)
 if "exit" in how:
     sys.exit(3)

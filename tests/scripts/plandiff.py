@@ -10,7 +10,8 @@ make, digested per launch, compared between two trees, joined on each example's 
 **What it compares.** Each fuzz suite of `tests/scripts/fuzz_campaign.py` (`SUITES`) drives the scheduler, its engine
 turn (`EngineCore.step`) and the strict fake runner over random workloads. For each workload the harness digests, in
 order: every `StepPlan` the runner receives (`launch_forward`: every field, values in canonical dtypes, empty arrays and
-zero scalars left out, so a field a newer tree adds and leaves empty changes nothing), every set of grammar masks the
+zero scalars left out, so a field a newer tree adds and leaves empty changes nothing, and so is each ADMIT term that
+every admission carries when all its values are neutral, `NEUTRAL`), every set of grammar masks the
 engine fills (`launch_sample`: their count and words), and every `StepReport` a turn returns (each frontend's outputs,
 its timing fields, the names ending in `_ns`, and the per-request verify counts, `COUNTS`, left out), then the example's
 outcome (passed, or the exception's type). The radix suite drives `RadixCache` without a scheduler: its digest is every
@@ -71,6 +72,9 @@ EXAMPLES = 1000  # per suite; the campaign's 20,000 in a few minutes on 16 cores
 LINKED = ("tests/.fixtures",)  # git-ignored fixtures some suites' modules look for
 SHOW = 3  # changed examples per suite described field by field
 TRUNC = 24  # values shown per differing field
+# Plan fields set for every ADMIT (the penalties, the logit bias's count): each left out when all its values are the
+# neutral one, so a plan without penalties digests as in a tree from before them; their other arrays are empty then
+NEUTRAL = {"admit_rep": 1.0, "admit_pres": 0.0, "admit_freq": 0.0, "admit_prompt_len": 0, "admit_bias_n": 0}
 
 
 # -- canonical events (the worker side; the tree's own classes, duck-typed) --------------------------------------------
@@ -102,8 +106,8 @@ def _canon_array(a: Any) -> np.ndarray:
 
 
 def _fields(obj: Any, names: list[str]) -> list[tuple[str, Any]]:
-    """(name, value) of the set fields: arrays with elements, non-zero scalars, non-empty sequences; `*_ns` timings
-    never."""
+    """(name, value) of the set fields: arrays with elements (not all of them NEUTRAL), non-zero scalars, non-empty
+    sequences; `*_ns` timings never."""
     out = []
     for name in sorted(names):
         if name.endswith("_ns"):
@@ -112,7 +116,7 @@ def _fields(obj: Any, names: list[str]) -> list[tuple[str, Any]]:
         if v is None:
             continue
         if isinstance(v, np.ndarray):
-            if v.size:
+            if v.size and not (name in NEUTRAL and bool((v == NEUTRAL[name]).all())):
                 out.append((name, _canon_array(v)))
         elif isinstance(v, (bool, int, float, np.generic)):
             if v:

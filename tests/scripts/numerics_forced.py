@@ -375,7 +375,7 @@ class Pixels:
         self.path = px.arena_path(px.default_dir(tempfile.gettempdir()), f"numerics-{os.getpid()}")
         px.remove(self.path)
         # locked as a server's (llm_mini_infer.leftovers): a server starting meanwhile on this host leaves it alone
-        self.lock = px.create_locked(self.path, max(need, px.ALIGN))
+        self.path, self.lock = px.create_locked(self.path, max(need, px.ALIGN))
         self.arena = px.map_writable(self.path)
         self.next = 0
 
@@ -425,7 +425,8 @@ class Pixels:
 
         self.arena.close()
         px.remove(self.path)
-        os.close(self.lock)
+        if self.lock is not None:
+            os.close(self.lock)
 
 
 # -- the engine --------------------------------------------------------------------------------------------------------

@@ -42,17 +42,39 @@ def create(path: str, size: int) -> None:
         os.close(fd)
 
 
-def create_locked(path: str, size: int) -> int:
+def create_locked(path: str, size: int) -> tuple[str, int | None]:
     """The launcher's arena: created as `create` does, but locked from the moment it appears (`leftovers.locked_file`).
-    The lock's descriptor: close it once the file is removed. A failure removes the file."""
-    fd = leftovers.locked_file(path)
+    Its path and the lock's descriptor: close it once the file is removed. On a filesystem that refuses flock
+    (`leftovers.refuses_flock`) it is made unlocked at `path` + UNLOCKED_SUFFIX, a name no sweep matches, and the
+    descriptor is None, with a warning: no start removes it, while this server lives or after a kill. A failure
+    removes the file."""
     try:
-        _allocate(fd, path, size)
+        fd = leftovers.locked_file(path)
+    except OSError as exc:
+        if not leftovers.refuses_flock(exc):
+            raise
+        refused = exc
+    else:
+        try:
+            _allocate(fd, path, size)
+        except BaseException:
+            remove(path)
+            os.close(fd)
+            raise
+        return path, fd
+    unlocked = path + leftovers.UNLOCKED_SUFFIX
+    fd = os.open(unlocked, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)  # its pid and socket directory make it new
+    try:
+        _allocate(fd, unlocked, size)
     except BaseException:
-        remove(path)
-        os.close(fd)
+        remove(unlocked)
         raise
-    return fd
+    finally:
+        os.close(fd)
+    leftovers.warn_unlocked(path, refused, f"this server's pixel arena is made unlocked as {unlocked}, which no start "
+                            f"removes: if the server is killed, the file keeps its {size >> 20} MiB until it is "
+                            "removed by hand (in /dev/shm, a start's check counts them as used)")
+    return unlocked, None
 
 
 def _allocate(fd: int, path: str, size: int) -> None:

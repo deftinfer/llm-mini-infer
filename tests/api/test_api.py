@@ -357,6 +357,7 @@ def test_the_sampling_fields_are_accepted(server) -> None:
     for extra in ({"presence_penalty": -2}, {"presence_penalty": 2}, {"frequency_penalty": -2.0},
                   {"frequency_penalty": 2.0}, {"frequency_penalty": 0.5, "presence_penalty": 1.0},
                   {"repetition_penalty": 0.5}, {"repetition_penalty": 1.5}, {"repetition_penalty": 1e-30},
+                  {"repetition_penalty": 3.4028235e38}, {"repetition_penalty": 1.1754944e-38},  # the bounds given
                   {"presence_penalty": None, "frequency_penalty": None, "repetition_penalty": None},
                   {"logit_bias": {"1": 2.0, "+5": -3, " 7 ": 100, "05": 1, "5": 2}},
                   {"logit_bias": {"3": 1000, "4": -1000}}, {"logit_bias": {}}, {"logit_bias": None},
@@ -414,6 +415,10 @@ SAMPLING_REFUSALS = [
                                           "to 3.4028235e+38), got 1e-40."),
     ({"repetition_penalty": 1e39}, None, "repetition_penalty must be a normal float32 number (from 1.1754944e-38 "
                                          "to 3.4028235e+38), got 1e+39."),
+    ({"repetition_penalty": 3.5e38}, None, "repetition_penalty must be a normal float32 number (from 1.1754944e-38 "
+                                           "to 3.4028235e+38), got 3.5e+38."),
+    ({"repetition_penalty": 1e-39}, None, "repetition_penalty must be a normal float32 number (from 1.1754944e-38 "
+                                          "to 3.4028235e+38), got 1e-39."),  # a subnormal float32
     ({"logit_bias": {"x": 1, "3": 1, "1.5": 2}}, "logit_bias",
      "logit_bias contains key(s) that cannot be converted to integer token IDs: ['x', '1.5'] "
      "(parameter=logit_bias, value=['x', '1.5'])"),
@@ -446,8 +451,17 @@ def test_the_sampling_fields_refusals(body, param, message) -> None:
     assert (err.param, err.message) == (param, message)
 
 
+def test_the_repetition_penalty_bound_is_where_float32_rounds_to_infinity() -> None:
+    """Every float64 below the midpoint between float32's largest and 2^128 rounds to a finite float32 and passes; the
+    midpoint itself rounds to infinity and is refused."""
+    for value in (3.4028235e38, 3.4028235677973362e+38, 1.1754944e-38):
+        assert checked_request({"repetition_penalty": value}).repetition_penalty == value
+    err = refusal({"repetition_penalty": 3.4028235677973366e+38})
+    assert err.message.startswith("repetition_penalty must be a normal float32 number")
+
+
 def test_the_sampling_fields_refusals_over_http(server) -> None:
-    for extra, param, message in SAMPLING_REFUSALS[:3] + SAMPLING_REFUSALS[9:10]:
+    for extra, param, message in SAMPLING_REFUSALS[:3] + SAMPLING_REFUSALS[11:12]:
         code, body = server.post("/v1/chat/completions", chat(max_tokens=4, **extra))
         assert code == 400 and (body["error"]["param"], body["error"]["message"]) == (param, message), body
 

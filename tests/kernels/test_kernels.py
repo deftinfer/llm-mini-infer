@@ -563,18 +563,21 @@ TERMS_COMBOS = [(0.0, 1.0, 0, 0.0), (1.0, 1.0, 0, 0.0), (0.7, 0.8, 20, 0.0), (1.
                 (1.3, 1.0, 50, 0.05), (1.0, 0.5, 0, 0.1), (0.9, 0.99, 3000, 0.0), (1.0, 1.0, 0, 0.2)]
 
 
-def _terms_run(logits, rng, k: int, ids=None, mask=None, mask_row=None, padded=False, reps: int = 8, vocab: int = 0):
+def _terms_run(logits, rng, k: int, ids=None, mask=None, mask_row=None, padded=False, reps: int = 8, vocab: int = 0,
+               setup=None):
     """`TERMS_COMBOS` rows with penalties, a bias (1,024 entries on some), both or neither
     (`sampler_cases.terms_tables`), each at a verify window position (k > 0): the kernel's tokens, statuses and counts
     after it, and the reference's (`apply_terms`, then `sample`). Without a window the samples are committed (no MTP: a
     penalised row's token counts), with one not (MTP commits after its verification), as the runners call it.
-    `vocab`: the tables' (default: the logits' width)."""
+    `vocab`: the tables' (default: the logits' width); `setup(tables)`: changes them before the run."""
     from llm_mini_infer.runner.cuda.penalties import TERM_PEN
     from llm_mini_infer.runner.cuda.sampler import apply_terms
 
     n = len(TERMS_COMBOS) * reps
     vocab = vocab or logits.shape[1]
     tables, drafts, w = terms_tables(rng, n, vocab, k, DEV)
+    if setup is not None:
+        setup(tables)
     temp, top_p, top_k, min_p = (np.array([c[i] for c in TERMS_COMBOS for _ in range(reps)]) for i in range(4))
     temp, top_p, min_p, top_k = temp.astype(np.float32), top_p.astype(np.float32), min_p.astype(np.float32), \
         top_k.astype(np.int64)
@@ -668,6 +671,40 @@ def test_sampler_with_terms_under_masks_and_the_sparse_head(vocab) -> None:
                                                     mask_row=rows, padded=True, vocab=vocab)
         assert sa.tolist() == sb.tolist() and np.array_equal(a, b) and torch.equal(ca, cb)
         assert np.isin(a, union).all()
+
+
+@pytest.mark.parametrize("vocab", [248_320, 262_144])
+def test_sampler_with_terms_where_x_overflows_under_a_mask(vocab) -> None:
+    """A repetition penalty near float32's largest (1e38) on rows whose every allowed token is in the prompt with a
+    logit below -3.4: y is -FLT_MAX there, and y / T overflows below T 1. The kernel clamps x (`clampf`) and samples
+    among the allowed tokens; so does the reference, token for token on every path, the statuses 0 and the counts
+    alike, and no row samples a token its mask refuses."""
+    from llm_mini_infer.runner.cuda.penalties import PROMPT, TERM_PEN
+
+    rng = np.random.default_rng(vocab + 3)
+    torch.manual_seed(13)
+    n = len(TERMS_COMBOS) * 8
+    allowed = np.zeros((2, vocab), bool)
+    allowed[0, rng.choice(vocab, 6, replace=False)] = True
+    allowed[1, rng.choice(vocab, 40, replace=False)] = True
+    words = np.packbits(np.pad(allowed, ((0, 0), (0, -vocab % 32))), axis=1, bitorder="little").view(np.int32)
+    mask = torch.as_tensor(words.copy(), device=DEV)
+    rows = np.arange(n) % 2
+    toks = torch.as_tensor(np.flatnonzero(allowed.any(0)), device=DEV)
+    logits = (torch.randn(n, vocab, device=DEV) * 4).to(BF).float()
+    logits[:, toks] = -torch.empty(n, len(toks), device=DEV).uniform_(4, 60).to(BF).float()
+
+    def setup(tables) -> None:
+        tables.rep[(tables.terms & TERM_PEN) != 0] = 1e38
+        tables.cnt[:, toks] |= PROMPT
+
+    (a, sa, ca), (b, sb, cb), flags, params = _terms_run(logits, rng, 0, mask=mask,
+                                                         mask_row=torch.as_tensor(rows, device=DEV), setup=setup)
+    assert sa.tolist() == sb.tolist() and not sa.any()
+    bad = np.flatnonzero(a != b)
+    assert len(bad) == 0, [(i, int(flags[i]), float(params[0][i]), a[i], b[i]) for i in bad[:10]]
+    assert torch.equal(ca, cb)
+    assert allowed[rows, a].all()
 
 
 # temperature, top_p, top_k, min_p: top-k and top-p cuts inside tie groups of thousands, one batch (k <= 2,048) or

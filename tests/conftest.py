@@ -38,7 +38,7 @@ def _servers_root() -> None:
 
     if os.environ.get(leftovers.TEST_ROOT_ENV):
         return
-    name = f"llm-mini-tests-{os.getuid()}"
+    name = f"{leftovers.TEST_ROOT_PREFIX}{os.getuid()}"  # its servers log no warning for it (launcher._warn_test_root)
     root = os.path.join(leftovers.tmp_root(), name)  # /tmp: a socket's path holds about 104 bytes
     _own_folder(root)
     if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK):
@@ -71,9 +71,9 @@ def private_tmp(monkeypatch):
 
     session = os.environ[leftovers.TEST_ROOT_ENV]
     root = tempfile.mkdtemp(prefix="t-", dir=session)
-    held = leftovers.locked_file(os.path.join(root, HELD))  # a killed session's go at its next start
-    made = [root]
-    try:
+    held, made = None, [root]
+    try:  # a root left without its lock (HELD) would stay for good: removed with the rest if the lock fails
+        held = leftovers.locked_file(os.path.join(root, HELD))  # a killed session's go at its next start
         if os.path.isdir(os.path.join(session, "shm")):
             made.append(tempfile.mkdtemp(prefix="t-", dir=os.path.join(session, "shm")))
             os.symlink(made[-1], os.path.join(root, "shm"))
@@ -82,7 +82,8 @@ def private_tmp(monkeypatch):
     finally:
         for path in made:
             shutil.rmtree(path, ignore_errors=True)
-        os.close(held)
+        if held is not None:
+            os.close(held)
 
 
 def remove_stale_roots(session: str) -> None:

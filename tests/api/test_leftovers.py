@@ -1,10 +1,12 @@
 """What a killed server leaves and the next start removes (`llm_mini_infer.leftovers`): what the sweep removes, what it
-keeps, the locks that tell a live server's files from a dead one's, and the race with a server being made. Every test
-under its own root (`private_tmp`), with or without an `shm` folder (`layout`: Linux's /dev/shm, or none as on macOS):
-nothing here touches /tmp or /dev/shm themselves, but for the flock check in a folder of its own."""
+keeps, the locks that tell a live server's files from a dead one's, the race with a server being made, and a filesystem
+that refuses flock. Every test under its own root (`private_tmp`), with or without an `shm` folder (`layout`: Linux's
+/dev/shm, or none as on macOS): nothing here touches /tmp or /dev/shm themselves (the flock check on /dev/shm runs in
+the test's own folder there)."""
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import json
 import logging
@@ -39,7 +41,7 @@ from llm_mini_infer.engine import ipc
 from llm_mini_infer.vision import arena
 path, lock = ipc.locked_dir()
 pixels = arena.arena_path(arena.default_dir(path), f"{os.getpid()}-{os.path.basename(path)}")
-pixels_lock = arena.create_locked(pixels, 4096)
+pixels, pixels_lock = arena.create_locked(pixels, 4096)
 print(json.dumps([path, pixels]), flush=True)
 sys.stdin.read()
 """
@@ -74,7 +76,7 @@ for module, name in ((tempfile, "mkdtemp"), (os, "open"), (fcntl, "flock"), (os,
     stopping_after(module, name)
 path, lock = ipc.locked_dir()
 pixels = arena.arena_path(arena.default_dir(path), f"{os.getpid()}-{os.path.basename(path)}")
-pixels_lock = arena.create_locked(pixels, 4096)
+pixels, pixels_lock = arena.create_locked(pixels, 4096)
 pause("made")
 """
 # the directory, its lock file (made, locked, renamed), then the arena (made, locked, renamed, sized)
@@ -175,7 +177,8 @@ def make_dead(root: str) -> tuple[str, str]:
     os.close(fd)
     assert os.path.dirname(path) == root
     pixels = arena.arena_path(arena.default_dir(path), f"{os.getpid()}-{os.path.basename(path)}")
-    os.close(arena.create_locked(pixels, 4096))
+    pixels, fd = arena.create_locked(pixels, 4096)
+    os.close(fd)
     return path, pixels
 
 
@@ -279,7 +282,7 @@ def _link_to_a_dead_directory(root: str, shm: str) -> list[str]:
 
 def _link_to_a_dead_arena(root: str, shm: str) -> list[str]:
     target = os.path.join(root, "dead-arena")
-    os.close(arena.create_locked(target, 4096))
+    os.close(arena.create_locked(target, 4096)[1])
     link = arena.arena_path(shm, "1-link")
     os.symlink(target, link)
     return [link, target]
@@ -416,11 +419,13 @@ def test_a_sweep_never_removes_a_server_being_made(layout) -> None:
 def test_a_killed_holders_lock_is_free_at_once(where, private_tmp) -> None:
     """The premise: the flock `locked_file` takes is held until its holder dies, and its SIGKILL frees it at once,
     though a child it spawned (as the launcher spawns its pool workers) still maps the file. On the tests' root, and
-    on /dev/shm itself (tmpfs, Linux) in a folder of the test's own."""
+    on /dev/shm itself (tmpfs, Linux) in the test's own folder there (`private_tmp`'s `shm`), which the next session
+    removes if this one is killed."""
     if where == "/dev/shm":
-        if not (os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK)):
+        shm = os.path.join(private_tmp, "shm")  # a link to it, where the session's root has a folder in /dev/shm
+        if not (os.path.isdir(shm) and os.path.realpath(shm).startswith(os.path.realpath("/dev/shm") + os.sep)):
             pytest.skip("no writable /dev/shm on this host")
-        folder = tempfile.mkdtemp(prefix="flock-", dir="/dev/shm")
+        folder = tempfile.mkdtemp(prefix="flock-", dir=shm)
     else:
         folder = tempfile.mkdtemp(dir=private_tmp)
     path, child = os.path.join(folder, "held"), 0
@@ -444,6 +449,77 @@ def test_a_killed_holders_lock_is_free_at_once(where, private_tmp) -> None:
             while _alive(child) and time.monotonic() < deadline:
                 time.sleep(0.05)
         shutil.rmtree(folder, ignore_errors=True)
+
+
+# -- a filesystem that refuses flock -----------------------------------------------------------------------------------
+
+def _refusing(error: OSError):
+    def flock(fd, operation):
+        raise error
+    return flock
+
+
+def _warnings(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.name == LOGGER and r.levelno >= logging.WARNING]
+
+
+@pytest.mark.parametrize("name", ["ENOLCK", "ENOSYS", "EOPNOTSUPP", "ENOTSUP"])
+def test_a_filesystem_refusing_flock_gets_files_no_sweep_removes(layout, name, caplog, monkeypatch) -> None:
+    """Its socket directory has no lock file and its arena is made under another name, each with one warning naming the
+    errno; a sweep, with flock working again, removes neither: nothing tells it that their server is dead."""
+    code = getattr(errno, name)
+    with monkeypatch.context() as m:  # only while the files are made: the sweep takes the same function
+        m.setattr(leftovers.fcntl, "flock", _refusing(OSError(code, os.strerror(code))))
+        path, fd = ipc.locked_dir()
+        pixels = arena.arena_path(arena.default_dir(path), f"{os.getpid()}-{os.path.basename(path)}")
+        made, pfd = arena.create_locked(pixels, 4096)
+    assert fd is None and pfd is None
+    assert not os.path.lexists(os.path.join(path, LOCK_FILE))
+    assert not os.path.lexists(os.path.join(path, LOCK_FILE + NEW_SUFFIX))
+    assert made == pixels + leftovers.UNLOCKED_SUFFIX and os.path.getsize(made) == 4096
+    assert not os.path.lexists(pixels) and not made.endswith(ARENA_SUFFIX)
+    warnings = _warnings(caplog)
+    assert len(warnings) == 2, warnings
+    assert warnings[0].startswith(f"cannot lock {os.path.join(path, LOCK_FILE)} ({errno.errorcode[code]}: "), warnings
+    assert warnings[1].startswith(f"cannot lock {pixels} ({errno.errorcode[code]}: ") and made in warnings[1], warnings
+    sweep_now()
+    assert os.path.isdir(path) and os.path.isfile(made)
+    assert len(_warnings(caplog)) == 2
+
+
+@pytest.mark.parametrize("error", [BlockingIOError(errno.EAGAIN, "busy"), PermissionError(errno.EACCES, "refused")],
+                         ids=["busy", "EACCES"])
+def test_a_refused_flock_of_another_kind_still_raises(layout, error, monkeypatch) -> None:
+    """Not the filesystem refusing flock (a lock held, a permission): the error reaches the caller, and neither the
+    socket directory nor the arena is left."""
+    there = _entries(layout)
+    pixels = arena.arena_path(arena.default_dir(layout), "1-x")
+    with monkeypatch.context() as m:
+        m.setattr(leftovers.fcntl, "flock", _refusing(error))
+        with pytest.raises(type(error)):
+            ipc.locked_dir()
+        assert _entries(layout) == there
+        with pytest.raises(type(error)):
+            arena.create_locked(pixels, 4096)
+    for name in (pixels, pixels + NEW_SUFFIX, pixels + leftovers.UNLOCKED_SUFFIX):
+        assert not os.path.lexists(name), name
+    assert _entries(layout) == there
+
+
+def test_a_sweep_where_flock_fails_keeps_everything(shm_layout, monkeypatch, caplog) -> None:
+    """A dead server's directory and arena whose lock the sweep cannot take (the filesystem refuses flock): both stay,
+    with a warning each; once flock works they go."""
+    path, pixels = make_dead(shm_layout)
+    with monkeypatch.context() as m:
+        m.setattr(leftovers.fcntl, "flock", _refusing(OSError(errno.ENOLCK, os.strerror(errno.ENOLCK))))
+        leftovers.sweep()
+    assert os.path.isdir(path) and os.path.isfile(pixels)
+    warnings = _warnings(caplog)
+    assert len(warnings) == 2, warnings
+    assert any(w.startswith(f"cannot remove {path},") for w in warnings), warnings
+    assert any(w.startswith(f"cannot remove {pixels},") for w in warnings), warnings
+    leftovers.sweep()
+    assert not os.path.lexists(path) and not os.path.lexists(pixels)
 
 
 # -- the tests' roots --------------------------------------------------------------------------------------------------
@@ -476,3 +552,30 @@ def test_the_files_follow_the_tests_root(layout) -> None:
     assert os.path.dirname(path) == layout and os.path.basename(path).startswith(PREFIX)
     shm = os.path.join(layout, "shm") if os.path.isdir(os.path.join(layout, "shm")) else None
     assert leftovers.shm_root() == shm and arena.default_dir(path) == (shm or path)
+
+
+def test_a_tests_root_outside_the_harness_is_a_warning(monkeypatch, caplog, tmp_path) -> None:
+    """The launcher warns once when the tests' root is set outside the harness's own (`launcher._warn_test_root`): the
+    harness's root and the private roots under it are quiet, as is no root at all."""
+    from llm_mini_infer import launcher
+
+    name = "llm_mini_infer.launcher"
+    caplog.set_level(logging.WARNING, logger=name)
+
+    def warned() -> list[logging.LogRecord]:
+        return [r for r in caplog.records if r.name == name and r.levelno == logging.WARNING]
+
+    harness = os.path.join("/tmp", f"{leftovers.TEST_ROOT_PREFIX}{os.getuid()}")  # tests/conftest.py's
+    for quiet in (harness, os.path.join(harness, "t-x"), harness + "/"):
+        monkeypatch.setenv(leftovers.TEST_ROOT_ENV, quiet)
+        launcher._warn_test_root()
+        assert not warned(), quiet
+    monkeypatch.delenv(leftovers.TEST_ROOT_ENV)
+    launcher._warn_test_root()
+    assert not warned()
+    for loud in (str(tmp_path), harness + "-other", os.path.join("/tmp", f"{leftovers.TEST_ROOT_PREFIX}x", "t-x")):
+        caplog.clear()
+        monkeypatch.setenv(leftovers.TEST_ROOT_ENV, loud)
+        launcher._warn_test_root()
+        (record,) = warned()
+        assert record.getMessage().startswith(f"{leftovers.TEST_ROOT_ENV} is set ({loud}), a test hook"), loud
