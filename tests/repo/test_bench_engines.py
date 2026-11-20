@@ -554,12 +554,13 @@ def test_family_k_runs_our_own_draft_counts_on_a1s_loads_and_the_mixed_load(rig,
     assert drive.main(["--out", str(rig.out), "--model", "gemma", "--family", "K", "--dry-run"]) == 0
     out = capsys.readouterr().out
     assert [ln.split(":")[0] for ln in out.splitlines() if ln.startswith("K ")] == [
-        "K ours-k0", "K ours-k1", "K ours-k2", "K ours-k3", "K ours"]
+        "K ours-k0", "K ours-k1", "K ours-k2", "K ours-k3", "K ours", "K ours-adaptive"]
     assert "speculative.num_speculative_tokens=0" in out and "speculative.num_speculative_tokens=5" in out
-    assert out.count("load scene-c1: ") == 5 and out.count("load chat-c64: --workload chat") == 5
+    assert out.count("dev.speculative.adaptive=true") == 1
+    assert out.count("load scene-c1: ") == 6 and out.count("load chat-c64: --workload chat") == 6
     assert out.count("load mixed-c64-chat: --workload chat --input-tokens 1024 --max-tokens 256 --ignore-eos "
-                     "--concurrency 32 --first-index 3000000") == 5
-    assert out.count("load mixed-c64-scene: --workload scene --concurrency 32 --first-index 3000000") == 5
+                     "--concurrency 32 --first-index 3000000") == 6
+    assert out.count("load mixed-c64-scene: --workload scene --concurrency 32 --first-index 3000000") == 6
     k = {a.name: a for a in arms.arms("qwen")["K"]}
     assert sorted(k) == ["ours", "ours-k0", "ours-k1", "ours-k2"]
     assert "OURS_OWN_K" in arms.k_source(k["ours-k1"]) and arms.k_source(k["ours"]) == arms.MODELS["qwen"].k_source
