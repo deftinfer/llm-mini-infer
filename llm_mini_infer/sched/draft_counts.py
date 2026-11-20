@@ -18,8 +18,9 @@ step, every `EXPLORE_EVERY` of the bucket's steps, nearest first; every `REFRESH
 (the positions its count does not verify) and one neighbour of its count (their times); otherwise it switches to the
 count with the most tokens per device-ms only when that beats its own by `HYSTERESIS`. A count above what the rows
 hold makes a raise (the scheduler verifies what they hold and drafts k, `raised`), so the bucket's next plan runs that
-count again: it is measured there. Times are measured, so the schedule is not reproducible from run to run; no output
-token depends on it (architecture.md, "Speculative decoding").
+count again: it is measured there (a row that sat out the raise still holds less, and makes the follow a raise too:
+then the plan after it, `MAX_FOLLOWS`). Times are measured, so the schedule is not reproducible from run to run; no
+output token depends on it (architecture.md, "Speculative decoding").
 """
 
 from __future__ import annotations
@@ -32,6 +33,9 @@ HYSTERESIS = 0.03  # a switch must gain this share of tokens per device-ms
 EXPLORE_EVERY = 8  # a bucket's unmeasured count runs one step in every this many of the bucket's steps
 REFRESH_EVERY = 256  # k and a neighbour of the bucket's count run one step each in every this many
 MIN_STEPS = 2  # measured steps before a (bucket, count)'s time is trusted
+# Plans that run a raised count again (`raised`): a row near its max_tokens sits out the plan after one it ran in, so
+# one that sat out the raise holds less at the first follow; by the second every row has drafted k
+MAX_FOLLOWS = 2
 
 
 def row_bucket(rows: int) -> int:
@@ -53,9 +57,10 @@ class DraftCounts:
         self.cost: dict[tuple[int, int, int], list[float]] = {}  # (bucket, v, d) -> [device ms, steps]
         self.steps: dict[int, int] = {}  # bucket -> decode steps chosen
         self.current: dict[int, int] = {}  # bucket -> the count it runs
-        self.follow: dict[int, int] = {}  # bucket -> the count its next plan runs again (after a raise: `raised`)
+        # bucket -> (the count its next plan runs again, the follows of that raise so far: `raised`)
+        self.follow: dict[int, tuple[int, int]] = {}
         self.chosen = dict.fromkeys(self.counts, 0)  # steps planned at each count (`choose`)
-        self._last: tuple[int, int, bool] | None = None  # the last choice: (bucket, count, whether a follow)
+        self._last: tuple[int, int, int] | None = None  # the last choice: (bucket, count, the follows it ends)
         # the probe schedule and the trust in a time (the module's constants; tests shorten them)
         self.explore_every, self.refresh_every, self.min_steps = EXPLORE_EVERY, REFRESH_EVERY, MIN_STEPS
 
@@ -75,9 +80,9 @@ class DraftCounts:
         n = self.steps.get(b, 0)
         self.steps[b] = n + 1
         cur = self.current.get(b, self.k)
-        c = self.follow.pop(b, None)
-        follow = c is not None and at[c] > 0
-        if not follow:
+        f = self.follow.pop(b, None)
+        c, depth = f if f is not None and at[f[0]] > 0 else (None, 0)
+        if c is None:
             c = self._probe(b, n, cur, at)
         if c is None:
             rates = {x: self.rate(at[x], x) for x in self.counts if at[x] and self.measured(row_bucket(at[x]), x)}
@@ -87,15 +92,16 @@ class DraftCounts:
                     cur = best
             self.current[b] = c = cur
         self.chosen[c] += 1
-        self._last = (b, c, follow)
+        self._last = (b, c, depth)
         return c
 
     def raised(self) -> None:
         """The last plan chosen (`choose`) raised its count: its rows held fewer drafts, so it verified those and
-        drafted k. The bucket's next plan runs that count again, now held, and so measures it (once: a follow that
-        raises again is not followed)."""
-        if self._last is not None and not self._last[2]:
-            self.follow[self._last[0]] = self._last[1]
+        drafted k. The bucket's next plan runs that count again, now held, and so measures it (a follow that raises
+        again is followed once more: `MAX_FOLLOWS`)."""
+        if self._last is not None and self._last[2] < MAX_FOLLOWS:
+            b, c, depth = self._last
+            self.follow[b] = (c, depth + 1)
 
     def _probe(self, b: int, n: int, cur: int, at: dict[int, int]) -> int | None:
         """A count to run once for its measurements, or None (module docstring)."""

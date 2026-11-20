@@ -1,8 +1,8 @@
 """The draft-count policy (`sched.draft_counts.DraftCounts`) on synthetic acceptance and device times, driven by the
 scheduler's rule for a count above what the rows hold (a raise: `Scheduler._schedule`): the count with the most tokens
-per device-ms, hysteresis, the deterministic probes, a probe above the count measured at that count, the climb back
-when acceptance rises, the rows each count fits in a tight budget, and the survival estimate updated only where a step
-verified."""
+per device-ms, hysteresis, the deterministic probes, a probe above the count measured at that count (past a row that
+sat out its raise too), the climb back when acceptance rises, the rows each count fits in a tight budget, and the
+survival estimate updated only where a step verified."""
 
 from __future__ import annotations
 
@@ -117,6 +117,33 @@ def test_a_probe_above_the_count_is_measured_at_that_count() -> None:
     before = p.cost[(64, K, K)][1], p.surv.copy()
     drive(p, 64, SCENE, REFRESH_EVERY, held=ran[-1][2])
     assert p.cost[(64, K, K)][1] > before[0] and (p.surv[1:] > before[1][1:]).all()
+
+
+def test_a_follow_survives_a_row_that_sat_out_the_raise() -> None:
+    """Rows near their max_tokens sit out the plan after one they ran in (`Scheduler._schedule`'s gate): one that sat
+    out a raise comes back still holding the bucket's count, so the first follow raises again; the second verifies the
+    count (`MAX_FOLLOWS`). One row in 64 sits out each plan: k is verified at every refresh, the neighbour above at its
+    probes (with one follow, neither ever is)."""
+    p = DraftCounts((1, 2, 3), K)
+    held = np.full(64, K)
+    ran = []
+    for i in range(3 * REFRESH_EVERY + 10):
+        run = np.arange(64) != i % 64
+        n = int(run.sum())
+        c = p.choose(n)
+        h = int(held[run].min())
+        v, d = (c, c) if c <= h else (h, K)
+        if c > h:
+            p.raised()
+        acc = np.zeros(n, np.int64)
+        for j in range(1, v + 1):
+            acc[: round(float(CHAT[j - 1]) * n)] = j
+        p.observe_accept(v, acc)
+        p.observe_cost(n, v, d, int(cost_ms(n, v, d) * 1e6))
+        held[run] = d
+        ran.append(v)
+    late = ran[REFRESH_EVERY:]
+    assert ran[-1] == 1 and late.count(K) >= 2 and late.count(2) >= 2, (late.count(K), late.count(2))
 
 
 def test_a_bucket_below_k_climbs_back_when_acceptance_rises() -> None:

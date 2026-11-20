@@ -547,21 +547,39 @@ def derive_refine_chunk_tokens(*, max_num_batched_tokens: int, max_num_seqs: int
         " at any k, so k never changes the precise copy" if drafter else "")
 
 
-def could_end(m: Any, drafts: list[int]) -> bool:
-    """Whether a sample row whose window starts at matcher `m`'s state and verifies `drafts` (MTP; [] without) could
-    deliver the grammar's EOS (architecture.md, "Structured output"): the grammar allows nothing else now, or it does
-    after some of the drafts. The target accepts a draft only if it is its own masked sample, so only drafts the grammar
-    allows can lead there: llguidance's `try_consume_tokens` consumes those and stops at the first it rejects (never
-    entering its error state), and they are rolled back."""
+NEVER_ENDS = 1 << 30  # `end_drafts`: no prefix of the drafts ends the grammar
+
+
+def end_drafts(m: Any, drafts: list[int]) -> int:
+    """How many of `drafts` a sample row whose window starts at matcher `m`'s state must verify before it could deliver
+    the grammar's EOS (architecture.md, "Structured output"): 0 when the grammar allows nothing else now, j when it
+    does after the first j drafts, NEVER_ENDS when no prefix of them gets there. The target accepts a draft only if it
+    is its own masked sample, so only drafts the grammar allows can lead there: llguidance's `try_consume_tokens`
+    consumes those and stops at the first it rejects (never entering its error state; it may take an EOS after the
+    stop), and they are rolled back."""
     if m.is_stopped():
-        return True
+        return 0
     if not drafts:
-        return False
+        return NEVER_ENDS
     n = m.try_consume_tokens(drafts)
-    end = bool(m.is_stopped())
+    end = NEVER_ENDS
+    if n and m.is_stopped():  # the first prefix that stopped it: n, or fewer when it took tokens past its stop
+        end = n
+        while end > 1:
+            m.rollback(1)
+            n -= 1
+            if not m.is_stopped():
+                break
+            end -= 1
     if n:
         m.rollback(n)
     return end
+
+
+def could_end(m: Any, drafts: list[int]) -> bool:
+    """Whether a sample row whose window starts at matcher `m`'s state and verifies `drafts` (MTP; [] without) could
+    deliver the grammar's EOS (`end_drafts`)."""
+    return end_drafts(m, drafts) <= len(drafts)
 
 
 def advance_matcher(m: Any, toks: list[int], eos: frozenset[int]) -> tuple[bool, bool]:
@@ -892,7 +910,8 @@ class Scheduler:
         # known; a slot's next decode row verifies at most that many (0 since its admission)
         self.held = np.zeros(s, np.int64)
         self.n_masked = 0  # slots with masked set
-        self.may_end = np.zeros(s, bool)  # the slot's next sample row could deliver its grammar's EOS (`could_end`)
+        # the drafts the slot's next sample row must verify before it could deliver its grammar's EOS (`end_drafts`)
+        self.end_at = np.full(s, NEVER_ENDS, np.int64)
         self.end_waits = 0  # decode rows skipped behind a row in flight that could end its request's grammar
         self.dropped_samples = 0  # sample rows whose request had left before their result (a stop, abort, preemption)
         self.structured_requests = 0
@@ -1324,9 +1343,11 @@ class Scheduler:
 
     def _end_wait(self, order: np.ndarray, dec: np.ndarray) -> bool:
         """Whether this plan skips its decode rows `dec` (architecture.md, "Structured output"): each has a row in
-        flight that could deliver its grammar's EOS, and the plan would carry nothing else (no waiting request, no
-        prefill chunk; the decoding requests outside `dec` wait for a length finish)."""
-        if self.num_waiting or not (self.may_end[dec] & (self.pending[dec] > 0)).all() or \
+        flight (in the last plan built) that could deliver its grammar's EOS with the drafts that plan verifies, and the
+        plan would carry nothing else (no waiting request, no prefill chunk; the decoding requests outside `dec` wait
+        for a length finish)."""
+        v = self._v(self._last_inf) if self._last_inf is not None else self.k
+        if self.num_waiting or not ((self.end_at[dec] <= v) & (self.pending[dec] > 0)).all() or \
                 not self.decoding[order].all():
             return False
         self.end_waits += len(dec)
@@ -1491,7 +1512,7 @@ class Scheduler:
             self.decoding[slot] = True
             self.pending[slot] += 1
             if self.masked[slot] and not req.ignore_eos:  # its first token: an EOS if the grammar is stopped
-                self.may_end[slot] = req.matcher.is_stopped()
+                self.end_at[slot] = 0 if req.matcher.is_stopped() else NEVER_ENDS
         return row
 
     def _decode_with_preemption(self, order: np.ndarray, dec: np.ndarray, need: np.ndarray,
@@ -1828,7 +1849,8 @@ class Scheduler:
         self.ckpt_pending[slot] = False
         self.overrun[slot] = False
         self.pending[slot] = 0
-        self.decoding[slot] = self.may_end[slot] = False  # until its final chunk (`_chunk_row`)
+        self.decoding[slot] = False  # until its final chunk (`_chunk_row`)
+        self.end_at[slot] = NEVER_ENDS
         self.ignore_eos[slot] = req.ignore_eos
         self.num_pages[slot] = len(pages)
         if self.window:
@@ -1992,7 +2014,7 @@ class Scheduler:
             b.extend_row(row, toks, None if req.rope is None else np.full((3, nf), req.rope_off, np.int32))
             self.mirror[slot] += nf
             if self.masked[slot] and not req.ignore_eos:  # its first token: an EOS if the forced tokens end its grammar
-                self.may_end[slot] = req.matcher.is_stopped()
+                self.end_at[slot] = 0 if req.matcher.is_stopped() else NEVER_ENDS
         self._tails.clear()
 
     def _grammar_failed(self, req: Req, m: Any, when: str) -> None:
@@ -2001,16 +2023,14 @@ class Scheduler:
         log.error("request %s: its grammar rejected a token %s", req.label, when)
 
     def _advance_grammars(self, s: np.ndarray, rows: np.ndarray, tok: np.ndarray, n_new: np.ndarray | None,
-                          finish: np.ndarray, inf: Inflight) -> None:
-        """Advance the matchers of masked slots over the tokens their rows delivered (`rows`: indices into `s`) by
-        step `inf`. A finishing row needs nothing; an EOS under ignore_eos terminates the grammar (`advance_matcher`;
-        unmasked after); a token the grammar rejects finishes the request with an error (`finish`, in place).
-        Otherwise, without ignore_eos, `may_end` is computed for the slot's next sample row (`could_end`;
-        `self.drafts` already holds its window's drafts: those it verifies, the plan in flight's count when that plan
-        holds its row)."""
+                          finish: np.ndarray) -> None:
+        """Advance the matchers of masked slots over the tokens their rows delivered (`rows`: indices into `s`).
+        A finishing row needs nothing; an EOS under ignore_eos terminates the grammar (`advance_matcher`; unmasked
+        after); a token the grammar rejects finishes the request with an error (`finish`, in place). Otherwise, without
+        ignore_eos, `end_at` is computed for the slot's next sample row (`end_drafts`; `self.drafts` already holds its
+        window's drafts; `_end_wait` compares it with the count that row verifies)."""
         eos = self.grammars.eos
         off = np.cumsum(n_new) - n_new if n_new is not None else None
-        nxt = self._last_inf if self._last_inf is not inf else None  # planned after `inf`, before this process
         for i in rows.tolist():
             if finish[i]:
                 continue
@@ -2027,9 +2047,7 @@ class Scheduler:
                 req.matcher = None
             elif not req.ignore_eos:
                 d = self.drafts[slot]  # the drafts this step made (−1 past them: `StepPlan.draft_n`)
-                if self.k and nxt is not None and self.mark[slot] == self._mark_id:
-                    d = d[:self._v(nxt)]  # its row in the plan in flight verifies that plan's count
-                self.may_end[slot] = could_end(req.matcher, d[d >= 0].tolist() if self.k else [])
+                self.end_at[slot] = end_drafts(req.matcher, d[d >= 0].tolist() if self.k else [])
 
     def fill_masks(self, inf: Inflight, buf: np.ndarray) -> int:
         """The masks of a plan's MASKED rows, in plan order (`plan.py`), after `process` of the step before it:
@@ -2678,7 +2696,7 @@ class Scheduler:
         if self.n_masked:
             rows = np.flatnonzero(self.masked[s])
             if len(rows):
-                self._advance_grammars(s, rows, tok, delivered, finish, inf)
+                self._advance_grammars(s, rows, tok, delivered, finish)
         # Output tokens the frontend receives with these (`Req.unrep`): before a row's, the forced prefix its
         # final chunk took (or a preemption's unreported tokens); after them, the EOS an EOS-free finish appends
         pre = post = None
@@ -3374,7 +3392,7 @@ class Scheduler:
         if self.lp[slot] >= 0:
             self.lp[slot] = -1
             self.n_lp -= 1
-        self.may_end[slot] = False
+        self.end_at[slot] = NEVER_ENDS
         if self.unrep[slot]:  # its unreported tokens stay with the request (`Req.unrep`: a preemption's readmission)
             self._clear_unrep(slot)
         if not donated:

@@ -20,7 +20,7 @@ from llm_mini_infer.engine.messages import FinishReason
 from llm_mini_infer.grammar import GrammarError
 from llm_mini_infer.grammar.spec import GrammarSpecs, check, json_schema_grammar
 from llm_mini_infer.runner.fake import masked_pick, unpack_mask
-from llm_mini_infer.sched.scheduler import could_end
+from llm_mini_infer.sched.scheduler import NEVER_ENDS, could_end, end_drafts
 
 from ..support.fake_grammar import FakeGrammar, spec
 from ..support.fixtures import QWEN
@@ -114,7 +114,8 @@ def test_llguidance_masks_along_an_output_and_its_drafts(llg) -> None:
 
 
 def test_could_end_walks_the_drafts_with_llguidance(llg) -> None:
-    """A row could deliver the EOS when the document is complete before it, or after drafts the grammar allows; the
+    """A row could deliver the EOS when the document is complete before it, or after drafts the grammar allows; how
+    many drafts it must verify for that (`end_drafts`: an EOS llguidance takes past the stop not among them); the
     walk leaves the matcher as it was."""
     from tokenizers import Tokenizer
 
@@ -125,9 +126,12 @@ def test_could_end_walks_the_drafts_with_llguidance(llg) -> None:
     assert m.consume_tokens(ids[:-2])
     assert not could_end(m, [])  # no drafts (no MTP): only a complete document ends the next sample
     assert could_end(m, ids[-2:]) and could_end(m, [*ids[-2:], 248046])
-    assert not could_end(m, ids[-2:-1])  # one token short of the end
+    assert end_drafts(m, ids[-2:]) == end_drafts(m, [*ids[-2:], 248046]) == 2
+    assert end_drafts(m, [*ids[-2:], 248046, 11]) == 2
+    assert not could_end(m, ids[-2:-1]) and end_drafts(m, ids[-2:-1]) == NEVER_ENDS  # one token short of the end
     assert not could_end(m, [12345, *ids[-2:]])  # a draft the grammar rejects stops the walk
     assert m.consume_tokens(ids[-2:]) and m.is_stopped() and could_end(m, [])  # the walks changed nothing
+    assert end_drafts(m, [7]) == 0
 
 
 def test_a_grammar_the_engine_cannot_compile_raises(llg) -> None:
