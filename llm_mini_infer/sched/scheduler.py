@@ -103,6 +103,7 @@ from ..engine.messages import (
 )
 from ..grammar import GrammarError
 from ..logutil import traceback_without_messages
+from .draft_counts import DraftCounts
 from .plan import (
     ADMIT_CONSTRAINED,
     ADMIT_LOGPROBS,
@@ -399,6 +400,11 @@ class Inflight:
     wcls: np.ndarray | None = None
     wdraft: np.ndarray | None = None
     n_encode: int = 0  # images the plan encodes (ENCODE sections; llm_mini_infer:step_encoder_images)
+    # MTP: the drafts the plan's device rows verify and those its SAMPLE rows make (`sched.plan`; −1: k), and whether
+    # every row of it is a decode row without logprobs (the step's time is the decode part's: `DraftCounts`)
+    v: int = -1
+    d: int = -1
+    decode_only: bool = False
 
 
 @dataclass
@@ -660,7 +666,8 @@ class Scheduler:
                  refine_min: int = REFINE_MIN,
                  precise_cost: float = 1.0, refine_chunk_tokens: int = 0, mtp_k_max: int = 0,
                  forced_prefix: bool = False, eos_free_finish: bool = False, batch_invariant: bool = False,
-                 logprobs: bool = False, penalties_vocab: int = 0, compile_timeout_s: float = COMPILE_TIMEOUT_S):
+                 logprobs: bool = False, penalties_vocab: int = 0, compile_timeout_s: float = COMPILE_TIMEOUT_S,
+                 draft_counts: tuple[int, ...] = (), count_schedule: tuple[int, ...] = ()):
         self.max_num_seqs = max_num_seqs
         self.max_tokens = max_num_batched_tokens
         self.max_model_len = max_model_len
@@ -669,7 +676,15 @@ class Scheduler:
         self.chunk_cap = long_prefill_token_threshold
         self.row_tokens = mixed_step_row_tokens  # decode rows x prefill tokens of a step (0: off)
         self.k = mtp_k
-        self.reserve = reserve_positions(steps_in_flight, mtp_k)
+        self.reserve = reserve_positions(steps_in_flight, mtp_k)  # at k, whatever count a step runs (the largest)
+        # The draft count per step (`speculative.adaptive`, `sched.draft_counts`): the counts below k a plan may verify
+        # and draft (`Capabilities.draft_counts`; empty: k on every step), or a schedule of counts cycled per plan with
+        # decode rows (`dev.speculative.count_schedule`: tests)
+        self.count_policy = DraftCounts(draft_counts, mtp_k) if mtp_k and draft_counts else None
+        self.count_schedule = tuple(int(c) for c in count_schedule) if mtp_k else ()
+        if any(not 1 <= c <= mtp_k for c in self.count_schedule):
+            raise ValueError(f"count_schedule {list(count_schedule)}: counts between 1 and k ({mtp_k})")
+        self._schedule_i = 0
         # The MTP drafter writes KV of its own (Qwen's MTP layer: `Capabilities.draft_kv`): a hit on a page boundary
         # copies the page of hit − 1, an image chunk's next token needs its embedding (the drafter's input there), and
         # a final chunk's pages cover the positions its drafter's chain writes past its row (`chain`: `_chunk_pages`)
@@ -840,6 +855,7 @@ class Scheduler:
         self.spec_draft_tokens = 0
         self.spec_accepted = 0
         self.spec_accepted_per_pos = np.zeros(max(1, mtp_k), np.int64)
+        self.spec_offered_per_pos = np.zeros(max(1, mtp_k), np.int64)  # verify rows that verified each position
         self.num_overruns = 0  # MTP rows whose device commit ran past a finish the runner did not know (KV-only finish)
         # ... their tokens past that finish, in spec_accepted but never delivered; and the tokens readmissions' final
         # prefill chunks sampled (a request's next token after a preemption, from no verify row). Σ over requests of
@@ -869,6 +885,9 @@ class Scheduler:
         self.grammars = grammars
         self.masked = np.zeros(s, bool)
         self.drafts = np.zeros((s, max(1, mtp_k)), np.int32)
+        # ... and how many it made (`StepPlan.draft_n`): set when that row is planned, which is when its count is
+        # known; a slot's next decode row verifies at most that many (0 since its admission)
+        self.held = np.zeros(s, np.int64)
         self.n_masked = 0  # slots with masked set
         self.may_end = np.zeros(s, bool)  # the slot's next sample row could deliver its grammar's EOS (`could_end`)
         self.end_waits = 0  # decode rows skipped behind a row in flight that could end its request's grammar
@@ -1187,13 +1206,17 @@ class Scheduler:
         decode_ckpts: list[tuple[int, int, int]] = []
         order = self._running_order()
         width = 1 + self.k  # tokens of a decode row
+        v = d = c = self.k  # the drafts the plan's decode rows verify, those its SAMPLE rows make, the count chosen
         if len(order):
             dec = order[self.decoding[order]]
             if len(dec):
-                # in-flight samples deliver at most 1 token each, decode rows (device input) 1 + k
+                # in-flight samples deliver at most 1 token each, decode rows (device input) 1 + k (at most)
                 dec = dec[self.n_out[dec] + self.pending[dec] + self.k * self.dev_inflight[dec] < self.max_out[dec]]
                 if self.n_masked and len(dec) and self._end_wait(order, dec):
                     dec = dec[:0]
+                if len(dec) and (self.count_policy is not None or self.count_schedule):
+                    c = self._choose_count(len(dec))
+                    width = 1 + c
                 if len(dec) * width > budget.soft:
                     dec = dec[:budget.soft // width]
             if len(dec):
@@ -1213,12 +1236,17 @@ class Scheduler:
                 elif short.size:
                     self._grow_rows(dec[short], need[short], None if needw is None else needw[short])
                 if len(dec):
+                    if self.count_policy is not None or self.count_schedule:
+                        # one count for all its rows, at most what each holds; a count above that verifies what
+                        # they hold and drafts k, which every later count can verify (a raise)
+                        held = int(self.held[dec].min())
+                        v, d = (c, c) if c <= held else (held, self.k)
                     row0 = b.n_sched
                     b.add_device_rows(dec, self.masked[dec] if self.n_masked else None,
-                                      self.lp[dec] >= 0 if self.n_lp else None)
+                                      self.lp[dec] >= 0 if self.n_lp else None, v)
                     self.pending[dec] += 1
                     self.mark[dec] = self._mark_id
-                    budget.decode_rows(len(dec), width, self.row_tokens, self.grid)
+                    budget.decode_rows(len(dec), 1 + v, self.row_tokens, self.grid)
                     if self.ckpt_interval and self.cache is not None:
                         self._decode_checkpoints(dec, row0, decode_ckpts)
                     self.dev_inflight[dec] += 1
@@ -1246,14 +1274,22 @@ class Scheduler:
         self.pending_wclear.clear()
         if self._plan_precise:
             self.precise_steps += 1
+        if b.n_sched > b.n_device:
+            d = self.k  # explicit rows: a step on the runners' token-bucket graphs, which draft k (`sched.plan`)
+        if self.k:
+            b.draft_n = d if d < self.k else 0
         self.step_id += 1
         plan = b.finish(self.step_id)
         slots = plan.sched_slot.astype(np.int64)
         self.last_step[slots] = self.step_id
         flags = plan.sched_flags
-        inf = Inflight(step_id=self.step_id, slots=slots, aids=self.aid[slots], sample=(flags & SAMPLE) != 0,
+        sample = (flags & SAMPLE) != 0
+        if self.k:
+            self.held[slots[sample]] = d
+        inf = Inflight(step_id=self.step_id, slots=slots, aids=self.aid[slots], sample=sample,
                        device=plan.sched_tok_off < 0, n_tokens=plan.n_query_tokens, admitted=admitted,
-                       decode_ckpts=decode_ckpts, n_encode=self.encoder_images - enc0)
+                       decode_ckpts=decode_ckpts, n_encode=self.encoder_images - enc0, v=v, d=d,
+                       decode_only=b.n_sched == b.n_device and not (flags & LOGPROBS).any())
         if self.n_masked:
             masked = np.flatnonzero(flags & MASKED)
             if len(masked):
@@ -1263,6 +1299,14 @@ class Scheduler:
         self.prompt_tokens += b.n_tokens
         self._last_inf = inf  # the EOS-free finish's gate reads the step in flight (`_eos_free`)
         return plan, inf
+
+    def _choose_count(self, rows: int) -> int:
+        """The draft count of a plan with `rows` decode rows: the dev schedule's next, else the policy's."""
+        if self.count_schedule:
+            c = self.count_schedule[self._schedule_i % len(self.count_schedule)]
+            self._schedule_i += 1
+            return c
+        return self.count_policy.choose(rows)
 
     def _end_wait(self, order: np.ndarray, dec: np.ndarray) -> bool:
         """Whether this plan skips its decode rows `dec` (architecture.md, "Structured output"): each has a row in
@@ -1782,6 +1826,7 @@ class Scheduler:
         self.has_first[slot] = req.first_done
         self.runner_ns[slot] = req.runner_ns
         self.verify_rows[slot], self.verify_tokens[slot] = req.verify_rows, req.verify_tokens
+        self.held[slot] = 0  # the slot's drafts are another admission's: its final chunk's SAMPLE row drafts anew
         if req.n_out:  # readmission after preemption: refill the ring's partial row
             gen = req.out_chunks[0]  # _preempt left exactly the n_out generated tokens here
             full_rows = req.n_out - req.n_out % _OUT_W
@@ -1965,7 +2010,8 @@ class Scheduler:
                 self._unmask(slot)
                 req.matcher = None
             elif not req.ignore_eos:
-                self.may_end[slot] = could_end(req.matcher, self.drafts[slot].tolist() if self.k else [])
+                self.may_end[slot] = could_end(req.matcher, self.drafts[slot, :self.held[slot]].tolist()
+                                               if self.k else [])
 
     def fill_masks(self, inf: Inflight, buf: np.ndarray) -> int:
         """The masks of a plan's MASKED rows, in plan order (`plan.py`), after `process` of the step before it:
@@ -1988,7 +2034,7 @@ class Scheduler:
         grammar has stopped): `vllm:spec_decode_num_draft_tokens` counts the drafts the grammar takes (and under
         ignore_eos the accepted ones past a drafted EOS: `_count_verify`), so these are not counted as drafted, here
         or in `process`."""
-        k, g = self.k, self.grammars
+        k, g = self._v(inf) if self.k else 0, self.grammars  # the drafts the plan's device rows verify
         eos = g.eos
         only = eos_only(buf.shape[1], min(eos)) if eos else -1  # a grammar with no EOS ids: all ones
         singles: list[tuple[Any, int]] = []
@@ -2011,7 +2057,7 @@ class Scheduler:
                 singles.append((req.matcher, off))
             else:
                 windows.append((r, off, slot))
-                m, d = req.matcher, self.drafts[slot].tolist()
+                m, d = req.matcher, self.drafts[slot, :k].tolist()
                 v = 0 if m.is_stopped() else m.validate_tokens(d)
                 invalid[r] = k - v
                 e = k if eos.isdisjoint(d) else next(j for j, t in enumerate(d) if t in eos)
@@ -2039,7 +2085,7 @@ class Scheduler:
         verify rows `windows` (plan row, offset in `buf`, slot), and the drafts each row verifies, for `process` to
         class its first rejected draft and count the masks verification read. One pass over the rows' masks, behind
         the forward."""
-        k, n, g = self.k, len(inf.slots), self.grammars
+        k, n, g = self._v(inf), len(inf.slots), self.grammars
         rows = np.asarray([w[0] for w in windows], np.int64)
         idx = (np.asarray([w[1] for w in windows], np.int64)[:, None] + np.arange(1 + k)).ravel()
         block = buf[idx].view(np.uint32)
@@ -2054,7 +2100,7 @@ class Scheduler:
         inf.wcls = np.zeros((n, 1 + k), np.int8)
         inf.wcls[rows] = cls.reshape(-1, 1 + k)
         inf.wdraft = np.full((n, k), -1, np.int32)
-        inf.wdraft[rows] = self.drafts[np.asarray([w[2] for w in windows], np.int64)]
+        inf.wdraft[rows] = self.drafts[np.asarray([w[2] for w in windows], np.int64), :k]
 
     # -- images -----------------------------------------------------------------------------------------------
 
@@ -2519,6 +2565,8 @@ class Scheduler:
         slots = inf.slots
         valid = self.aid[slots] == inf.aids
         self._done_step = inf.step_id
+        if self.count_policy is not None and inf.decode_only and len(slots) and not inf.n_encode:
+            self.count_policy.observe_cost(len(slots), self._v(inf), self._d(inf), gpu_busy_ns)
         if self._orphans:  # unverified writes nothing will verify (`_admit_one`); the plans that read them are built
             for nss, ns, key, aids, ckpts, lo, pages, spans in self._orphans:
                 self._remove_unverified(nss, ns, key, aids, ckpts, lo, spans)
@@ -2648,15 +2696,26 @@ class Scheduler:
         `n_out` tokens each: the rows of running requests (`process`) and those held for preempted ones
         (`_deliver_held`)."""
         acc = n_out.astype(np.int64) - 1
+        v = self._v(inf)
         self.spec_drafts += len(rows)
         # the drafts counted are those the grammar takes (`fill_masks`); under ignore_eos those after a drafted EOS are
         # verified unconstrained, so a row counts at least the drafts it accepted
-        self.spec_draft_tokens += len(rows) * self.k if inf.invalid is None else \
-            int(np.maximum(self.k - inf.invalid[rows], acc).sum())
+        self.spec_draft_tokens += len(rows) * v if inf.invalid is None else \
+            int(np.maximum(v - inf.invalid[rows], acc).sum())
         self.spec_accepted += int(acc.sum())
-        self.spec_accepted_per_pos += (acc[:, None] > np.arange(self.k)[None, :]).sum(axis=0)
+        self.spec_accepted_per_pos[:v] += (acc[:, None] > np.arange(v)[None, :]).sum(axis=0)
+        self.spec_offered_per_pos[:v] += len(rows)
+        if self.count_policy is not None:
+            self.count_policy.observe_accept(v, acc)
         if inf.wpop is not None:
             self._rejections(inf, rows, acc, tokens)
+
+    def _v(self, inf: Inflight) -> int:
+        """The drafts the plan's device rows verified (`Inflight.v`; −1: k)."""
+        return self.k if inf.v < 0 else inf.v
+
+    def _d(self, inf: Inflight) -> int:
+        return self.k if inf.d < 0 else inf.d
 
     def _eos_free(self, inf: Inflight, s: np.ndarray, finish: np.ndarray) -> list[int]:
         """The EOS-free finish (architecture.md, "Grammar-aware heads"): the rows (indices into `s`) whose request's
@@ -2753,7 +2812,7 @@ class Scheduler:
         after each accepted draft), and the class of the mask the first rejected draft's position was sampled under. A
         draft equal to its target sample, refused only because that sample ends the request (a stop token, or
         max_tokens: the commit limits), is no rejection."""
-        k = self.k
+        k = self._v(inf)
         pop = inf.wpop[rows]
         has = pop[:, 0] >= 0
         if not has.any():

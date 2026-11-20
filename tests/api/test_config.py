@@ -682,8 +682,8 @@ def test_state_fields_are_refused_at_load(tmp_path, monkeypatch, capsys, caplog)
     from llm_mini_infer import cli, entrypoint
 
     assert config.STATE_FIELDS == ("model_source", "speculative_source", "eos_token_ids", "grammar_eos_token_ids",
-                                   "sampling_penalties", "mtp_k_max", "vocab_size", "cpu_budget", "image_tokens_max",
-                                   "pixel_arena", "pool_dir", "runner_info", "reasons")
+                                   "sampling_penalties", "mtp_k_max", "draft_counts", "vocab_size", "cpu_budget",
+                                   "image_tokens_max", "pixel_arena", "pool_dir", "runner_info", "reasons")
     groups = {f.name for f in msgspec.structs.fields(config.Config)} - set(config.STATE_FIELDS)
     assert groups == {"model", "sampling", "scheduler", "cache", "speculative", "images", "structured_output",
                       "tool_calls", "reasoning", "runner", "server", "engine", "observability", "dev"}
@@ -727,7 +727,7 @@ def test_the_settings_split(tmp_path, monkeypatch, capsys, caplog) -> None:
     from llm_mini_infer import cli, entrypoint
 
     dev = [k.removeprefix("dev.") for k in config.leaves(config.Config) if k.startswith("dev.")]
-    assert len(config.SETTINGS) == 60 < 61 and len(dev) == 61 and not set(dev) & set(config.SETTINGS)
+    assert len(config.SETTINGS) == 60 < 61 and len(dev) == 64 and not set(dev) & set(config.SETTINGS)
     for name, value in (("runner.cuda.fused_ops", False), ("cache.num_pages", 10), ("runner.fake.step_ms", 1.0),
                         ("scheduler.mixed_step_row_tokens", 100)):
         got = config.load(None, {f"dev.{name}": value}).dev

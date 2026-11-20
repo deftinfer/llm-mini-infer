@@ -301,6 +301,14 @@ class DevSpeculativeConfig(_Group):
     # window's last W positions, stays (`runner.cuda.gemma`). It changes acceptance and, where outputs depend on the
     # batch, their rounding
     draft_query_next: bool = False
+    # Each verify step's draft count chosen from the load and the measured acceptance (architecture.md, "Speculative
+    # decoding"): of k and `adaptive_counts`, the one with the most tokens per device-ms (`sched.draft_counts`);
+    # outputs unchanged. Gemma 4's assistant only (the Qwen runner verifies k on every step)
+    adaptive: bool = False
+    # Its counts below k, each 1 to k - 1 (the runner captures a graph set for each). Default: 1, 2 and 3 below k
+    adaptive_counts: list[int] | None = None
+    # Tests: a schedule of counts (each 1 to k) cycled over the plans with decode rows, instead of the policy
+    count_schedule: list[int] | None = None
 
 
 class DevImageConfig(_Group):
@@ -446,6 +454,9 @@ class Config(msgspec.Struct, forbid_unknown_fields=True, kw_only=True):
     # The k the derived refine piece leaves room for (dev.cache.refine_chunk_tokens): with an assistant its largest,
     # whatever k is set, so k never changes the precise copy; else the set k (0: no drafter)
     mtp_k_max: int = 0
+    # The draft counts below k a verify step may run (`_derive_draft_counts`): the runner captures them, the scheduler
+    # chooses among them and k (dev.speculative.adaptive) or cycles them (count_schedule); empty: k on every step
+    draft_counts: list[int] = []
     vocab_size: int = 0
     cpu_budget: float = 0.0
     image_tokens_max: int = 0  # the most placeholder tokens one image takes (0: no images)
@@ -637,6 +648,7 @@ def derive(cfg: Config) -> Config:
     else:
         why = "the set k: the checkpoint's MTP layer (Qwen) derives its refine piece from the set k"
     reasons["mtp_k_max"] = f"{cfg.mtp_k_max}: {why}"
+    _derive_draft_counts(cfg, assistant, reasons)
     # Below either, the scheduler never plans a step: the server starts and hangs (our decode rows are 1 + k wide)
     if sc.max_num_seqs < 1:
         raise ValueError(f"scheduler.max_num_seqs {sc.max_num_seqs}: at least 1")
@@ -908,6 +920,34 @@ def _derive_structured(cfg: Config, model_dir: Path, reasons: dict[str, str]) ->
 
 SPARSE_HEAD_ROWS = 1024  # the grammar-aware heads' rows (architecture.md, "Grammar-aware heads")
 GEMMA4_TYPES = ("gemma4", "gemma4_text")  # models.gemma4.model.MODEL_TYPES (this module imports no torch)
+
+
+def _derive_draft_counts(cfg: Config, assistant: bool, reasons: dict[str, str]) -> None:
+    """The draft counts a verify step may run below k (`dev.speculative.adaptive`, `count_schedule`; `cfg.draft_counts`:
+    what the runner captures and the scheduler chooses from)."""
+    dsp, k = cfg.dev.speculative, cfg.speculative.num_speculative_tokens
+    sched = [int(c) for c in dsp.count_schedule or []]
+    if sched and not k:
+        raise ValueError("dev.speculative.count_schedule: needs drafts (speculative.num_speculative_tokens > 0)")
+    if any(not 1 <= c <= k for c in sched):
+        raise ValueError(f"dev.speculative.count_schedule: counts from 1 to k ({k}), got {sched}")
+    if dsp.adaptive:
+        if not k:
+            raise ValueError("dev.speculative.adaptive: needs drafts (speculative.num_speculative_tokens > 0)")
+        if not assistant and cfg.runner.kind == "cuda":
+            raise ValueError("dev.speculative.adaptive: Gemma 4's assistant only (speculative.model); the Qwen runner "
+                             "verifies k on every step")
+        if dsp.adaptive_counts is None:
+            dsp.adaptive_counts = [c for c in (1, 2, 3) if c < k]
+            reasons["dev.speculative.adaptive_counts"] = (
+                f"{dsp.adaptive_counts}: 1, 2 and 3 below k ({k}), with k the counts each step chooses from")
+    elif dsp.adaptive_counts is None:
+        dsp.adaptive_counts = []
+        reasons["dev.speculative.adaptive_counts"] = "none: dev.speculative.adaptive is off (k on every step)"
+    counts = [int(c) for c in dsp.adaptive_counts]
+    if any(not 1 <= c < k for c in counts) or len(set(counts)) != len(counts):
+        raise ValueError(f"dev.speculative.adaptive_counts: distinct counts from 1 to k - 1 ({k - 1}), got {counts}")
+    cfg.draft_counts = sorted(set(counts) | {c for c in sched if c < k}) if dsp.adaptive or sched else []
 
 
 def _derive_heads(cfg: Config, hf: dict[str, Any], assistant: bool, reasons: dict[str, str]) -> None:

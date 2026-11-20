@@ -24,12 +24,14 @@ Contract (architecture.md, "The step plan"; the plan's sections, effects and lif
 - **Device input.** A SCHED row with `tok_off == -1` reads its input from the slot's pending token and its position
   from the device `seq_len`. The host never supplies that input, so the step launches before the previous step's
   tokens reach the host.
-- **MTP** (`mtp_depth` k > 0). A device-input row verifies `1 + k` tokens: the pending token and the k drafts the runner
-  drafted for the slot in its previous SAMPLE step. It returns `n_out = 1 + accepted` tokens (the accepted drafts, then
-  the bonus token, which becomes pending) and advances `seq_len` by as much. Drafts are accepted while they equal the
-  target's samples (the sampler's noise of their position), so the tokens are exactly the target's sampled sequence;
-  acceptance also stops at the slot's commit limits (ADMIT). Every SAMPLE row drafts k tokens for the next step and
-  returns them (`StepResult.drafts`): the engine computes the next step's masks along them. While device-input rows of
+- **MTP** (`mtp_depth` k > 0). A device-input row verifies `1 + v` tokens: the pending token and the first v of the
+  drafts the runner drafted for the slot in its previous SAMPLE step (v = k, or one of `draft_counts`: the plan's
+  `sched_n_draft`, the same on every device row of a plan; never more than that step drafted). It returns `n_out = 1 +
+  accepted` tokens (the accepted drafts, then the bonus token, which becomes pending) and advances `seq_len` by as
+  much. Drafts are accepted while they equal the target's samples (the sampler's noise of their position), so the
+  tokens are exactly the target's sampled sequence; acceptance also stops at the slot's commit limits (ADMIT). Every
+  SAMPLE row drafts k tokens for the next step, or the plan's `draft_n` (one of `draft_counts`), and returns them
+  (`StepResult.drafts`, −1 past them): the engine computes the next step's masks along them. While device-input rows of
   a slot are in flight, the host knows its `seq_len` only as a range: each advances it by 1 to 1 + k.
 - **Results** are per SCHED row, in plan order (`StepResult`). `wait` must not block on anything but the device
   work of that step.
@@ -40,7 +42,7 @@ Contract (architecture.md, "The step plan"; the plan's sections, effects and lif
 - **Grammar masks** (`grammar_masks`). A MASKED row's masks depend on the tokens the slot's previous step delivered (and
   on its drafts), which the engine learns only from `wait` of that step, after `launch_forward` of this one. So the
   engine fills them between the two calls, into `mask_buffer(handle)` (int32 bit words: token t is allowed when bit t %
-  32 of word t // 32 is set; one row per mask, in plan order: 1 + k per MTP device-input row, 1 per other row), and
+  32 of word t // 32 is set; one row per mask, in plan order: 1 + v per MTP device-input row, 1 per other row), and
   passes their count to `launch_sample`, which may run none of the step's sampling before. A step without MASKED rows
   needs no masks (count 0). A mask is applied to the target's logits before the sampler's noise, so verification
   compares the drafts with masked samples. A used sample whose mask allows nothing reports `MASK_EMPTY`.
@@ -94,6 +96,8 @@ class Capabilities(msgspec.Struct, frozen=True, kw_only=True):
     # Features
     max_steps_in_flight: int = 2  # D in `sched.plan.reserve_positions`
     mtp_depth: int = 0  # k; 0 = no MTP
+    # MTP: the counts below k a plan may verify and draft (`sched.plan`: `sched_n_draft`, `draft_n`); empty: k alone
+    draft_counts: tuple[int, ...] = ()
     # The MTP drafter writes KV of its own at the target's positions (Qwen's MTP layer; `sched.plan`'s module docstring,
     # "MTP drafting"). False: it reads the target's KV and writes none (Gemma 4's assistant, cross-model KV sharing)
     draft_kv: bool = True
@@ -168,7 +172,8 @@ class StepResult(msgspec.Struct, kw_only=True):
     tokens: np.ndarray  # int32 [n_sched, 1 + k]; -1 padding; row i holds n_out[i] tokens (a finish token last)
     n_out: np.ndarray  # int32 [n_sched]: 0 without SAMPLE, 1 with, 1 + accepted drafts on MTP decode rows
     status: np.ndarray | None = None  # uint32 [n_sched]: bit 0 NONFINITE (contract), bit 1 MASK_EMPTY; None = all ok
-    drafts: np.ndarray | None = None  # int32 [n_sched, k] (MTP): each SAMPLE row's drafts for its slot's next step
+    drafts: np.ndarray | None = None  # int32 [n_sched, k] (MTP): each SAMPLE row's drafts for its slot's next step (−1
+    # past the plan's `draft_n`)
     gpu_busy_ns: int = 0  # device time of this step's forward + sampling
     gpu_idle_before_ns: int = 0  # device idle right before this step's forward (nothing was queued)
     gpu_idle_inside_ns: int = 0  # device idle between this step's forward and sampling (sampling launched late)
