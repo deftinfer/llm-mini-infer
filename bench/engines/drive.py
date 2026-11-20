@@ -13,9 +13,11 @@ the engine comparison's arms (bench/engines/arms.py), one engine after another, 
 invariance), `D` (cold and warm start, then the structured-output validity run, and the grammar cost for
 llm-mini-infer), `B` (vLLM's own draft counts), `I` (each engine in both modes, c=64 scene and chat on fresh servers:
 the cost of batch invariance), `K` (llm-mini-infer's own draft counts: A1's loads, then `mixed-c64`, 32 chat and 32
-scene clients at once against one server, each part its own report), `M` (qwen only: multi-turn sessions), `Q` (the
-head arm of each engine in its vendor image), `control` (the GPU control, bench/engines/gpu_control.py). `--load`
-keeps only the named loads of each unit (repeats of a load go to another `--out`).
+scene clients at once against one server, each part its own report; the parts start together, but each measures its
+own window after its own warm-up, so the windows differ by the clients' start-up skew), `M` (qwen only:
+multi-turn sessions), `Q` (the head arm of each engine in its vendor image), `control` (the GPU control,
+bench/engines/gpu_control.py). `--load` keeps only the named loads of each unit (repeats of a load go to another
+`--out`); a unit with none of them is left out (not started, not marked done).
 
 **Layout** under `--out`: `<model>/<family>/<unit>/` holds `server.log` (private), `startup.json`, `smoke.json`, one
 `<load>.json` per load, the `/metrics` pages around it, `gpu.csv`, `manifest.json` and, last, `done`. A unit whose
@@ -368,11 +370,10 @@ def run_children(argvs: list[list[str]], env: dict[str, str], cwd: Path, log_pat
                     proc.wait()
                     out.append((-9, True))
             return out
-        except BaseException:
+        except BaseException:  # every group, an exited leader's too (what it started may still run)
             for proc in procs:
-                if proc.poll() is None:
-                    with contextlib.suppress(OSError):
-                        os.killpg(proc.pid, signal.SIGKILL)
+                with contextlib.suppress(OSError):
+                    os.killpg(proc.pid, signal.SIGKILL)
             raise
 
 
@@ -1153,6 +1154,8 @@ def main(argv: list[str] | None = None) -> int:
     ap = parser()
     args = ap.parse_args(argv)
     if args.family == "control":
+        if args.load:
+            ap.error("--load: the control family has no loads")
         return run_control(args)
     if not args.model:
         ap.error("--model is required")
@@ -1179,14 +1182,13 @@ def main(argv: list[str] | None = None) -> int:
               bins, meta_extra)
     units = build_units(args)
     if args.load:
-        known: set[str] = set()
-        for u in units:
-            with contextlib.suppress(LookupError):  # A2 without its A1 report: its one load is find-rate
-                known |= {s.name for s in family_loads(ctx, u)}
-            if u.family == "A2":
-                known.add("find-rate")
+        names = {u.name: {"find-rate"} if u.family == "A2" else {s.name for s in family_loads(ctx, u)} for u in units}
+        known = set().union(*names.values())
         if missing := [n for n in args.load if n not in known]:
-            ap.error(f"--load {', '.join(missing)}: not a load of this family (have {', '.join(sorted(known))})")
+            ap.error(f"--load {', '.join(missing)}: not a load of this family (have "
+                     f"{', '.join(sorted(known)) or 'no loads'})")
+        # a unit with none of them would run no load and be marked done: left out (family C's second pass)
+        units = [u for u in units if names[u.name] & set(args.load)]
     if args.dry_run:
         dry_run(ctx, units)
         return 0

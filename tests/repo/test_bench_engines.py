@@ -10,6 +10,7 @@ import platform
 import socket
 import stat
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -559,8 +560,21 @@ def test_load_keeps_only_the_named_loads_and_refuses_an_unknown_one(rig, capsys)
     loads = [ln.strip().split(":")[0] for ln in capsys.readouterr().out.splitlines() if ln.startswith("  load ")]
     assert loads == ["load chat-c64", "load mixed-c64-chat", "load mixed-c64-scene"]
     with pytest.raises(SystemExit):
+        drive.main([*base, "--load", "chat-c64", "--load", "chat-c99"])  # every name must be known
+    assert "--load chat-c99: not a load of this family" in capsys.readouterr().err
+    with pytest.raises(SystemExit):
         drive.main([*base, "--load", "chat-c99"])
     assert "--load chat-c99: not a load of this family" in capsys.readouterr().err
+    with pytest.raises(SystemExit):
+        drive.main(["--out", str(rig.out), "--model", "qwen", "--family", "smoke", "--dry-run", "--load", "x"])
+    assert "(have no loads)" in capsys.readouterr().err
+    gemma = ["--out", str(rig.out), "--model", "gemma", "--family", "C", "--dry-run", "--load", "scene-c64"]
+    assert drive.main(gemma) == 0  # a second pass has only `stability`: left out, not refused
+    out = capsys.readouterr().out
+    assert "-p2:" not in out and "C ours-nobi-p1:" in out and "load stability" not in out
+    with pytest.raises(SystemExit):
+        drive.main(["--out", str(rig.out), "--family", "control", "--label", "start", "--load", "x"])
+    assert "the control family has no loads" in capsys.readouterr().err
 
 
 def test_a_load_of_parts_runs_one_client_per_part_each_with_its_report(rig, monkeypatch):
@@ -597,6 +611,43 @@ def test_arms_config_cache_roots_and_the_family_i_variants(monkeypatch):
     assert cmd[cmd.index("--max-running-requests") + 1] == "48"
     assert cmd[cmd.index("--max-mamba-cache-size") + 1] == "240"
     assert any("--max-running-requests 48" in d for d in sg.deviations)
+
+
+def test_run_children_share_one_deadline_and_kill_only_what_outlives_it(tmp_path):
+    quick = [sys.executable, "-c", "raise SystemExit(3)"]
+    slow = [sys.executable, "-c", "import time; time.sleep(120)"]
+    t0 = time.monotonic()
+    out = drive.run_children([slow, quick, slow], dict(os.environ), tmp_path, tmp_path / "log", 8)
+    assert out == [(-9, True), (3, False), (-9, True)]
+    assert time.monotonic() - t0 < 14  # one deadline for all: a limit per child would take 16 s
+
+
+def test_an_interrupted_start_kills_every_group_already_running(tmp_path, monkeypatch):
+    pidfile = tmp_path / "pid"
+    first = ["/bin/sh", "-c", f"sleep 120 & echo $! > {pidfile}"]  # returns at once; the sleep stays in its group
+    real, procs = drive.subprocess.Popen, []
+
+    def popen(*a, **kw):
+        if procs:  # the second start: once the first has exited, leaving its sleep
+            procs[0].wait(timeout=10)
+            raise KeyboardInterrupt
+        procs.append(real(*a, **kw))
+        return procs[0]
+
+    monkeypatch.setattr(drive.subprocess, "Popen", popen)
+    with pytest.raises(KeyboardInterrupt):
+        drive.run_children([first, ["true"]], dict(os.environ), tmp_path, tmp_path / "log", 60)
+    pid = int(pidfile.read_text().strip())
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        os.kill(pid, 9)
+        pytest.fail("the exited leader's sleep outlived the interrupt")
 
 
 def fake_children(monkeypatch, code=0, report: str | None = "{}", timed_out=False, only="run.py"):
