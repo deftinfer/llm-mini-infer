@@ -16,22 +16,56 @@ def serve_args(s: argparse.ArgumentParser) -> argparse.ArgumentParser:
                    "repo id")
     s.add_argument("--runner", choices=["fake", "cuda"],
                    help="cuda (the default) or fake (random tokens: tests and benchmarks)")
-    s.add_argument("--config", help="YAML configuration file")
-    s.add_argument("--host")
-    s.add_argument("--port", type=int)
-    s.add_argument("--frontends", type=int, help="frontend processes (default 1)")
-    s.add_argument("--served-model-name")
-    s.add_argument("--max-model-len", type=int)
-    s.add_argument("--max-num-seqs", type=int)
-    s.add_argument("--max-num-batched-tokens", type=int)
-    s.add_argument("--max-num-queued-reqs", type=int, help="503 past this many requests in flight (default: no limit)")
-    s.add_argument("--max-num-queued-tokens", type=int,
-                   help="503 once the prompts not yet given a token hold this many tokens (default: no limit)")
-    s.add_argument("--page-size", type=int)
-    s.add_argument("--step-ms", type=float, help="fake runner: device time per step")
-    s.add_argument("--log-level")
+    s.add_argument(
+        "--config",
+        help="path to the YAML configuration file (default: application configuration)",
+    )
+    s.add_argument("--host", help="server bind address (default: config server.host)")
+    s.add_argument("--port", type=int, help="TCP port for the server (default: config server.port)")
+    s.add_argument("--frontends", type=int,
+                   help="number of frontend processes (default: 1; overrides server.num_frontends)")
+    s.add_argument(
+        "--served-model-name",
+        help="model name exposed by the API (default: config model.served_model_name)",
+    )
+    s.add_argument(
+        "--max-model-len",
+        type=int,
+        help="maximum model context length in tokens (default: config model.max_model_len)",
+    )
+    s.add_argument(
+        "--max-num-seqs",
+        type=int,
+        help="maximum concurrent sequences (default: config scheduler.max_num_seqs)",
+    )
+    s.add_argument(
+        "--max-num-batched-tokens",
+        type=int,
+        help="maximum batched tokens per scheduler iteration (default: config scheduler.max_num_batched_tokens)",
+    )
+    s.add_argument(
+        "--max-num-queued-reqs",
+        type=int,
+        help=(
+            "maximum requests in flight before returning HTTP 503 "
+            "(default: unlimited; overrides scheduler.max_num_queued_reqs)"
+        ),
+    )
+    s.add_argument(
+        "--max-num-queued-tokens",
+        type=int,
+        help=(
+            "maximum queued prompt tokens before returning HTTP 503 "
+            "(default: unlimited; overrides scheduler.max_num_queued_tokens)"
+        ),
+    )
+    s.add_argument("--page-size", type=int, help="KV-cache page size in tokens (default: config dev.cache.page_size)")
+    s.add_argument("--step-ms", type=float,
+                   help="fake runner device time per step in milliseconds (overrides dev.runner.fake.step_ms)")
+    s.add_argument("--log-level", help="logging level (default: config observability.log_level)")
     s.add_argument("--set", action="append", default=[], metavar="GROUP.KEY=VALUE",
-                   help="override any setting, e.g. --set scheduler.policy=priority (repeatable)")
+                   help="override any setting, e.g. --set scheduler.policy=priority "
+                        "(repeatable; takes precedence over individual CLI flags)")
     return s
 
 

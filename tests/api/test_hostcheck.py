@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from llm_mini_infer import hostcheck, synthetic
+from llm_mini_infer import cli, hostcheck, synthetic
 from llm_mini_infer.vision.gemma import GemmaVision
 from llm_mini_infer.vision.probe import probe
 
@@ -158,6 +158,19 @@ def test_the_synthetic_prompt_reaches_its_length_in_gemmas_tokens() -> None:
     for target in (synthetic.PROMPT_TOKENS, 600):
         n = len(tok.encode(synthetic.system_prompt(lambda t: len(tok.encode(t).ids), target)).ids)
         assert target <= n <= target + 100
+
+
+def test_cli_options_have_help() -> None:
+    """Every optional CLI argument must document its purpose."""
+    parsers = {
+        "serve": cli.serve_args(argparse.ArgumentParser()),
+        "hostcheck": hostcheck.build_parser(),
+    }
+
+    for name, parser in parsers.items():
+        for action in parser._actions:
+            if action.option_strings:
+                assert action.help, f"{name} option {action.option_strings} has no help text"
 
 
 # -- the request, the arrivals, the parsing ----------------------------------------------------------------------------
