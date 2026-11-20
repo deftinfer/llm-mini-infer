@@ -81,6 +81,9 @@ VLLM_OWN_K = {
               (4, "vLLM v0.33.0's recipe, recipes/models/Google/gemma-4-31B-it.yaml")),
     "qwen": ((1, "the value vLLM v0.33.0's docs start at (an MTP layer needs an explicit k)"),),
 }
+# llm-mini-infer's own draft counts (family K), the headline k among them: its assistant takes 0 to 7 drafts, the Qwen
+# runner's MTP layer 0 to 3; k = 0 keeps the drafter configured and drafts nothing
+OURS_OWN_K = {"gemma": (0, 1, 2, 3, 5), "qwen": (0, 1, 2, 3)}
 
 
 @dataclass(frozen=True)
@@ -253,7 +256,8 @@ def arms(model: str) -> dict[str, list[Arm]]:
         invariant = [nodg if a.engine == "vllm" else a for a in other_mode]
         other_mode = [*other_mode, nodg]
     out = {"smoke": head + other_mode, "A1": head, "A2": head, "C": head + other_mode, "D": head, "S": head,
-           "B": own, "I": [a for pair in zip(head, invariant, strict=True) for a in pair]}
+           "B": own, "I": [a for pair in zip(head, invariant, strict=True) for a in pair],
+           "K": [Arm("ours", model, k=k) for k in OURS_OWN_K[model]]}
     if model == "qwen":
         # The multi-turn cell: llm-mini-infer with superseded checkpoints demoted and not, at checkpoint slots below
         # the conversations in flight; vLLM's and SGLang's own caches (capacity not matched)
@@ -269,4 +273,6 @@ def k_source(arm: Arm) -> str:
         return dict(VLLM_OWN_K[arm.model]).get(arm.k, "named by the arm")
     if arm.engine == "vllm":
         return "the same k as the other engines (vLLM's own: bench/engines/arms.py, VLLM_OWN_K)"
+    if arm.k is not None and arm.k != MODELS[arm.model].k:
+        return "named by the arm (llm-mini-infer's own draft counts: bench/engines/arms.py, OURS_OWN_K)"
     return MODELS[arm.model].k_source

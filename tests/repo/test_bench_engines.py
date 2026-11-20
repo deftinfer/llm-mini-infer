@@ -536,6 +536,50 @@ def test_family_i_runs_both_modes_of_each_engine_at_c64(rig, capsys):
     assert "VLLM_USE_DEEP_GEMM" in out
 
 
+def test_family_k_runs_our_own_draft_counts_on_a1s_loads_and_the_mixed_load(rig, capsys):
+    rig.mp.undo()  # the real loads_for
+    assert drive.main(["--out", str(rig.out), "--model", "gemma", "--family", "K", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert [ln.split(":")[0] for ln in out.splitlines() if ln.startswith("K ")] == [
+        "K ours-k0", "K ours-k1", "K ours-k2", "K ours-k3", "K ours"]
+    assert "speculative.num_speculative_tokens=0" in out and "speculative.num_speculative_tokens=5" in out
+    assert out.count("load scene-c1: ") == 5 and out.count("load chat-c64: --workload chat") == 5
+    assert out.count("load mixed-c64-chat: --workload chat --input-tokens 1024 --max-tokens 256 --ignore-eos "
+                     "--concurrency 32 --first-index 3000000") == 5
+    assert out.count("load mixed-c64-scene: --workload scene --concurrency 32 --first-index 3000000") == 5
+    k = {a.name: a for a in arms.arms("qwen")["K"]}
+    assert sorted(k) == ["ours", "ours-k0", "ours-k1", "ours-k2"]
+    assert "OURS_OWN_K" in arms.k_source(k["ours-k1"]) and arms.k_source(k["ours"]) == arms.MODELS["qwen"].k_source
+
+
+def test_load_keeps_only_the_named_loads_and_refuses_an_unknown_one(rig, capsys):
+    rig.mp.undo()  # the real loads_for
+    base = ["--out", str(rig.out), "--model", "qwen", "--family", "K", "--dry-run", "--arm", "ours-k1"]
+    assert drive.main([*base, "--load", "chat-c64", "--load", "mixed-c64"]) == 0
+    loads = [ln.strip().split(":")[0] for ln in capsys.readouterr().out.splitlines() if ln.startswith("  load ")]
+    assert loads == ["load chat-c64", "load mixed-c64-chat", "load mixed-c64-scene"]
+    with pytest.raises(SystemExit):
+        drive.main([*base, "--load", "chat-c99"])
+    assert "--load chat-c99: not a load of this family" in capsys.readouterr().err
+
+
+def test_a_load_of_parts_runs_one_client_per_part_each_with_its_report(rig, monkeypatch):
+    each = ["--concurrency", "2", "--requests", "4", "--warmup-requests", "1", "--max-tokens", "8"]
+    spec = [drive.LoadSpec("mix", [], parts=(
+        ("chat", ["--workload", "chat", "--input-tokens", "32", "--ignore-eos", *each]),
+        ("scene", [*drive.SCENE, "--prompt-tokens", "64", *each])))]
+    monkeypatch.setattr(drive, "loads_for", lambda ctx, unit: spec)
+    assert rig.run(family="A1") == 0
+    u, m = rig.unit(family="A1"), rig.manifest(family="A1")
+    ld = m["loads"][0]
+    assert ld["file"] == ["mix-chat.json", "mix-scene.json"] and ld["ok"] is True and len(ld["exit"]) == 2
+    for part in ("chat", "scene"):
+        report = json.loads((u / f"mix-{part}.json").read_text())
+        assert report["meta"]["part"] == part and report["meta"]["unit"] == "vllm"
+        assert report["workload"]["name"] == part and report["loads"][0]["ok"] == 4
+    assert not (u / "mix.json").exists() and (u / "metrics-mix-after.txt").exists()
+
+
 def test_arms_config_cache_roots_and_the_family_i_variants(monkeypatch):
     ours = arms.Arm("ours", "gemma")
     monkeypatch.setenv("LLM_MINI_INFER_CONFIG", "/x/c.yaml")

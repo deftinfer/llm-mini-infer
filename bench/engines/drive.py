@@ -4,15 +4,18 @@ the engine comparison's arms (bench/engines/arms.py), one engine after another, 
 
     python3 bench/engines/drive.py --out DIR --model gemma|qwen --family FAMILY [--engines ours,vllm,sglang] \\
         [--rotate N] [--arm NAME ...] [--engine-bin ENGINE=PATH ...] [--inherit-env] [--client-pythonpath DIR] \\
-        [--bound-file PATH] [--meta-extra JSON] [--m-concurrency 48] [--tokenizer ID] [--skip-validity] [--dry-run]
+        [--bound-file PATH] [--meta-extra JSON] [--m-concurrency 48] [--tokenizer ID] [--load NAME ...] \\
+        [--skip-validity] [--dry-run]
     python3 bench/engines/drive.py --out DIR --family control --label start|middle|end [--python PATH]
 
 **Families** (`--family`): `smoke` (the start and the smoke checks), `A1` (closed-loop loads of the head arms), `A2`
 (the highest rate within a latency bound, needs `--bound-file`), `C` (two passes of every arm and the cost of batch
 invariance), `D` (cold and warm start, then the structured-output validity run, and the grammar cost for
 llm-mini-infer), `B` (vLLM's own draft counts), `I` (each engine in both modes, c=64 scene and chat on fresh servers:
-the cost of batch invariance), `M` (qwen only: multi-turn sessions), `Q` (the head arm of each engine in its vendor
-image), `control` (the GPU control, bench/engines/gpu_control.py).
+the cost of batch invariance), `K` (llm-mini-infer's own draft counts: A1's loads, then `mixed-c64`, 32 chat and 32
+scene clients at once against one server, each part its own report), `M` (qwen only: multi-turn sessions), `Q` (the
+head arm of each engine in its vendor image), `control` (the GPU control, bench/engines/gpu_control.py). `--load`
+keeps only the named loads of each unit (repeats of a load go to another `--out`).
 
 **Layout** under `--out`: `<model>/<family>/<unit>/` holds `server.log` (private), `startup.json`, `smoke.json`, one
 `<load>.json` per load, the `/metrics` pages around it, `gpu.csv`, `manifest.json` and, last, `done`. A unit whose
@@ -68,13 +71,14 @@ CHAT = ["--workload", "chat", "--input-tokens", "1024", "--max-tokens", "256", "
 # Each load of a server starts at its own workload index (run.py's --first-index), so no load resends a request an
 # earlier one put in the server's prefix cache; the same load starts at the same index on every engine and family (a
 # family C or B load at c=64 sends A1's c=64 requests)
-FIRST = {"c1": ["--first-index", "0"], "c16": ["--first-index", "1000000"], "c64": ["--first-index", "2000000"]}
+FIRST = {"c1": ["--first-index", "0"], "c16": ["--first-index", "1000000"], "c64": ["--first-index", "2000000"],
+         "mixed": ["--first-index", "3000000"]}
 VERSION_PACKAGES = ("vllm", "sglang", "sglang-kernel", "llm-mini-infer", "torch", "flashinfer-python",
                     "flashinfer-cubin", "flashinfer-jit-cache", "triton", "xgrammar", "llguidance", "transformers",
                     "deep-gemm", "sgl-kernel")
 # A start that fails with one of these lines is a refusal the engine documents, not a failure
 EXPECTED_REFUSALS = ("batch_invariant mode is not supported for GDN_ATTN",)
-FAMILIES = ("smoke", "A1", "A2", "C", "D", "B", "I", "M", "Q", "control")
+FAMILIES = ("smoke", "A1", "A2", "C", "D", "B", "I", "K", "M", "Q", "control")
 
 
 # -- the engines' startup logs -----------------------------------------------------------------------------------------
@@ -339,19 +343,36 @@ def alive(h: startup.Handle, ctx: Ctx, wait_s: float = HEALTH_WAIT_S) -> bool:
 def run_child(argv: list[str], env: dict[str, str], cwd: Path, log_path: Path, limit: float | None) -> tuple[int, bool]:
     """Run a command in its own process group with its output appended to `log_path`. Returns (exit code, timed out);
     a command past `limit` seconds is killed with its group."""
+    return run_children([argv], env, cwd, log_path, limit)[0]
+
+
+def run_children(argvs: list[list[str]], env: dict[str, str], cwd: Path, log_path: Path,
+                 limit: float | None) -> list[tuple[int, bool]]:
+    """`run_child` for several commands at once: each one's (exit code, timed out), the limit counted from their
+    start."""
+    deadline = None if limit is None else time.monotonic() + limit
+    procs: list[subprocess.Popen] = []
     with open(log_path, "ab") as log:
-        proc = subprocess.Popen(argv, cwd=cwd, env=env, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                                start_new_session=True)
         try:
-            return proc.wait(timeout=limit), False
-        except subprocess.TimeoutExpired:
-            with contextlib.suppress(OSError):
-                os.killpg(proc.pid, signal.SIGKILL)
-            proc.wait()
-            return -9, True
+            for argv in argvs:
+                procs.append(subprocess.Popen(argv, cwd=cwd, env=env, stdout=log, stderr=subprocess.STDOUT,
+                                              stdin=subprocess.DEVNULL, start_new_session=True))
+            out = []
+            for proc in procs:
+                try:
+                    out.append((proc.wait(timeout=None if deadline is None else max(0.0, deadline - time.monotonic())),
+                                False))
+                except subprocess.TimeoutExpired:
+                    with contextlib.suppress(OSError):
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    proc.wait()
+                    out.append((-9, True))
+            return out
         except BaseException:
-            with contextlib.suppress(OSError):
-                os.killpg(proc.pid, signal.SIGKILL)
+            for proc in procs:
+                if proc.poll() is None:
+                    with contextlib.suppress(OSError):
+                        os.killpg(proc.pid, signal.SIGKILL)
             raise
 
 
@@ -431,6 +452,8 @@ class LoadSpec:
     name: str
     args: list[str]
     fixed: dict[str, str] = field(default_factory=dict)  # replaces entries of FIXED
+    # One client per part, all at once, each with its own arguments and report (`<name>-<part>.json`); `args` unused
+    parts: tuple[tuple[str, list[str]], ...] = ()
 
 
 @dataclass
@@ -530,18 +553,33 @@ def a1_rate(ctx: Ctx, arm: arms.Arm) -> float:
     return float(rate)
 
 
+def a1_loads() -> list[LoadSpec]:
+    return [LoadSpec("scene-c1", [*SCENE, "--concurrency", "1", "--requests", "150", *FIRST["c1"]]),
+            LoadSpec("chat-c1", [*CHAT, "--concurrency", "1", "--requests", "80", *FIRST["c1"]]),
+            LoadSpec("scene-c16", [*SCENE, "--concurrency", "16", *FIRST["c16"]]),
+            LoadSpec("scene-c64", [*SCENE, "--concurrency", "64", *FIRST["c64"]]),
+            LoadSpec("chat-c16", [*CHAT, "--concurrency", "16", *FIRST["c16"]]),
+            LoadSpec("chat-c64", [*CHAT, "--concurrency", "64", *FIRST["c64"]])]
+
+
 def loads_for(ctx: Ctx, unit: Unit) -> list[LoadSpec]:
-    """The loads of a unit, in order. Raises LookupError when A2 has no A1 rate to start from."""
+    """The loads of a unit, in order, cut to `--load` when given. Raises LookupError when A2 has no A1 rate to start
+    from."""
+    loads = family_loads(ctx, unit)
+    keep = getattr(ctx.args, "load", None)
+    return [s for s in loads if s.name in keep] if keep else loads
+
+
+def family_loads(ctx: Ctx, unit: Unit) -> list[LoadSpec]:
     fam, args = unit.family, ctx.args
     if fam in ("smoke", "D"):
         return []
     if fam == "A1":
-        return [LoadSpec("scene-c1", [*SCENE, "--concurrency", "1", "--requests", "150", *FIRST["c1"]]),
-                LoadSpec("chat-c1", [*CHAT, "--concurrency", "1", "--requests", "80", *FIRST["c1"]]),
-                LoadSpec("scene-c16", [*SCENE, "--concurrency", "16", *FIRST["c16"]]),
-                LoadSpec("scene-c64", [*SCENE, "--concurrency", "64", *FIRST["c64"]]),
-                LoadSpec("chat-c16", [*CHAT, "--concurrency", "16", *FIRST["c16"]]),
-                LoadSpec("chat-c64", [*CHAT, "--concurrency", "64", *FIRST["c64"]])]
+        return a1_loads()
+    if fam == "K":
+        return [*a1_loads(),
+                LoadSpec("mixed-c64", [], parts=(("chat", [*CHAT, "--concurrency", "32", *FIRST["mixed"]]),
+                                                 ("scene", [*SCENE, "--concurrency", "32", *FIRST["mixed"]])))]
     if fam == "A2":
         rate = a1_rate(ctx, unit.arm)
         lo, hi, res = round(0.4 * rate, 3), round(1.0 * rate, 3), round(0.1 * rate, 3)
@@ -792,26 +830,40 @@ def classify_failure(unit: Unit, err: startup.StartError, log_path: Path) -> tup
 def run_load(ctx: Ctx, unit: Unit, spec: LoadSpec, udir: Path, bound: Path | None, sampler: gpu_control.Sampler,
              meta: dict) -> dict:
     name = spec.name
-    report = udir / f"{name}.json"
-    report.unlink(missing_ok=True)  # a stale report must not pass for this run's
+    parts = spec.parts or (("", spec.args),)
+    files = [f"{name}-{part}.json" if part else f"{name}.json" for part, _ in parts]
+    for f in files:
+        (udir / f).unlink(missing_ok=True)  # a stale report must not pass for this run's
     save_metrics(ctx, udir / f"metrics-{name}-before.txt")
     fixed = {**FIXED, **spec.fixed}
-    cmd = [sys.executable, str(ctx.client_dir / "bench/load/run.py"), "--base-url", ctx.base_url, "--model",
-           ctx.model.id, "--tokenizer", ctx.tokenizer, "--out", str(report), "--meta", json.dumps(meta),
-           *[str(bound) if a == "{bound}" else a for a in spec.args], *[x for kv in fixed.items() for x in kv]]
+    cmds = [[sys.executable, str(ctx.client_dir / "bench/load/run.py"), "--base-url", ctx.base_url, "--model",
+             ctx.model.id, "--tokenizer", ctx.tokenizer, "--out", str(udir / f),
+             "--meta", json.dumps({**meta, "part": part} if part else meta),
+             *[str(bound) if a == "{bound}" else a for a in args], *[x for kv in fixed.items() for x in kv]]
+            for (part, args), f in zip(parts, files, strict=True)]
     ctx.log(f"{unit.name}: load {name}")
     t0 = time.monotonic()
-    code, timed_out = run_child(cmd, client_env(ctx), ctx.client_dir, ctx.out / "drive.log", LOAD_LIMIT_S)
+    if spec.parts:
+        results = run_children(cmds, client_env(ctx), ctx.client_dir, ctx.out / "drive.log", LOAD_LIMIT_S)
+    else:
+        results = [run_child(cmds[0], client_env(ctx), ctx.client_dir, ctx.out / "drive.log", LOAD_LIMIT_S)]
     t1 = time.monotonic()
     save_metrics(ctx, udir / f"metrics-{name}-after.txt")
-    ctx.log(f"{unit.name}: load {name} exited {code} after {t1 - t0:.0f} s" + (" (timed out)" if timed_out else ""))
-    error = report_failure(code, timed_out, report)
+    codes = [code for code, _ in results]
+    timed_out = any(t for _, t in results)
+    ctx.log(f"{unit.name}: load {name} exited {' '.join(map(str, codes))} after {t1 - t0:.0f} s"
+            + (" (timed out)" if timed_out else ""))
+    errors = [(part, report_failure(code, t, udir / f))
+              for (part, _), (code, t), f in zip(parts, results, files, strict=True)]
+    error = "; ".join(f"{part}: {e}" if part else e for part, e in errors if e) or None
+    args = [a for _, part_args in parts for a in part_args]
     client = {"seed": int(fixed["--seed"]), "warmup_s": float(fixed["--warmup"]),
               "duration_s": float(fixed["--duration"]), "tail_s": float(fixed["--tail"]),
               "timeout_s": float(fixed["--timeout"]),
-              "warmup_requests": warmup_requests_of([*spec.args, *[x for kv in fixed.items() for x in kv]])}
-    return {"name": name, "file": f"{name}.json", "exit": code, "seconds": round(t1 - t0, 1),
-            **gpu_control.summarize(sampler.samples, t0, t1), "ok": error is None,
+              "warmup_requests": warmup_requests_of([*args, *[x for kv in fixed.items() for x in kv]])}
+    one = not spec.parts
+    return {"name": name, "file": files[0] if one else files, "exit": codes[0] if one else codes,
+            "seconds": round(t1 - t0, 1), **gpu_control.summarize(sampler.samples, t0, t1), "ok": error is None,
             **({"error": error} if error else {}), "client": client}
 
 
@@ -1042,7 +1094,8 @@ def dry_run(ctx: Ctx, units: list[Unit]) -> None:
         print(f"  env: {' '.join(sorted(arm_env))}")
         try:
             for spec in loads_for(ctx, u):
-                print(f"  load {spec.name}: {' '.join(spec.args)}")
+                for part, args in spec.parts or (("", spec.args),):
+                    print(f"  load {spec.name}{'-' + part if part else ''}: {' '.join(args)}")
         except LookupError as exc:
             print(f"  loads: {exc}")
 
@@ -1088,6 +1141,8 @@ def parser() -> argparse.ArgumentParser:
                     help="add one argument to the end of an arm's command (a recipe's flag; a named deviation)")
     ap.add_argument("--deviation", action="append", default=[], metavar="ARM=TEXT",
                     help="the reason for an arm's deviation, into its manifest")
+    ap.add_argument("--load", action="append", default=[], metavar="NAME",
+                    help="keep only this load of each unit (repeatable)")
     ap.add_argument("--skip-validity", action="store_true",
                     help="family D: no structured-output validity run (a named deviation)")
     ap.add_argument("--dry-run", action="store_true", help="print each unit's command and environment names only")
@@ -1123,6 +1178,15 @@ def main(argv: list[str] | None = None) -> int:
     ctx = Ctx(args, model, Path(args.out), f"http://{arms.HOST}:{arms.PORT}", client_dir, args.tokenizer or model.id,
               bins, meta_extra)
     units = build_units(args)
+    if args.load:
+        known: set[str] = set()
+        for u in units:
+            with contextlib.suppress(LookupError):  # A2 without its A1 report: its one load is find-rate
+                known |= {s.name for s in family_loads(ctx, u)}
+            if u.family == "A2":
+                known.add("find-rate")
+        if missing := [n for n in args.load if n not in known]:
+            ap.error(f"--load {', '.join(missing)}: not a load of this family (have {', '.join(sorted(known))})")
     if args.dry_run:
         dry_run(ctx, units)
         return 0
