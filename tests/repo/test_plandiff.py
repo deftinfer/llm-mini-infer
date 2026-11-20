@@ -1,7 +1,7 @@
 """The plan-diff harness (`tests/scripts/plandiff.py`): it finds no difference between a tree and itself, flags a
 planted one-decision change (the mixed-step bound one token lower) with its first differing plan and fields, accepts it
 where `--expect-changed` allows it, flags a strategy that draws other workloads or test cases (`--compare-draws`), and
-digests decisions, not their storage or timings."""
+digests decisions, not their storage, timings or neutral ADMIT terms."""
 
 from __future__ import annotations
 
@@ -206,6 +206,51 @@ def test_digests_follow_values_not_storage_or_timing() -> None:
     r3 = _Report({0: _Out(np.array([5]), np.array([111]), [5])}, 4, 900)  # pixels released
     assert pd.event_digest(*pd.report_event(r1)) == pd.event_digest(*pd.report_event(r2))
     assert pd.event_digest(*pd.report_event(r1)) != pd.event_digest(*pd.report_event(r3))
+
+
+@dataclass
+class _Admit:
+    __slots__ = ("admit_bias_n", "admit_freq", "admit_pres", "admit_prompt_len", "admit_rep", "admit_slot", "step_id")
+    step_id: int
+    admit_slot: np.ndarray
+    admit_rep: np.ndarray
+    admit_pres: np.ndarray
+    admit_freq: np.ndarray
+    admit_prompt_len: np.ndarray
+    admit_bias_n: np.ndarray
+
+
+@dataclass
+class _Bare:
+    __slots__ = ("admit_slot", "step_id")
+    step_id: int
+    admit_slot: np.ndarray
+
+
+@dataclass
+class _Seeded:
+    __slots__ = ("admit_seed", "admit_slot", "step_id")
+    step_id: int
+    admit_slot: np.ndarray
+    admit_seed: np.ndarray
+
+
+def test_neutral_admit_terms_digest_as_their_absence() -> None:
+    """The penalty terms every ADMIT carries (`plandiff.NEUTRAL`), all at their neutral values, digest as a plan from a
+    tree without them; one value that is not neutral, in any of them, differs. Another all-zero field still counts."""
+    def digest(p) -> bytes:
+        return pd.event_digest(*pd.plan_event(p))
+
+    slots = np.array([4, 5], np.int32)
+    neutral = dict(admit_rep=np.ones(2, np.float32), admit_pres=np.zeros(2, np.float32),
+                   admit_freq=np.zeros(2, np.float32), admit_prompt_len=np.zeros(2, np.int32),
+                   admit_bias_n=np.zeros(2, np.int32))
+    base = digest(_Admit(3, slots, **neutral))
+    assert base == digest(_Bare(3, slots))
+    for name, v in (("admit_rep", [1.0, 1.2]), ("admit_pres", [0, 0.5]), ("admit_freq", [0, -1]),
+                    ("admit_prompt_len", [0, 7]), ("admit_bias_n", [0, 2])):
+        assert digest(_Admit(3, slots, **{**neutral, name: np.array(v, neutral[name].dtype)})) != base, name
+    assert digest(_Seeded(3, slots, np.zeros(2, np.int32))) != digest(_Bare(3, slots))
 
 
 def test_first_difference_names_the_event_and_fields() -> None:
