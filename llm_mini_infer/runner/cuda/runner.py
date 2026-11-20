@@ -690,11 +690,14 @@ class CudaRunner(Runner):
                  vision_buckets: list[int] | None = None, grammar: bool = True, pdl: bool = False,
                  always_split: bool = False, sparse_head: bool = False, sparse_head_rows: int = 1024,
                  draft_universe: bool = False, batch_invariant: bool = False, attn_split_keys: int = 0,
-                 sync_check: str | None = None, logprobs: bool = False, penalties: bool = False):
+                 attn_prefill: tuple[int, int] | None = None, sync_check: str | None = None, logprobs: bool = False,
+                 penalties: bool = False):
         """`batch_invariant`: a row's bits do not depend on the rows beside it (architecture.md, "Batch invariance");
-        `attn_split_keys`: then a decode row's split of its full layers' keys (0: `attn512.fixed_split_keys` of the
-        longest row). `logprobs`: takes LOGPROBS rows, its head's logits kept for them (`runner.cuda.logprobs`).
-        `penalties`: takes admissions with penalties and a logit bias (`runner.cuda.penalties`)."""
+        `attn_split_keys`: then the full layers' fixed split's base for decode rows (0: `attn512.SPLIT_KEYS`),
+        `attn_prefill` its prefill rows' (whole up to that many keys, base; None: `attn512.PREFILL_FROM`,
+        `attn_window.FULL_PREFILL_KEYS`; `kernels.attn_window.FullAttention`). `logprobs`: takes LOGPROBS rows, its
+        head's logits kept for them (`runner.cuda.logprobs`). `penalties`: takes admissions with penalties and a logit
+        bias (`runner.cuda.penalties`)."""
         if always_split and not grammar:
             raise ValueError("always-split graphs need the grammar masks' split (structured output)")
         self.device = torch.device(device)
@@ -723,11 +726,12 @@ class CudaRunner(Runner):
         self.always_split = always_split  # every step with rows split, masked or not; only the split graphs
         self.inv = batch_invariant
         self.max_model_len = min(max_model_len or cfg.max_position_embeddings, cfg.max_position_embeddings)
-        if batch_invariant:  # the full layers' fixed split (kernels.attn512's rule, on kernels.attn_window's kernels)
-            from ...kernels.attn512 import fixed_split_keys
+        from ...kernels.attn512 import PREFILL_FROM, SPLIT_KEYS
+        from ...kernels.attn_window import FULL_PREFILL_KEYS
 
-            attn_split_keys = attn_split_keys or fixed_split_keys(self.max_model_len + 1 + mtp_k)
-        self.attn_split_keys = attn_split_keys if batch_invariant else 0
+        # the full layers' fixed split (kernels.attn512's rule, on kernels.attn_window's kernels)
+        self.attn_split_keys = (attn_split_keys or SPLIT_KEYS) if batch_invariant else 0
+        self.attn_prefill = attn_prefill or (PREFILL_FROM, FULL_PREFILL_KEYS)
         self.memory_utilization = memory_utilization
         self.memory_gb = memory_gb
         self.check = check
@@ -1082,7 +1086,8 @@ class CudaRunner(Runner):
                 self.attn: Any = FullAttention(self.pools, cfg.num_heads, cfg.num_kv_heads, cfg.head_dim, dev,
                                                max_tokens=pc.max_num_batched_tokens, max_rows=pc.max_num_seqs,
                                                max_kv=self.max_model_len + self.L, scale=cfg.head_dim ** -0.5,
-                                               qo_per_row=self.L, split_keys=self.attn_split_keys)
+                                               qo_per_row=self.L, split_keys=self.attn_split_keys,
+                                               prefill_from=self.attn_prefill[0], prefill_keys=self.attn_prefill[1])
                 workspace = torch.zeros(WORKSPACE_BYTES, dtype=torch.uint8, device=dev)
             else:
                 self.attn = FlashInferAttention(self.pools, cfg.num_heads, cfg.num_kv_heads, cfg.head_dim, dt, dev,
@@ -2430,7 +2435,8 @@ class CudaRunner(Runner):
             if kind == "decode":
                 self._plan_decode_graph(meta, lay, st, parity, size)
             else:
-                self.attn.plan(meta, parity=parity, rows=lay.full_rows, stage=st.put32, fixed_rows=lay.n_dev)
+                self.attn.plan(meta, parity=parity, rows=lay.full_rows, stage=st.put32, fixed_rows=lay.n_dev,
+                               lb=lay.r_kv_lb)
                 if self.k:  # the true KV lengths, decided on the device (the decode graphs' body does its own)
                     self.attn.fix_lengths(meta.attn_plan, n, meta.kv_len_dev)
         elif self.attn_kind == "flashinfer":
@@ -2500,7 +2506,7 @@ class CudaRunner(Runner):
             full[:n] = lay.full_rows
             pr = np.arange(n, rows)
             full[n:, 1], full[n:, 2], full[n:, 3] = pr * L, L, L
-            self.attn.plan_graph(meta, bucket=rows, rows=full, stage=st.put32, real=n)
+            self.attn.plan_graph(meta, bucket=rows, rows=full, stage=st.put32, real=n, lb=lay.r_kv_lb)
             return
         kv = np.full(rows, L, np.int64)
         kv[:n] = lay.r_kv

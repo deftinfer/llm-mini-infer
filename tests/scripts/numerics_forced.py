@@ -491,13 +491,12 @@ class Engine:
                   draft_universe=opts.draft_universe, pdl=opts.pdl, always_split=opts.always_split,
                   batch_invariant=inv)
         if gemma:  # the switch's five runner settings together (`runner.cuda.make_cuda_runner`)
-            from llm_mini_infer.kernels.attn512 import fixed_split_keys
+            from llm_mini_infer.kernels.attn512 import SPLIT_KEYS as FULL_SPLIT_KEYS
             from llm_mini_infer.kernels.attn_window import SPLIT_KEYS
             from llm_mini_infer.runner.cuda.gemma import GemmaRunner
 
             self.runner: Any = GemmaRunner(
-                model_dir, assistant=assistant,
-                attn512_split_keys=fixed_split_keys(opts.max_model_len + 1 + opts.k) if inv else 0,
+                model_dir, assistant=assistant, attn512_split_keys=FULL_SPLIT_KEYS if inv else 0,
                 window_split_keys=SPLIT_KEYS if inv else 0, head_fixed_m=inv, encode_per_image=inv, **kw)
         else:
             from llm_mini_infer.runner.cuda.runner import CudaRunner

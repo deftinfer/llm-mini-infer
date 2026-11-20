@@ -388,7 +388,7 @@ class DevCudaConfig(_Group):
     # rows beside it, its MTP verify window's offset or the step's kind. Default: on for Gemma 4, and for Qwen3.8 with a
     # block-FP8 checkpoint, when model.max_model_len is at most 8,184 (BATCH_INVARIANT_MAX_LEN less 8) and the token
     # budget, the chunk cap and dev.cache.page_size allow it (`_invariance_blocked`). Forced on past that length, a
-    # fixed split holds about a 32nd of the context instead of 256 keys
+    # query's bits still depend on its position and keys alone (its attention splits come from its position)
     batch_invariant: bool | None = None
 
 
@@ -970,8 +970,7 @@ def _derive_grammar_tokens(cfg: Config, reasons: dict[str, str]) -> None:
                          f"ids ({ids}), so the sample decides which: use backend guidance")
 
 
-# dev.runner.cuda.batch_invariant's default context: kernels.attn512's fixed split keeps 256 keys a split up to the
-# merge's 32 splits (`fixed_split_keys`)
+# dev.runner.cuda.batch_invariant's default context
 BATCH_INVARIANT_MAX_LEN = 32 * 256
 
 
@@ -1017,11 +1016,9 @@ def _derive_batch_invariance(cfg: Config, hf: dict[str, Any], gemma: bool, short
     """The default of `dev.runner.cuda.batch_invariant` (architecture.md, "Batch invariance"; the rule: its comment in
     `DevCudaConfig`). Raises when it is set on and `_invariance_blocked` gives a reason."""
     o = cfg.dev.runner.cuda
-    long = (f"off: model.max_model_len {cfg.model.max_model_len} is past {BATCH_INVARIANT_MAX_LEN - 8:,}, where a "
-            "decode row's keys may outgrow the full layers' fixed split (at most 32 splits of 256 keys: "
-            f"{BATCH_INVARIANT_MAX_LEN:,}); forced on, a split holds about a 32nd of the context instead, so a "
-            "decode row runs fewer, longer splits (one up to that many keys), and a prefill row one however long its "
-            "history; set it to take that")
+    long = (f"off: model.max_model_len {cfg.model.max_model_len} is past {BATCH_INVARIANT_MAX_LEN - 8:,}, the "
+            "longest context it is on at by default; forced on, a query's bits still depend on its position and keys "
+            "alone; set it to take that")
     from .sched.plan import CKPT_GRID
 
     # The Qwen runner cuts its prompts on the GDN prefill's 64-token grid too; its MTP layer writes KV of its own, so

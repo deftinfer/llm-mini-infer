@@ -17,11 +17,17 @@ per group (their KV is the null page's 1 + k positions). The split count sets th
 other last bits.
 
 **The fixed split** (`split_keys` > 0; docs/architecture.md, "Batch invariance"). The wave split makes a row's merge
-order depend on the rows beside it, and its chunks on its tile's causal end. With a fixed split every split s holds the
-keys [s × split_keys, (s + 1) × split_keys), whatever the batch, the tile or the row's planned length: a decode row's
-group takes ceil(kv / split_keys) splits of its upper-bound KV length (a split past the tile's true keys is empty, and
-the merge skips it). Prefill rows (explicit tokens) take one split, the whole of their keys in one CTA, whatever the
-step (`plan`'s `fixed_rows`).
+order depend on the rows beside it, and its chunks on its tile's causal end. With a fixed split each query's splits
+come from its own absolute position p alone (`split_size`, `query_splits`): a decode row's query splits its keys [0, p]
+at absolute multiples of `split_keys` · 2^m, the least m >= 0 that keeps them within the merge's `MAX_SPLITS` (so 256
+keys a split up to 8,192 keys, 512 up to 16,384, ...); a prefill row's query takes its keys whole while they are at
+most `prefill_from`, and past that splits them as a decode query does, from `prefill_keys`. Split j of a query holds the
+keys [j × S, (j + 1) × S) of its size S, whatever the batch, the tile, the chunk it lands in or the row's planned
+length. A group (row, tile, KV head) takes the most splits any position its rows may hold needs (`range_splits`: under
+MTP a decode row's queries lie anywhere from its lowest possible length to its planned one, and the count drops where
+the size doubles); a split past a row's keys is empty, and the merge skips it. A tile whose rows straddle a size
+boundary loops the union of its rows' ranges, each row masked to its own. A step whose split items pass the partials
+runs them in more launches (`plan`'s launches), each its groups' items and merge: the same arithmetic either way.
 
 **CUDA graphs** (decode buckets): every row has `qo_per_row` queries (one, or the 1 + k of an MTP verify row). The
 captured launches read static row, item and group tables of a bucket's capacity (padding items exit at once); before
@@ -49,28 +55,44 @@ KT = 16  # keys per KV tile
 MIN_SPLIT_KEYS = 256  # an eager plan's splits hold at least this many keys of the longest row
 MAX_SPLITS = 32  # the merge's lanes (csrc/attn512.cu MAX_MERGE_SPLITS)
 WAVE_FILL = 0.6  # a wave left under this share full takes about 5/3 of a wave (module docstring; fitted on SM120)
-SPLIT_KEYS = 256  # the fixed split's keys a split (module docstring), unless longer rows need more (`fixed_split_keys`)
+SPLIT_KEYS = 256  # the fixed split's base for decode rows (module docstring, `split_size`)
+PREFILL_FROM = 8192  # the fixed split: a prefill query with at most this many keys takes them whole (module docstring)
+# The fixed split's base for a prefill query past PREFILL_FROM (`split_size`): its full layers' prefill tiles of 2
+# positions already fill the GPU from a few hundred queries, so a split pays for a short chunk over a long history
+# only, and a smaller base costs a long chunk more than 3% (attn-timing on SM120)
+PREFILL_KEYS = 16384
 
 
 def tiles(n_query: int, group: int) -> int:
     return -(-n_query * group // ROWS)
 
 
-def plan_items(nq: np.ndarray, group: int, kv_heads: int, n_splits: int | np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def tile_items(nq: np.ndarray, group: int, kv_heads: int, n_tile: np.ndarray,
+               rows: int = ROWS) -> tuple[np.ndarray, np.ndarray]:
     """(items int32 [n_items, 4]: (row, tile, KV head, split | n << 16); groups int32 [n_groups, 2]: (first item, n)),
-    grouped by (row, tile, KV head) with a group's n splits consecutive; `n_splits` per row, or one for all."""
+    grouped by (row, tile, KV head) with a group's n splits consecutive; `n_tile`: the split count of each (row, tile),
+    in that order, for all of the tile's KV heads; `rows`: a tile's query rows."""
     nq = np.asarray(nq, np.int64)
-    ns = np.broadcast_to(np.asarray(n_splits, np.int64), nq.shape)
-    per_row = (-(-nq * group // ROWS)) * kv_heads  # groups per row
-    g_row = np.repeat(np.arange(len(nq)), per_row)
-    g_local = np.arange(len(g_row)) - np.repeat(np.cumsum(per_row) - per_row, per_row)
-    g_ns = ns[g_row]
+    t_row = -(-nq * group // rows)  # tiles per row
+    n_tile = np.asarray(n_tile, np.int64)
+    if len(n_tile) != int(t_row.sum()):
+        raise ValueError(f"attn512: {len(n_tile)} tile split counts for {int(t_row.sum())} tiles")
+    g_row = np.repeat(np.arange(len(nq)), t_row * kv_heads)
+    g_local = np.arange(len(g_row)) - np.repeat(np.cumsum(t_row * kv_heads) - t_row * kv_heads, t_row * kv_heads)
+    g_ns = np.repeat(n_tile, kv_heads)
     first = np.cumsum(g_ns) - g_ns
     i_grp = np.repeat(np.arange(len(g_row)), g_ns)
     split = np.arange(len(i_grp)) - first[i_grp]
     items = np.stack([g_row[i_grp], g_local[i_grp] // kv_heads, g_local[i_grp] % kv_heads,
                       split | (g_ns[i_grp] << 16)], axis=1).astype(np.int32)
     return items, np.stack([first, g_ns], axis=1).astype(np.int32)
+
+
+def plan_items(nq: np.ndarray, group: int, kv_heads: int, n_splits: int | np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """`tile_items` with `n_splits` per row, or one for all."""
+    nq = np.asarray(nq, np.int64)
+    ns = np.broadcast_to(np.asarray(n_splits, np.int64), nq.shape)
+    return tile_items(nq, group, kv_heads, np.repeat(ns, -(-nq * group // ROWS)))
 
 
 def choose_splits(n_groups: int, max_kv: int, sms: int, resident: int = 0) -> int:
@@ -91,17 +113,58 @@ def bucket_splits(real: int, per_row: int, sms: int, resident: int, max_items: i
     return max(1, min(s, max_items // (real * per_row)))
 
 
-def fixed_split_keys(max_kv: int, keys: int = SPLIT_KEYS) -> int:
-    """The fixed split's keys a split for rows of up to `max_kv` keys: `keys`, or the least multiple of 16 that keeps
-    such a row within the merge's `MAX_SPLITS`."""
-    need = -(-max_kv // MAX_SPLITS)
-    return max(keys, -(-need // KT) * KT)
+def split_size(pos: np.ndarray | int, keys: int) -> np.ndarray:
+    """The fixed split of a query at absolute position `pos` (its keys [0, pos]): `keys` · 2^m, the least m >= 0 that
+    keeps its pos + 1 keys within `MAX_SPLITS` splits (module docstring)."""
+    pos = np.asarray(pos, np.int64)
+    s = np.full(pos.shape, keys, np.int64)
+    while (big := pos + 1 > s * MAX_SPLITS).any():
+        s = np.where(big, 2 * s, s)
+    return s
 
 
-def fixed_splits(kv: np.ndarray | int, split_keys: int) -> np.ndarray:
-    """Each decode row's split count under the fixed split: its KV length's splits of `split_keys` keys (at least
-    one)."""
-    return np.maximum(-(-np.asarray(kv, np.int64) // split_keys), 1)
+def query_splits(pos: np.ndarray | int, keys: int, whole: int = 0) -> np.ndarray:
+    """A query's split count under the fixed split: one when its pos + 1 keys are at most `whole` (a prefill query
+    taking them whole), else ceil((pos + 1) / `split_size`)."""
+    pos = np.asarray(pos, np.int64)
+    return np.where(pos + 1 <= whole, 1, -(-(pos + 1) // split_size(pos, keys)))
+
+
+def range_splits(lo: np.ndarray | int, hi: np.ndarray | int, keys: int, whole: int = 0) -> np.ndarray:
+    """The most splits a query at any position in [lo, hi] takes (`query_splits`): the count rises with the position
+    within a size and drops where the size doubles, so it is the count at hi, or `MAX_SPLITS` when the range crosses a
+    size boundary (the position just before it takes MAX_SPLITS)."""
+    lo, hi = np.broadcast_arrays(np.asarray(lo, np.int64), np.asarray(hi, np.int64))
+    split = np.maximum(lo, whole)  # the first position that splits
+    n = np.where(split_size(split, keys) == split_size(hi, keys), query_splits(hi, keys, whole), MAX_SPLITS)
+    return np.where(hi + 1 <= whole, 1, n)
+
+
+def tile_positions(nq: np.ndarray, kv: np.ndarray, group: int, rows: int = ROWS) -> tuple[np.ndarray, np.ndarray]:
+    """Each (row, tile)'s first and last query position, in (row, tile) order, for rows of `nq` queries ending at KV
+    length `kv` (a tile is `rows` flattened (position, head) rows, position-major, the last tile cut at nq)."""
+    nq, kv = np.asarray(nq, np.int64), np.asarray(kv, np.int64)
+    t_row = -(-nq * group // rows)
+    t = np.arange(int(t_row.sum())) - np.repeat(np.cumsum(t_row) - t_row, t_row)
+    q0 = np.repeat(kv - nq, t_row)
+    last = np.minimum((t * rows + rows - 1) // group, np.repeat(nq, t_row) - 1)
+    return q0 + t * rows // group, q0 + last
+
+
+def launches(groups: np.ndarray, cap: int) -> list[tuple[int, int, int, int]]:
+    """A step's launches under the fixed split: (first item, items, first group, groups) each, consecutive groups whose
+    items' indexes in their launch stay within `cap` partials (one launch when every group fits, or none splits)."""
+    n_items = int(groups[-1, 0] + groups[-1, 1]) if len(groups) else 0
+    if n_items <= cap or not (groups[:, 1] > 1).any():
+        return [(0, n_items, 0, len(groups))]
+    end = groups[:, 0] + groups[:, 1]
+    out, g = [], 0
+    while g < len(groups):
+        start = int(groups[g, 0])
+        h = max(g + 1, int(np.searchsorted(end, start + cap, side="right")))
+        out.append((start, int(end[h - 1]) - start, g, h - g))
+        g = h
+    return out
 
 
 def bucket_capacity(bucket: int, per_row: int, sms: int, resident: int, max_items: int) -> tuple[int, bool]:
@@ -122,11 +185,12 @@ class Attn512:
 
     def __init__(self, pools: Any, rotary: Any, num_heads: int, num_kv_heads: int, rot: int, device: torch.device,
                  max_tokens: int, max_rows: int, scale: float = 1.0, qo_per_row: int = 1, share: Attn512 | None = None,
-                 split_keys: int = 0, max_kv: int = 0):
+                 split_keys: int = 0, max_kv: int = 0, prefill_from: int = PREFILL_FROM,
+                 prefill_keys: int = PREFILL_KEYS):
         """`qo_per_row`: a decode graph row's queries (1 + k under MTP). `share`: an instance whose split partials this
         one uses when large enough (the MTP drafter's attention runs after the target's, on the same stream).
-        `split_keys`: the fixed split's keys a split (module docstring; 0: the wave split), for rows of up to `max_kv`
-        keys."""
+        `split_keys`: the fixed split's base for decode rows (module docstring; 0: the wave split), for rows of up to
+        `max_kv` keys; `prefill_from` and `prefill_keys`: a prefill query's (the tests make them small)."""
         self.pools = pools
         self.cos, self.sin = rotary.cos["full_attention"], rotary.sin["full_attention"]
         self.h, self.hkv, self.rot, self.scale = num_heads, num_kv_heads, rot, scale
@@ -138,14 +202,12 @@ class Attn512:
         self.device = device
         self.qo_per_row = qo_per_row
         self.split_keys, self.max_splits = split_keys, 0
+        self.prefill_from, self.prefill_keys = prefill_from, prefill_keys
         if split_keys:
-            if split_keys % KT or max_kv < 1:
-                raise ValueError(f"attn512: a fixed split of {split_keys} keys (a multiple of {KT}) for rows of "
-                                 f"{max_kv} keys")
-            self.max_splits = int(fixed_splits(max_kv, split_keys))
-            if self.max_splits > MAX_SPLITS:
-                raise ValueError(f"attn512: rows of {max_kv} keys take {self.max_splits} splits of {split_keys} keys "
-                                 f"(the merge takes {MAX_SPLITS}: `fixed_split_keys`)")
+            if split_keys % KT or prefill_keys < KT or prefill_keys % KT or prefill_from < 0 or max_kv < 1:
+                raise ValueError(f"attn512: a fixed split of {split_keys} keys and {prefill_keys} past "
+                                 f"{prefill_from} (multiples of {KT}) for rows of {max_kv} keys")
+            self.max_splits = int(range_splits(0, max_kv - 1, split_keys))  # a decode row's, at most MAX_SPLITS
         per_row = max(1, max_rows * tiles(qo_per_row, self.group) * num_kv_heads)
         # Split partials for the most items a split launch can have: at most one wave of split items, or under
         # WAVE_FILL 3 splits of fewer than 0.6 × resident groups (at most 9 × resident // 5); every row of a
@@ -160,10 +222,11 @@ class Attn512:
             self.max_split_items = max_items
             self.o_part = torch.empty((max_items, ROWS, 512), dtype=torch.float32, device=device)
             self.ml_part = torch.empty((max_items, ROWS, 2), dtype=torch.float32, device=device)
-        # Tables, per parity (module docstring)
+        # Tables, per parity (module docstring): under the fixed split a prefill group may take up to MAX_SPLITS items
         max_groups = (tiles(max_tokens, self.group) + max_rows) * num_kv_heads
         self.rows = [torch.zeros((max_rows + 1, 4), dtype=torch.int32, device=device) for _ in range(2)]
-        self.items = [torch.zeros((max_groups + max_items, 4), dtype=torch.int32, device=device) for _ in range(2)]
+        n_items = max_groups * MAX_SPLITS if split_keys else max_groups + max_items
+        self.items = [torch.zeros((n_items, 4), dtype=torch.int32, device=device) for _ in range(2)]
         self.groups = [torch.zeros((max_groups, 2), dtype=torch.int32, device=device) for _ in range(2)]
         # decode buckets: static row, item and group tables, the launch's sizes (items, groups, split), the host
         # tables per real row count (the wave split) and what the bucket's last replay's tables were made for (its
@@ -179,31 +242,40 @@ class Attn512:
             return s
         return max(1, self.max_split_items // n_groups)
 
-    def plan(self, meta: Any, *, parity: int, rows: np.ndarray, stage: Any, fixed_rows: int = 0) -> None:
+    def plan(self, meta: Any, *, parity: int, rows: np.ndarray, stage: Any, fixed_rows: int = 0,
+             lb: np.ndarray | None = None) -> None:
         """Eager steps: `rows` int32 [n, 4] (slot, first token, n_query, KV length after the step); `stage` puts an
         int32 array into the step's page-locked staging and returns its host view (the runner's `put32`). Under the
-        fixed split, the first `fixed_rows` rows are decode rows (split by their own lengths) and the rest prefill rows
-        (one split each: module docstring)."""
+        fixed split, the first `fixed_rows` rows are decode rows, their queries anywhere from their lowest possible KV
+        length `lb` (per row; None: the planned ones) to their planned one, and the rest prefill rows (module
+        docstring)."""
         nq, kv_len = rows[:, 2].astype(np.int64), rows[:, 3].astype(np.int64)
         if self.split_keys:
-            splits = np.ones(len(rows), np.int64)
-            splits[:fixed_rows] = fixed_splits(kv_len[:fixed_rows], self.split_keys)
-            split = bool((splits > 1).any())
+            low = kv_len if lb is None else np.asarray(lb, np.int64)
+            d = slice(0, fixed_rows)
+            n_dec = range_splits(low[d] - nq[d], kv_len[d] - 1, self.split_keys)
+            first, last = tile_positions(nq[fixed_rows:], kv_len[fixed_rows:], self.group)
+            n_tile = np.concatenate([np.repeat(n_dec, -(-nq[d] * self.group // ROWS)),
+                                     range_splits(first, last, self.prefill_keys, self.prefill_from)])
+            items, grp = tile_items(nq, self.group, self.hkv, n_tile)
+            parts = launches(grp, self.max_split_items)
         else:
             groups = int(np.sum(-(-nq * self.group // ROWS))) * self.hkv
             splits = self._splits(groups, int(kv_len.max()))
-            split = splits > 1
-        items, grp = plan_items(nq, self.group, self.hkv, splits)
-        if self.split_keys and split:  # the decode rows' items come first: the partials they write must fit
-            last = int(np.flatnonzero(items[:, 3] >> 16 > 1)[-1]) + 1
-            if last > self.max_split_items:
-                raise RuntimeError(f"attn512: {last} split items over the partials' {self.max_split_items}")
+            items, grp = plan_items(nq, self.group, self.hkv, splits)
+            parts = [(0, len(items), 0, len(grp))]
         dr, di, dg = self.rows[parity], self.items[parity], self.groups[parity]
         dr[:len(rows)].copy_(stage(rows.reshape(-1)).view(-1, 4), non_blocking=True)
         di[:len(items)].copy_(stage(items.reshape(-1)).view(-1, 4), non_blocking=True)
-        if split:
-            dg[:len(grp)].copy_(stage(grp.reshape(-1)).view(-1, 2), non_blocking=True)
-        meta.full_plan = (dr, di, len(items), dg, len(grp), int(split))
+        runs = []
+        for i0, ni, g0, ng in parts:  # each launch's group table counts its items from its own first one
+            split = bool((grp[g0:g0 + ng, 1] > 1).any())
+            if split:
+                rel = grp[g0:g0 + ng].copy()
+                rel[:, 0] -= i0
+                dg[g0:g0 + ng].copy_(stage(rel.reshape(-1)).view(-1, 2), non_blocking=True)
+            runs.append((i0, ni, g0, ng, int(split)))
+        meta.full_plan = (dr, di, dg, fixed_rows, tuple(runs))
 
     def _graph_host(self, bucket: int, ns: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """A bucket's item and group tables for split counts `ns` per row (padding rows 1), padded to the bucket's
@@ -243,17 +315,21 @@ class Attn512:
         it, gt, n_items, n_groups, split = self.g_tabs[bucket]
         return self.g_rows[bucket], it, n_items, gt, n_groups, split
 
-    def plan_graph(self, meta: Any, *, bucket: int, rows: np.ndarray, stage: Any, real: int | None = None) -> None:
+    def plan_graph(self, meta: Any, *, bucket: int, rows: np.ndarray, stage: Any, real: int | None = None,
+                   lb: np.ndarray | None = None) -> None:
         """Before a decode graph's replay: its row table (int32 [bucket, 4], padding rows included) into the static
         buffer the captured launch reads; `real`, the real rows (the first ones; None: all of them), whose groups split
-        to fill the wave, or by their own lengths under the fixed split (module docstring): the item and group tables
-        are rewritten when they changed."""
+        to fill the wave, or by their own positions under the fixed split (module docstring; `lb`: the real rows'
+        lowest possible KV lengths, None: the planned ones): the item and group tables are rewritten when they
+        changed."""
         dr, it, n_items, gt, n_groups, split = self.graph_tables(bucket)
         dr.copy_(stage(rows.reshape(-1)).view(-1, 4), non_blocking=True)
         real = bucket if real is None else real
         if self.split_keys:
+            nq, kv = rows[:real, 2].astype(np.int64), rows[:real, 3].astype(np.int64)
+            low = kv if lb is None else np.asarray(lb, np.int64)[:real]
             ns = np.ones(bucket, np.int64)
-            ns[:real] = fixed_splits(rows[:real, 3], self.split_keys)
+            ns[:real] = range_splits(low - nq, kv - 1, self.split_keys)
             key: Any = ns.tobytes()
         else:
             key = real
@@ -262,16 +338,19 @@ class Attn512:
             it.copy_(stage(items.reshape(-1)).view(-1, 4), non_blocking=True)
             gt.copy_(stage(grp.reshape(-1)).view(-1, 2), non_blocking=True)
             self.g_last[bucket] = key
-        meta.full_plan = (dr, it, n_items, gt, n_groups, split)
+        meta.full_plan = (dr, it, gt, bucket, ((0, n_items, 0, n_groups, split),))
 
     def run(self, meta: Any, layer: Any, q: torch.Tensor, out: torch.Tensor) -> None:
-        rows, items, n_items, groups, n_groups, split = meta.full_plan
+        rows, items, groups, n_dec, runs = meta.full_plan
         if meta.fix_len:  # the true KV lengths, decided on the device (module docstring)
             rows[:meta.n_rows, 3].copy_(meta.kv_len_dev[:meta.n_rows])
         kv = self.pools.fkv[layer.index]  # [pages, page_size, Hkv, 512]
         pt = meta.page_table
-        _check(build.load().lmk_attn512(
-            _p(q), self.h, self.hkv, _p(kv), kv.stride(0), kv.shape[1], _p(pt), pt.stride(0),
-            _p(layer.k_norm.weight), _p(self.cos), _p(self.sin), self.rot, self.scale, _p(rows), _p(items), n_items,
-            _p(groups), n_groups, split, self.split_keys, _p(out), _p(self.o_part) if split else _p(None),
-            _p(self.ml_part) if split else _p(None), _stream(q)), "attn512")
+        lib = build.load()
+        for i0, n_items, g0, n_groups, split in runs:  # a step past the partials: its launches in stream order
+            _check(lib.lmk_attn512(
+                _p(q), self.h, self.hkv, _p(kv), kv.stride(0), kv.shape[1], _p(pt), pt.stride(0),
+                _p(layer.k_norm.weight), _p(self.cos), _p(self.sin), self.rot, self.scale, _p(rows), _p(items[i0:]),
+                n_items, _p(groups[g0:]), n_groups, split, self.split_keys, n_dec, self.prefill_from,
+                self.prefill_keys, _p(out), _p(self.o_part) if split else _p(None),
+                _p(self.ml_part) if split else _p(None), _stream(q)), "attn512")

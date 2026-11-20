@@ -531,7 +531,7 @@ def test_batch_invariance_needs_a_short_context(tmp_path) -> None:
     assert cfg.dev.runner.cuda.batch_invariant is False
     why = cfg.reasons["dev.runner.cuda.batch_invariant"]
     assert why.startswith(f"off: model.max_model_len {config.BATCH_INVARIANT_MAX_LEN} is past {MAXL:,}")
-    assert "fewer, longer splits" in why and "a prefill row one however long its history" in why
+    assert "the longest context it is on at by default" in why and "position and keys alone" in why
     forced = derive(config.BATCH_INVARIANT_MAX_LEN, **{"dev.runner.cuda.batch_invariant": True})
     assert forced.dev.runner.cuda.batch_invariant is True
     assert derive(MAXL, **{"dev.runner.cuda.batch_invariant": False}).dev.runner.cuda.batch_invariant is False

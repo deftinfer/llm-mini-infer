@@ -31,6 +31,10 @@
 // tile after the last scales by exactly 1 and adds exactly 0. So the extra tiles a CTA visits do not change the
 // query's bits.
 //
+// **Full attention's sizes** (`attn_window_kernel<true>`, Qwen3.8's full layers, no window): a decode query at absolute
+// position p splits its keys at multiples of its own size, `split_keys` · 2^m (common.cuh `lmk_split_size`), so a tile
+// whose rows straddle a size boundary walks the union of their ranges and masks each row to its own.
+//
 // **Prefill rows** (`attn_window_prefill_kernel`: the many queries of a prompt; whole, no split). A tile is 64 query
 // rows (32 positions on Gemma 4). It reads the window's keys once for 4 times the queries. The decode CTA re-reads
 // them every 16 rows, and the L2 bandwidth bounds it (a 139-token prompt tail took 96 µs a layer). The CTA has 8
@@ -44,6 +48,12 @@
 // group's, in that order. The masking rule is the same, and a query's tiles fall in the same group whatever the
 // batch, so its bits depend on its keys alone. An image-span query (`kend`) also sees the later keys of its span
 // (keys [p − window_left, span end)) in the same pass. The tile's keys run to the largest key end of its queries.
+//
+// **The prefill split** (`attn_window_prefill_kernel<true>`, full attention only): a prefill query whose p + 1 keys pass
+// `whole` splits them at multiples of its own size from `split_keys` (common.cuh), each split one item writing the
+// tile's even and odd groups' merged, unnormalised state as fp32 partials, which `attn_window_merge_kernel<PROWS>`
+// combines in split order. A query with at most `whole` keys is written by the unsplit kernel (`<false>`), whose code
+// stays the unsplit path's; the split pass leaves it alone, even in a tile that straddles `whole`.
 //
 // Programmatic dependent launch (common.cuh): each kernel here waits for the kernel before it as its first
 // statement, then lets the next one launch.
@@ -59,7 +69,7 @@ constexpr int KT = 16;         // keys per KV tile
 constexpr int CHUNKS = D / 8;  // 16-byte chunks per key row
 constexpr int TILE_BYTES = KT * D * 2;
 constexpr float LOG2E = 1.4426950408889634f;
-constexpr int MAX_MERGE_SPLITS = 32;
+constexpr int MAX_MERGE_SPLITS = LMK_MAX_SPLITS;  // the merge's splits at most (common.cuh)
 
 struct Row {
   int slot, qstart, nq, kvlen;
@@ -120,6 +130,7 @@ struct Smem {
   float s[WARPS][ROWS][KT];                         // partial scores
 };
 
+template <bool CLASSES>
 __global__ void __launch_bounds__(THREADS, 2)
     attn_window_kernel(const bf16* __restrict__ q, int H, int G, int Hkv, const bf16* __restrict__ kv,
                        int64_t page_stride, int64_t plane_stride, int page_size, const int* __restrict__ wpt,
@@ -146,9 +157,13 @@ __global__ void __launch_bounds__(THREADS, 2)
   const int hi = min(rw.kvlen, p_last + 1);
   int k_begin = lo & ~(KT - 1), k_end = hi;  // KV tiles at absolute multiples of KT
   if (n_splits > 1) {  // split s: empty past hi (m = −inf, l = 0; the merge skips it)
-    const int s = lo / split_keys + j;
-    k_begin = max(k_begin, s * split_keys);
-    k_end = min(hi, (s + 1) * split_keys);
+    if constexpr (CLASSES) {  // full attention only (lo = 0): the union of the tile's rows' own split j (common.cuh)
+      lmk_split_union(p_first, p_last, j, split_keys, 0, k_begin, k_end);
+    } else {
+      const int s = lo / split_keys + j;
+      k_begin = max(k_begin, s * split_keys);
+      k_end = min(hi, (s + 1) * split_keys);
+    }
   }
   const int64_t item = blockIdx.x;
 
@@ -174,8 +189,8 @@ __global__ void __launch_bounds__(THREADS, 2)
   }
   __syncthreads();  // stage 0 now holds KV
 
-  // this thread's rows g and g + 8: absolute position, window start, validity
-  int rpos[2], rlo[2];
+  // this thread's rows g and g + 8: absolute position, window start, validity (full attention's sizes: its key end)
+  int rpos[2], rlo[2], rhi[2];
   bool rok[2];
 #pragma unroll
   for (int h = 0; h < 2; ++h) {
@@ -183,6 +198,17 @@ __global__ void __launch_bounds__(THREADS, 2)
     rok[h] = p < rw.nq;
     rpos[h] = q0 + p;
     rlo[h] = max(0, rpos[h] - window_left);
+    rhi[h] = k_end;
+    if constexpr (CLASSES) {  // [rlo, rhi): the tile's keys cut at the row's causal end, or its own split's range
+      rhi[h] = min(k_end, rpos[h] + 1);
+      if (n_splits > 1 && rok[h]) {
+        int a, b;
+        lmk_split_range(rpos[h], j, split_keys, 0, a, b);
+        rlo[h] = max(rlo[h], a);
+        rhi[h] = min(rhi[h], b);
+      }
+      if (!rok[h] || rhi[h] < rlo[h]) rhi[h] = rlo[h];
+    }
   }
   float o[8][4];
 #pragma unroll
@@ -260,7 +286,12 @@ __global__ void __launch_bounds__(THREADS, 2)
         v = fadd(v, sm.s[3][r][col]);
         const int key = kbase + col;
         const int h = e >> 1;
-        const bool ok = rok[h] && key < k_end && key <= rpos[h] && key >= rlo[h];
+        bool ok;
+        if constexpr (CLASSES) {
+          ok = (unsigned)(key - rlo[h]) < (unsigned)(rhi[h] - rlo[h]);  // rlo <= key < rhi
+        } else {
+          ok = rok[h] && key < k_end && key <= rpos[h] && key >= rlo[h];
+        }
         sc[n][e] = ok ? v * sl2 : -INFINITY;
       }
     }
@@ -369,13 +400,17 @@ struct PSmem {
   int hi[PWARPS];
 };
 
-// A prefill row's tile of 64 query rows (module comment above): item (row, tile of 64, KV head, unused). `kend` (or
-// null): int32 per token of q, the span end of an image-span query (0 elsewhere). The two groups run in step.
+// A prefill row's tile of 64 query rows (module comment above): item (row, tile of 64, KV head, unused; SPLIT: split
+// j | n << 16). `kend` (or null): int32 per token of q, the span end of an image-span query (0 elsewhere). The two
+// groups run in step. SPLIT (full attention, no spans): the tile's queries past `whole` keys, in their split j, into
+// the partials o_part [items, 64, D] and ml_part [items, 64, 2].
+template <bool SPLIT>
 __global__ void __launch_bounds__(PTHREADS, 1)
     attn_window_prefill_kernel(const bf16* __restrict__ q, int H, int G, int Hkv, const bf16* __restrict__ kv,
                                int64_t page_stride, int64_t plane_stride, int page_size, const int* __restrict__ wpt,
                                int64_t wpt_stride, int window_left, float scale, const Row* __restrict__ rows,
-                               const Item* __restrict__ items, const int* __restrict__ kend, bf16* __restrict__ out) {
+                               const Item* __restrict__ items, const int* __restrict__ kend, bf16* __restrict__ out,
+                               int whole, int split_keys, float* __restrict__ o_part, float* __restrict__ ml_part) {
   lmk_pdl_wait();  // PDL: read nothing a predecessor writes before this (common.cuh)
   lmk_pdl_trigger();
   extern __shared__ unsigned char smem_raw[];
@@ -388,6 +423,12 @@ __global__ void __launch_bounds__(PTHREADS, 1)
   const Row rw = rows[it.row];
   const int q0 = rw.kvlen - rw.nq;
   const int f0 = it.tile * PROWS;  // flattened f -> query position f / G, head kvh * G + f % G
+  [[maybe_unused]] const int j = it.split & 0xffff;  // SPLIT: this item's split
+  [[maybe_unused]] int s_lo = 0, s_hi = 0;  // SPLIT: the union of the split queries' ranges in split j
+  if constexpr (SPLIT) {
+    const int p0 = max(q0 + f0 / G, whole), p1 = q0 + min((f0 + PROWS - 1) / G, rw.nq - 1);
+    if (p0 <= p1) lmk_split_union(p0, p1, j, split_keys, whole, s_lo, s_hi);
+  }
   for (int c = tid; c < PROWS * CHUNKS; c += PTHREADS) {  // the Q tile is the first cp.async group
     const int r = c / CHUNKS, ch = c % CHUNKS;
     const int f = f0 + r, p = f / G;
@@ -403,6 +444,16 @@ __global__ void __launch_bounds__(PTHREADS, 1)
     const int f = f0 + 16 * wq + g + 8 * h, p = f / G;
     rlo[h] = max(0, q0 + p - window_left);
     rhi[h] = p < rw.nq ? max(q0 + p + 1, kend ? kend[rw.qstart + p] : 0) : 0;  // 0: no keys (past the row's queries)
+    if constexpr (SPLIT) {  // its keys in split j; none for a query taken whole (the unsplit kernel writes it)
+      if (p < rw.nq && q0 + p + 1 > whole) {
+        int a, b;
+        lmk_split_range(q0 + p, j, split_keys, whole, a, b);
+        rlo[h] = max(rlo[h], a);
+        rhi[h] = min(rhi[h], b);
+      } else {
+        rhi[h] = 0;
+      }
+    }
     hi = max(hi, rhi[h]);
   }
 #pragma unroll
@@ -410,7 +461,11 @@ __global__ void __launch_bounds__(PTHREADS, 1)
   if (lane == 0) sm.hi[warp] = hi;
   __syncthreads();
   hi = max(max(sm.hi[0], sm.hi[1]), max(sm.hi[2], sm.hi[3]));  // the tile's keys: [lo, hi)
-  const int k_begin = max(0, q0 + f0 / G - window_left) & ~(KT - 1);
+  int k_begin = max(0, q0 + f0 / G - window_left) & ~(KT - 1);
+  if constexpr (SPLIT) {
+    k_begin = s_lo;
+    hi = s_hi;
+  }
   const int n_tiles = hi > k_begin ? (hi - k_begin + KT - 1) / KT : 0;
   // this group's tiles: ti = first, first + 2, ... (absolute index k_begin / KT + ti ≡ grp mod 2)
   const int first = ((k_begin / KT) & 1) == grp ? 0 : 1;
@@ -572,6 +627,22 @@ __global__ void __launch_bounds__(PTHREADS, 1)
     lt += __shfl_xor_sync(0xffffffffu, lt, 1);  // the quad's shares, in a fixed order
     lt += __shfl_xor_sync(0xffffffffu, lt, 2);
     if (pidx >= rw.nq) continue;
+    if constexpr (SPLIT) {  // a split query's state, unnormalised, for the merge; a query taken whole: nothing
+      if (q0 + pidx + 1 <= whole) continue;
+      const int64_t item = blockIdx.x;
+      float* op = o_part + (item * PROWS + r) * D;
+#pragma unroll
+      for (int n = 0; n < D / 8; ++n) {
+        const int d = 8 * n + 2 * t4;
+        const float2 v = *reinterpret_cast<const float2*>(sm.merge.o + r * MO_STRIDE + d);
+        *reinterpret_cast<float2*>(op + d) = make_float2(o[n][2 * h] * s0 + v.x * s1, o[n][2 * h + 1] * s0 + v.y * s1);
+      }
+      if (t4 == 0) {
+        ml_part[(item * PROWS + r) * 2] = mx;
+        ml_part[(item * PROWS + r) * 2 + 1] = lt;
+      }
+      continue;
+    }
     const float inv = lt > 0.0f ? 1.0f / lt : 0.0f;
     bf16* dst = out + ((int64_t)(rw.qstart + pidx) * H + it.kvh * G + f % G) * D;
 #pragma unroll
@@ -590,31 +661,37 @@ __global__ void __launch_bounds__(PTHREADS, 1)
 // positions of the splits, whichever lanes they would use. Then every thread sums its dims over the splits. A group
 // of one split (its CTA wrote it), a padding group and a row past the row's queries exit. A split that none of the
 // row's keys reached (l = 0) weighs 0.
+// TR: the tile's query rows (ROWS for decode rows, PROWS for the prefill split, whose queries with at most `whole`
+// keys the unsplit kernel wrote).
+template <int TR>
 __global__ void attn_window_merge_kernel(int H, int G, const Row* __restrict__ rows, const Item* __restrict__ items,
                                          const int2* __restrict__ groups, const float* __restrict__ o_part,
-                                         const float* __restrict__ ml_part, bf16* __restrict__ out) {
+                                         const float* __restrict__ ml_part, bf16* __restrict__ out, int whole) {
   lmk_pdl_wait();  // PDL: read nothing a predecessor writes before this (common.cuh)
   lmk_pdl_trigger();
   __shared__ float wts[MAX_MERGE_SPLITS];
   __shared__ float inv_l;
-  const int2 grp = groups[blockIdx.x / ROWS];
+  const int2 grp = groups[blockIdx.x / TR];
   const int n_splits = grp.y;
   if (grp.x < 0 || n_splits <= 1) return;
-  const int r = blockIdx.x % ROWS;
+  const int r = blockIdx.x % TR;
   const int64_t i0 = grp.x;
   const Item it = items[i0];
   const Row rw = rows[it.row];
-  const int f = it.tile * ROWS + r, p = f / G;
+  const int f = it.tile * TR + r, p = f / G;
   if (p >= rw.nq) return;
+  if constexpr (TR != ROWS) {
+    if (rw.kvlen - rw.nq + p + 1 <= whole) return;
+  }
   if (threadIdx.x == 0) {
     float mx = -INFINITY;
     for (int s = 0; s < n_splits; ++s) {
-      const float* ml = ml_part + ((i0 + s) * ROWS + r) * 2;
+      const float* ml = ml_part + ((i0 + s) * TR + r) * 2;
       if (ml[1] > 0.0f) mx = fmaxf(mx, ml[0]);
     }
     float L = 0.0f;
     for (int s = 0; s < n_splits; ++s) {
-      const float* ml = ml_part + ((i0 + s) * ROWS + r) * 2;
+      const float* ml = ml_part + ((i0 + s) * TR + r) * 2;
       const float w = ml[1] > 0.0f ? exp2f(ml[0] - mx) : 0.0f;
       wts[s] = w;
       L += w * ml[1];
@@ -627,7 +704,7 @@ __global__ void attn_window_merge_kernel(int H, int G, const Row* __restrict__ r
   for (int s = 0; s < n_splits; ++s) {
     const float w = wts[s];
     if (w == 0.0f) continue;
-    const float4 v = *reinterpret_cast<const float4*>(o_part + ((i0 + s) * ROWS + r) * D + d);
+    const float4 v = *reinterpret_cast<const float4*>(o_part + ((i0 + s) * TR + r) * D + d);
     acc.x += w * v.x;
     acc.y += w * v.y;
     acc.z += w * v.z;
@@ -659,16 +736,17 @@ LMK_API int lmk_attn_window(const void* q, int H, int Hkv, const void* kv, int64
   const int smem = (int)sizeof(Smem);
   static bool init = false;
   if (!init) {
-    cudaFuncSetAttribute(attn_window_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    cudaFuncSetAttribute(attn_window_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     init = true;
   }
-  const int st = lmk_launch(attn_window_kernel, dim3(n_items), dim3(THREADS), smem, stream, (const bf16*)q, H, G, Hkv,
-                            (const bf16*)kv, page_stride, plane_stride, page_size, (const int*)wpage_table, wpt_stride,
-                            window_left, scale, (const Row*)rows, (const Item*)items, split_keys, (bf16*)out,
-                            (float*)o_part, (float*)ml_part);
+  const int st = lmk_launch(attn_window_kernel<false>, dim3(n_items), dim3(THREADS), smem, stream, (const bf16*)q, H, G,
+                            Hkv, (const bf16*)kv, page_stride, plane_stride, page_size, (const int*)wpage_table,
+                            wpt_stride, window_left, scale, (const Row*)rows, (const Item*)items, split_keys,
+                            (bf16*)out, (float*)o_part, (float*)ml_part);
   if (st) return st;
-  return lmk_launch(attn_window_merge_kernel, dim3(n_groups * ROWS), dim3(D / 4), 0, stream, H, G, (const Row*)rows,
-                    (const Item*)items, (const int2*)groups, (const float*)o_part, (const float*)ml_part, (bf16*)out);
+  return lmk_launch(attn_window_merge_kernel<ROWS>, dim3(n_groups * ROWS), dim3(D / 4), 0, stream, H, G,
+                    (const Row*)rows, (const Item*)items, (const int2*)groups, (const float*)o_part,
+                    (const float*)ml_part, (bf16*)out, 0);
 }
 
 // Prefill rows (module comment above). items: int32 [n_items, 4] (row, tile of 64 query rows, KV head, 0). rows, q,
@@ -684,12 +762,13 @@ LMK_API int lmk_attn_window_prefill(const void* q, int H, int Hkv, const void* k
   const int smem = (int)sizeof(PSmem);
   static bool init = false;
   if (!init) {
-    cudaFuncSetAttribute(attn_window_prefill_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    cudaFuncSetAttribute(attn_window_prefill_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     init = true;
   }
-  return lmk_launch(attn_window_prefill_kernel, dim3(n_items), dim3(PTHREADS), smem, stream, (const bf16*)q, H, G, Hkv,
-                    (const bf16*)kv, page_stride, plane_stride, page_size, (const int*)wpage_table, wpt_stride,
-                    window_left, scale, (const Row*)rows, (const Item*)items, (const int*)kend, (bf16*)out);
+  return lmk_launch(attn_window_prefill_kernel<false>, dim3(n_items), dim3(PTHREADS), smem, stream, (const bf16*)q, H,
+                    G, Hkv, (const bf16*)kv, page_stride, plane_stride, page_size, (const int*)wpage_table,
+                    wpt_stride, window_left, scale, (const Row*)rows, (const Item*)items, (const int*)kend,
+                    (bf16*)out, 0, 0, (float*)nullptr, (float*)nullptr);
 }
 
 // Full causal attention on the kernels above (Qwen3.8's full layers under batch invariance; kernels/attn_window.py
@@ -697,9 +776,11 @@ LMK_API int lmk_attn_window_prefill(const void* q, int H, int Hkv, const void* k
 // a tile's keys start at 0. Any GQA group G works. A tile's 16 (decode) or 64 (prefill) rows are (position, head)
 // pairs in that order, whatever divides them. With G = 6 the heads of a position may straddle two tiles. Each row is
 // its own query, and its bits depend on its keys alone. The page table is the slot's own (by absolute page). A
-// decode row's split count n comes from its own length (at most the merge's 32). Split s holds the keys
-// [s × split_keys, (s + 1) × split_keys). The arguments are those of `lmk_attn_window` and
-// `lmk_attn_window_prefill`, without the window.
+// decode query's splits come from its own position (common.cuh: sizes from `split_keys`, at most the merge's 32), its
+// group's count n from the most its rows may take (kernels/attn_window.py). The arguments are those of
+// `lmk_attn_window` and `lmk_attn_window_prefill`, without the window. `lmk_attn_full_prefill_split`: the prefill
+// split's items (row, 64-row tile, KV head, j | n << 16) and their groups, for the queries past `whole` keys (sizes
+// from `split_keys`), into o_part [n_items, 64, 256] fp32 and ml_part [n_items, 64, 2], merged in split order.
 constexpr int kNoWindow = 0x7fffffff;  // window_left: p − kNoWindow is below 0 for every position p
 
 LMK_API int lmk_attn_full(const void* q, int H, int Hkv, const void* kv, int64_t page_stride, int64_t plane_stride,
@@ -711,16 +792,17 @@ LMK_API int lmk_attn_full(const void* q, int H, int Hkv, const void* kv, int64_t
   const int G = H / Hkv, smem = (int)sizeof(Smem);
   static bool init = false;
   if (!init) {
-    cudaFuncSetAttribute(attn_window_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    cudaFuncSetAttribute(attn_window_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     init = true;
   }
-  const int st = lmk_launch(attn_window_kernel, dim3(n_items), dim3(THREADS), smem, stream, (const bf16*)q, H, G, Hkv,
-                            (const bf16*)kv, page_stride, plane_stride, page_size, (const int*)page_table, pt_stride,
-                            kNoWindow, scale, (const Row*)rows, (const Item*)items, split_keys, (bf16*)out,
-                            (float*)o_part, (float*)ml_part);
+  const int st = lmk_launch(attn_window_kernel<true>, dim3(n_items), dim3(THREADS), smem, stream, (const bf16*)q, H, G,
+                            Hkv, (const bf16*)kv, page_stride, plane_stride, page_size, (const int*)page_table,
+                            pt_stride, kNoWindow, scale, (const Row*)rows, (const Item*)items, split_keys,
+                            (bf16*)out, (float*)o_part, (float*)ml_part);
   if (st) return st;
-  return lmk_launch(attn_window_merge_kernel, dim3(n_groups * ROWS), dim3(D / 4), 0, stream, H, G, (const Row*)rows,
-                    (const Item*)items, (const int2*)groups, (const float*)o_part, (const float*)ml_part, (bf16*)out);
+  return lmk_launch(attn_window_merge_kernel<ROWS>, dim3(n_groups * ROWS), dim3(D / 4), 0, stream, H, G,
+                    (const Row*)rows, (const Item*)items, (const int2*)groups, (const float*)o_part,
+                    (const float*)ml_part, (bf16*)out, 0);
 }
 
 LMK_API int lmk_attn_full_prefill(const void* q, int H, int Hkv, const void* kv, int64_t page_stride,
@@ -732,10 +814,34 @@ LMK_API int lmk_attn_full_prefill(const void* q, int H, int Hkv, const void* kv,
   const int G = H / Hkv, smem = (int)sizeof(PSmem);
   static bool init = false;
   if (!init) {
-    cudaFuncSetAttribute(attn_window_prefill_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    cudaFuncSetAttribute(attn_window_prefill_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     init = true;
   }
-  return lmk_launch(attn_window_prefill_kernel, dim3(n_items), dim3(PTHREADS), smem, stream, (const bf16*)q, H, G, Hkv,
-                    (const bf16*)kv, page_stride, plane_stride, page_size, (const int*)page_table, pt_stride, kNoWindow,
-                    scale, (const Row*)rows, (const Item*)items, (const int*)nullptr, (bf16*)out);
+  return lmk_launch(attn_window_prefill_kernel<false>, dim3(n_items), dim3(PTHREADS), smem, stream, (const bf16*)q, H,
+                    G, Hkv, (const bf16*)kv, page_stride, plane_stride, page_size, (const int*)page_table, pt_stride,
+                    kNoWindow, scale, (const Row*)rows, (const Item*)items, (const int*)nullptr, (bf16*)out, 0, 0,
+                    (float*)nullptr, (float*)nullptr);
+}
+
+LMK_API int lmk_attn_full_prefill_split(const void* q, int H, int Hkv, const void* kv, int64_t page_stride,
+                                        int64_t plane_stride, int page_size, const void* page_table, int64_t pt_stride,
+                                        float scale, const void* rows, const void* items, int n_items,
+                                        const void* groups, int n_groups, int whole, int split_keys, void* out,
+                                        void* o_part, void* ml_part, cudaStream_t stream) {
+  if (n_items <= 0) return 0;
+  if (H % Hkv || page_size % KT || n_groups <= 0 || whole < 0 || split_keys < KT || split_keys % KT) return -1;
+  const int G = H / Hkv, smem = (int)sizeof(PSmem);
+  static bool init = false;
+  if (!init) {
+    cudaFuncSetAttribute(attn_window_prefill_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    init = true;
+  }
+  const int st = lmk_launch(attn_window_prefill_kernel<true>, dim3(n_items), dim3(PTHREADS), smem, stream,
+                            (const bf16*)q, H, G, Hkv, (const bf16*)kv, page_stride, plane_stride, page_size,
+                            (const int*)page_table, pt_stride, kNoWindow, scale, (const Row*)rows, (const Item*)items,
+                            (const int*)nullptr, (bf16*)out, whole, split_keys, (float*)o_part, (float*)ml_part);
+  if (st) return st;
+  return lmk_launch(attn_window_merge_kernel<PROWS>, dim3(n_groups * PROWS), dim3(D / 4), 0, stream, H, G,
+                    (const Row*)rows, (const Item*)items, (const int2*)groups, (const float*)o_part,
+                    (const float*)ml_part, (bf16*)out, whole);
 }

@@ -135,16 +135,14 @@ def test_attn_cases() -> None:
 
 
 def test_attn_timing_grid() -> None:
-    """The default grid's steps and their exact lengths, the Ms a step runs at, the on path's split per M."""
-    from llm_mini_infer.kernels.attn512 import MAX_SPLITS, fixed_split_keys, fixed_splits
-
+    """The default grid's steps and their exact lengths, and the prefill split bases a step is timed at."""
     a = nk.build_parser().parse_args(["attn-timing"])
-    ms, k = nfo.parse_ids(a.max_model_lens), a.k
+    k = a.k
     cases = nk.timing_cases(nfo.parse_ids(a.short_chunks), nfo.parse_ids(a.histories), a.long_chunk,
                             nfo.parse_ids(a.long_histories), nfo.parse_ids(a.decode_rows),
                             nfo.parse_ids(a.decode_histories), k)
     by = {c.name: c for c in cases}
-    assert len(cases) == len(by) == 2 * 3 + 2 + 2 * 3 and ms == [8184, 32768, 131072, 262144]
+    assert len(cases) == len(by) == 2 * 3 + 2 + 2 * 3 and a.max_model_len == 262144 and a.prefill_from == 8192
     assert all(not c.uncertain for c in cases)
     c = by["prefill-short-256-h131072"]
     assert (c.n_dec, c.nq.tolist(), c.ub.tolist()) == (0, [256], [131072 + 256])
@@ -153,31 +151,20 @@ def test_attn_timing_grid() -> None:
     c = by["decode-64-h32768"]
     assert c.n_dec == 64 and (c.nq == 4).all() and (c.ub == 32768 + 4).all() and nk.case_history(c) == 32768
     np.testing.assert_array_equal(c.starts, np.arange(64) * 4)
-    for c in cases:  # prefill rows once (M = any); verify rows at every M, skipped where a row is past M + 1 + k
-        got = nk.timing_ms(c, ms, k)
-        if not c.n_dec:
-            assert got == [(None, False)]
-        else:
-            assert [m for m, _ in got] == ms
-            assert all(skip == (int(c.ub.max()) > m + 1 + k) for m, skip in got)
-    assert nk.timing_ms(by["decode-1-h1024"], ms, k, per_m=False) == [(None, False)]
-    assert nk.timing_ms(by["decode-1-h32768"], ms, k) == [(8184, True), (32768, False), (131072, False),
-                                                           (262144, False)]
-    for m in ms:
-        c = by["decode-1-h1024"]
-        assert nk.on_max_kv(c, m, k) == m + 1 + k and nk.on_split_keys(c, m, k) == fixed_split_keys(m + 1 + k)
-        assert int(fixed_splits(m + 1 + k, nk.on_split_keys(c, m, k))) <= MAX_SPLITS
-    c = by["decode-1-h1024"]
-    assert nk.on_split_keys(c, 8184, k) == 256 and nk.on_split_keys(c, 262144, k) > 256
-    assert nk.on_max_kv(by["prefill-short-64-h8192"], None, k) == 8192 + 64
+    sps = nfo.parse_ids(a.prefill_keys)
+    assert sps == [0]  # each part's own base
+    sps = [8192, 4096, 2048]
+    for c in cases:  # a prefill step at each base on the full layers; decode steps and the sliding layers once
+        assert nk.timing_variants(c, sps, True) == ([None] if c.n_dec else sps)
+        assert nk.timing_variants(c, sps, False) == [None]
 
 
 def test_timing_ratios() -> None:
-    def rec(impl: str, mode: str, us: float | None, m: int | None = None) -> dict:
-        return {"case": "c", "impl": impl, "mode": mode, "m": m, **({} if us is None else {"median_us": us})}
+    def rec(impl: str, mode: str, us: float | None, sp: int | None = None) -> dict:
+        return {"case": "c", "impl": impl, "mode": mode, "sp": sp, **({} if us is None else {"median_us": us})}
 
-    recs = [rec("off", "eager", 50.0), rec("off", "graph", 20.0), rec("on", "eager", 25.0, 8184),
-            rec("on", "graph", 30.0, 8184), rec("on", "eager", None, 32768), rec("on", "bucket", 5.0, 8184)]
+    recs = [rec("off", "eager", 50.0), rec("off", "graph", 20.0), rec("on", "eager", 25.0, 8192),
+            rec("on", "graph", 30.0, 8192), rec("on", "eager", None, 4096), rec("on", "bucket", 5.0, 8192)]
     nk.timing_ratios(recs)
     assert [r.get("ratio") for r in recs[2:]] == [0.5, 1.5, None, None]
 

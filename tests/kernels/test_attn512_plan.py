@@ -121,19 +121,60 @@ def test_graph_capacity_covers_every_real_count() -> None:
             assert cap <= max(ITEMS + bucket * per_row, bucket * per_row)
 
 
-def test_the_fixed_split_takes_each_rows_own_count() -> None:
-    """The fixed split (answer reproducibility): a decode row's split count is its KV length's in `split_keys` keys,
-    at least one; longer rows widen the split so a row keeps to the merge's lanes."""
-    assert am.fixed_split_keys(4096 + 6) == am.SPLIT_KEYS == 256
-    assert am.fixed_split_keys(9000) == 288  # ceil(9,000 / 32) = 282, rounded up to 16
-    assert am.fixed_split_keys(131_072) == 4096
-    assert am.fixed_splits(4096 + 6, am.fixed_split_keys(4096 + 6)) <= am.MAX_SPLITS
-    np.testing.assert_array_equal(am.fixed_splits([1, 6, 256, 257, 2700, 4102], 256), [1, 1, 1, 2, 11, 17])
-    # per-row counts make each row's groups (decode rows split by their own length, a prefill row whole)
-    items, groups = am.plan_items(np.asarray([6, 6, 40]), G, HKV, am.fixed_splits([2700, 300, 1], 256))
-    per = am.tiles(6, G) * HKV
-    assert (groups[:per, 1] == 11).all() and (groups[per:2 * per, 1] == 2).all() and (groups[2 * per:, 1] == 1).all()
-    assert len(items) == per * (11 + 2) + am.tiles(40, G) * HKV
+def test_the_fixed_split_sizes_a_query_from_its_own_position() -> None:
+    """The fixed split (answer reproducibility): a query's split is 256 keys while its keys fit 32 of them, then doubles
+    (at most 32 splits), whatever the context; a prefill query takes its keys whole up to PREFILL_FROM."""
+    assert am.SPLIT_KEYS == 256 and am.PREFILL_FROM == 8192
+    np.testing.assert_array_equal(am.split_size([0, 8191, 8192, 16383, 16384, 262143], 256),
+                                  [256, 256, 512, 512, 1024, 8192])
+    np.testing.assert_array_equal(am.query_splits([0, 255, 256, 2699, 4101, 8191, 8192, 262143], 256),
+                                  [1, 1, 2, 11, 17, 32, 17, 32])
+    # today's counts at up to 8,192 keys: a row of KV length kv took ceil(kv / 256)
+    kv = np.arange(1, 8193)
+    np.testing.assert_array_equal(am.query_splits(kv - 1, 256), -(-kv // 256))
+    # a prefill query: whole up to 8,192 keys, past it from its own base
+    np.testing.assert_array_equal(am.query_splits([8191, 8192, 32767, 131071], 2048, 8192), [1, 5, 16, 32])
+    np.testing.assert_array_equal(am.query_splits([8191, 8192, 32767, 131071], 8192, 8192), [1, 2, 4, 16])
+
+
+def test_a_rows_count_is_the_most_over_its_possible_positions() -> None:
+    """Under MTP a verify row's queries lie anywhere from its lowest possible length to its planned one: across a size
+    boundary the count is the 32 of the position just before it, not the planned length's (17 there)."""
+    pos = np.arange(0, 40000)
+    q = am.query_splits(pos, 256)
+    for lo, hi in ((8180, 8195), (8191, 8192), (8192, 8200), (100, 106), (16380, 16390), (0, 39999)):
+        assert am.range_splits(lo, hi, 256) == q[lo:hi + 1].max()
+    assert am.range_splits(8187, 8195, 256) == 32 and am.query_splits(8195, 256) == 17
+    # a decode bucket's per-row counts from (lowest, planned) KV lengths: past the boundary 17; a row whose 6 queries
+    # (positions kv - 6 to kv - 1) straddle it, or whose lowest length lies before it, 32
+    nq, ub = np.asarray([6, 6, 6, 6]), np.asarray([8205, 300, 8196, 8205])
+    np.testing.assert_array_equal(am.range_splits(np.asarray([8205, 300, 8196, 8195]) - nq, ub - 1, 256),
+                                  [17, 2, 32, 32])
+
+
+def test_prefill_tiles_take_the_splits_their_positions_meet() -> None:
+    """A prefill row's tiles of 2 positions (G = 8): one split while a tile's keys are at most PREFILL_FROM, then each
+    tile its own count, a tile straddling the threshold taking its last position's."""
+    nq, kv = np.asarray([8]), np.asarray([8196])  # positions 8188-8195
+    first, last = am.tile_positions(nq, kv, G)
+    np.testing.assert_array_equal(first, [8188, 8190, 8192, 8194])
+    np.testing.assert_array_equal(last, [8189, 8191, 8193, 8195])
+    np.testing.assert_array_equal(am.range_splits(first, last, 2048, 8192), [1, 1, 5, 5])
+    items, groups = am.tile_items(nq, G, HKV, am.range_splits(first, last, 2048, 8192))
+    assert len(groups) == 4 * HKV and list(groups[:, 1]) == [1] * 8 + [5] * 8 and len(items) == 8 + 40
+    np.testing.assert_array_equal(am.tile_positions(np.asarray([1, 5]), np.asarray([10, 300]), 6, 64)[0], [9, 295])
+
+
+def test_a_steps_split_items_past_the_partials_run_in_more_launches() -> None:
+    """Each launch's groups' items sit within the partials when indexed from its first item; a step whose groups never
+    split is one launch, however many items."""
+    groups = np.stack([np.arange(100), np.ones(100, np.int64)], axis=1)
+    assert am.launches(groups, 10) == [(0, 100, 0, 100)]
+    n = np.asarray([3, 5, 1, 1, 8, 2, 7, 1])
+    groups = np.stack([np.cumsum(n) - n, n], axis=1)
+    runs = am.launches(groups, 10)
+    assert runs == [(0, 10, 0, 4), (10, 10, 4, 2), (20, 8, 6, 2)]
+    assert am.launches(groups, 1000) == [(0, int(n.sum()), 0, len(n))]
 
 
 def test_the_window_kernels_splits_cover_a_tile() -> None:

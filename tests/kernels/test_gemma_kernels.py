@@ -274,8 +274,8 @@ def test_attn512_split_counts_agree(qo) -> None:
         got = torch.full_like(q, float("nan"))
         ops._check(build.load().lmk_attn512(
             ops._p(q), 32, 4, ops._p(fkv), fkv.stride(0), 16, ops._p(table), table.stride(0), ops._p(kw), ops._p(cos),
-            ops._p(sin), 64, 1.0, ops._p(rr), ops._p(it), len(items), ops._p(gt), len(groups), split, 0, ops._p(got),
-            ops._p(o_part), ops._p(ml), ops._stream(q)), "attn512")
+            ops._p(sin), 64, 1.0, ops._p(rr), ops._p(it), len(items), ops._p(gt), len(groups), split, 0, 0, 0, 0,
+            ops._p(got), ops._p(o_part), ops._p(ml), ops._stream(q)), "attn512")
         torch.cuda.synchronize()
         assert torch.isfinite(got).all(), splits
         assert (got.float() - want.float()).abs().max().item() < 2e-2, splits
@@ -316,8 +316,8 @@ def test_attn512_staged_tables_change_no_bit(ps, splits) -> None:
         got = torch.full_like(q, float("nan"))
         ops._check(build.load().lmk_attn512(
             ops._p(q), 32, 4, ops._p(pool), pool.stride(0), size, ops._p(pt), pt.stride(0), ops._p(kw), ops._p(cos),
-            ops._p(sin), rot, 1.0, ops._p(rr), ops._p(it), len(items), ops._p(gt), len(groups), int(splits > 1), 0,
-            ops._p(got), ops._p(o_part), ops._p(ml), ops._stream(q)), "attn512")
+            ops._p(sin), rot, 1.0, ops._p(rr), ops._p(it), len(items), ops._p(gt), len(groups), int(splits > 1), 0, 0,
+            0, 0, ops._p(got), ops._p(o_part), ops._p(ml), ops._stream(q)), "attn512")
         torch.cuda.synchronize()
         outs.append(got)
     assert torch.isfinite(outs[0]).all()
@@ -599,6 +599,200 @@ def test_attn512_fixed_split_is_batch_invariant() -> None:
     alone, s1 = run(waves, [(1, p, qo, 0)])
     beside, s2 = run(waves, [*[(s, lens[s - 1] - qo, qo, 0) for s in range(2, 10)], (1, p, qo, 0)])
     assert not torch.equal(alone[s1[0]], beside[s2[-1]])
+
+
+# -- the fixed split by each query's own position (long contexts; prefill) -------------------------------------------
+
+
+def _split_case(lens: list[int], seed: int):
+    """Slots 1.. of `lens[i]` positions on shuffled pages, and slot 1's (the subject's) query at each of its positions:
+    a query at a position has the same values wherever a test places it."""
+    from types import SimpleNamespace
+
+    h, hkv, ps, d = 32, 4, 16, 512
+    torch.manual_seed(seed)
+    npg = [-(-n // ps) for n in lens]
+    fkv = (torch.randn(sum(npg) + 1, ps, hkv, d, device=DEV) * 0.5).to(BF)
+    table = torch.zeros(len(lens) + 1, max(npg) + 2, dtype=torch.int32, device=DEV)
+    perm = torch.randperm(sum(npg), device=DEV) + 1
+    o = 0
+    for i, n in enumerate(npg):
+        table[i + 1, :n] = perm[o:o + n].int()
+        o += n
+    q = (torch.randn(lens[0], h, d, device=DEV) * 0.06).to(BF)
+    kw = (torch.randn(d, device=DEV) * 0.3 + 1).to(BF)
+    cos, sin = _rope_tables(d, 64, 8192)
+    return SimpleNamespace(fkv=fkv, table=table, q=q, kw=kw, cos=cos, sin=sin, h=h, hkv=hkv, ps=ps, d=d)
+
+
+def _split_attn(case, *, max_rows: int, max_kv: int, qo: int = 6, split_keys: int = 16, prefill_from: int = 64,
+                prefill_keys: int = 32):
+    from llm_mini_infer.kernels.attn512 import Attn512
+
+    return Attn512(_Pools(case.fkv[None], case.ps), _Rot(case.cos, case.sin), case.h, case.hkv, 64,
+                   torch.device(DEV), max_tokens=4096, max_rows=max_rows, qo_per_row=qo, split_keys=split_keys,
+                   max_kv=max_kv, prefill_from=prefill_from, prefill_keys=prefill_keys)
+
+
+def _split_run(case, a, rows: list[tuple[int, int, int, int]], *, bucket: int = 0, fixed: int | None = None,
+               graph: bool = False, gap: int = 0, qo: int = 6):
+    """One step of `rows` (slot, first query position, queries, planned KV length above the true one), the first
+    `fixed` (None: all) decode rows and the rest prefill rows, each decode row planned from the lowest KV length `gap`
+    below its true one. With `bucket`: the decode bucket's tables (padding rows on the null page after the real ones),
+    and with `graph` run in a CUDA graph. Returns slot 1's output by query position (at most one row of the step is
+    slot 1's) and the step's launches."""
+    from types import SimpleNamespace
+
+    stage = lambda a_: torch.from_numpy(np.ascontiguousarray(a_, np.int32)).pin_memory()  # noqa: E731
+    rr, qs, true, at, where = [], [], [], 0, None
+    for slot, p0, nq, extra in rows:
+        rr.append((slot, at, nq, p0 + nq + extra))
+        true.append(p0 + nq)
+        if slot == 1:  # the other rows' queries are any (they never reach slot 1's output)
+            qs.append(case.q[p0:p0 + nq])
+            where = (at, p0, nq)
+        else:
+            qs.append((torch.randn(nq, case.h, case.d, device=DEV) * 0.06).to(BF))
+        at += nq
+    n = len(rows)
+    lb = np.maximum(np.asarray(true) - gap, [r[2] for r in rows])
+    if bucket:
+        rr += [(0, at + qo * i, qo, qo) for i in range(bucket - n)]
+        qs.append(torch.zeros((bucket - n) * qo, case.h, case.d, dtype=BF, device=DEV))
+        true += [qo] * (bucket - n)
+    q = torch.cat(qs).contiguous()
+    meta = SimpleNamespace(page_table=case.table, fix_len=True, n_rows=len(rr),
+                           kv_len_dev=torch.as_tensor(true, dtype=torch.int64, device=DEV))
+    rows_np = np.asarray(rr, np.int32)
+    out = torch.full_like(q, float("nan"))
+    if bucket:
+        a.plan_graph(meta, bucket=bucket, rows=rows_np, stage=stage, real=n, lb=lb)
+    else:
+        a.plan(meta, parity=0, rows=rows_np, stage=stage, fixed_rows=n if fixed is None else fixed, lb=lb)
+    if graph:
+        g = _replay_on_a_side_stream(lambda: a.run(meta, _Layer(case.kw), q, out))
+        out.fill_(float("nan"))
+        g.replay()
+    else:
+        a.run(meta, _Layer(case.kw), q, out)
+    torch.cuda.synchronize()
+    start, p0, nq = where
+    assert torch.isfinite(out).all()
+    return {p0 + j: out[start + j].clone() for j in range(nq)}, meta.full_plan[4]
+
+
+def test_attn512_query_sizes_are_batch_invariant() -> None:
+    """The fixed split sizes each query's splits from its own position (`split_keys` · 2^m, doubling where its keys
+    pass 32 splits; 16 keys here, so past 512, 1,024, ... keys): a verify row's queries at positions across a size
+    boundary (the split count drops there, a tile's two positions may straddle it) give the same bits for each
+    position whatever else shares the step and wherever its row's window lies: alone, with its window ending a few
+    positions earlier or later, beside eight other verify rows, in a decode bucket with padding rows (eagerly and in a
+    CUDA graph), planned for an upper bound with the lowest possible length below the true one (a true length just
+    under a boundary while the bound is past it), and beside a prefill row; and within BF16 rounding of the fp32
+    reference."""
+    ps, qo = 16, 6
+    lens = [2200, 1100, 700, 2100, 300, 1500, 900, 2050, 64]  # slot 1 the subject's, the rest companions'
+    case = _split_case(lens, seed=47)
+    a = _split_attn(case, max_rows=16, max_kv=lens[0] + qo)
+    others = [(s, lens[s - 1] - qo, qo, 0) for s in range(2, 10)]  # eight companions' verify rows
+    sizes = ((516, 512), (1026, 1024), (2050, 2048), (300, 0), (800, 0), (1500, 0))  # window end, size boundary
+    for end, bound in sizes:  # the window covers p + 1 = end - 5 .. end: 511..516, 1021..1026, 2045..2050
+        def at(shift: int, extra: int = 0, end: int = end) -> tuple[int, int, int, int]:
+            return (1, end + shift - qo, qo, extra)
+
+        configs = [
+            ([at(0)], {}),  # alone: the base
+            ([at(1)], {}),  # its window one later: the tile's positions pair differently
+            ([at(-1, 4)], {"gap": 2}),  # one earlier, planned for an upper bound
+            ([at(3, 6)], {"gap": 3}),
+            ([*others, at(0)], {}),  # beside eight rows, last
+            ([at(-2), *others[:3]], {}),  # first
+            ([at(1, 5), *others[:3]], {"bucket": 16, "gap": 2}),  # a decode bucket's tables with padding rows
+            ([*others[:5], at(-3, 3)], {"bucket": 16, "gap": 1, "graph": True}),  # and in a CUDA graph
+            ([at(0), (2, 600, 40, 0)], {"fixed": 1}),  # beside a prefill row (its queries past prefill_from split)
+            ([*others[:3], at(2), (5, 100, 70, 0)], {"fixed": 4}),
+        ]
+        if bound:  # the true length under the boundary, the bound past it: its split count is the most (32)
+            configs += [([(1, bound - qo, qo, 8)], {"gap": 2}),
+                        ([(1, bound - qo, qo, 8), *others[:3]], {"bucket": 16, "gap": 2, "graph": True})]
+        base, _ = _split_run(case, a, configs[0][0])
+        assert len(base) == qo
+        for rows, kw_run in configs[1:]:
+            got, _ = _split_run(case, a, rows, **kw_run)
+            shared = [p for p in got if p in base]
+            assert shared, (end, rows)
+            for p in shared:
+                assert torch.equal(base[p], got[p]), (end, p, rows, kw_run)
+        for p, row in base.items():
+            want = _full_ref([(1, p + 1)], case.fkv, case.table[[0, 1]], case.q[p:p + 1].contiguous(), case.kw,
+                             case.cos, case.sin, ps)[0]
+            assert (row.float() - want.float()).abs().max().item() < 2e-2, (end, p)
+
+
+def test_attn512_prefill_split_is_chunk_invariant() -> None:
+    """A prefill query takes its keys whole up to `prefill_from` and splits them past it at absolute multiples of its
+    own size (`prefill_keys` · 2^m): one prompt's positions 40..700 (`prefill_from` 64, 32 keys a split) give the same
+    bits for each query as one prefill row and as consecutive chunks of other lengths and offsets (a chunk of one
+    token, a chunk that cuts a tile of 16 query rows between two positions, chunks that begin before and past 64),
+    each chunk alone and beside decode rows (verify rows first) and another prefill row; and within BF16 rounding of
+    the reference. The step's split items pass the partial buffer: the chunk runs in several launches."""
+    ps, qo, p0, end = 16, 6, 40, 701
+    lens = [end, 1100, 900, 400]
+    case = _split_case(lens, seed=53)
+    a = _split_attn(case, max_rows=16, max_kv=1200)
+    dec = [(2, lens[1] - qo, qo, 0), (3, lens[2] - qo, qo, 3)]  # decode rows, the second planned above its length
+    side = (4, 100, 50, 0)  # another prefill row
+
+    def prompt(chunks: list[int], beside: bool) -> torch.Tensor:
+        outs, at, many = {}, p0, 0
+        for n in chunks:
+            row = (1, at, n, 0)
+            if beside:
+                got, runs = _split_run(case, a, [*dec, row, side], fixed=len(dec), gap=2)
+            else:
+                got, runs = _split_run(case, a, [row], fixed=0)
+            outs.update(got)
+            many = max(many, len(runs))
+            at += n
+        assert sorted(outs) == list(range(p0, end))
+        assert many > 1, chunks  # the chunks' items pass the partial buffer: several launches
+        return torch.stack([outs[p] for p in range(p0, end)])
+
+    base = prompt([end - p0], beside=False)
+    for chunks in ([end - p0], [24, 637], [100, 1, 560], [333, 328]):
+        for beside in (False, True):
+            assert torch.equal(prompt(chunks, beside), base), (chunks, beside)
+    want = _full_ref([(end - p0, end)], case.fkv, case.table[[0, 1]], case.q[p0:end].contiguous(), case.kw, case.cos,
+                     case.sin, ps)
+    assert (base.float() - want.float()).abs().max().item() < 2e-2
+
+
+def test_attn512_prefill_below_the_threshold_is_unsplit() -> None:
+    """The prefill split changes no bit of a query whose keys are at most `prefill_from` (p + 1 <= 64): positions
+    41..63 of a prompt equal the unsplit path's (an instance whose `prefill_from` is past the prompt), though the tile
+    of positions 63 and 64 splits for 64's sake and the merge of its one live split for 63 must equal the direct
+    write; the later positions differ (the control: the split took effect). And the split launches cut by a small
+    partial buffer (`max_rows` 1: a few hundred items) give the bits of one launch, for every query."""
+    ps, p0, end = 16, 41, 301
+    case = _split_case([end], seed=59)
+    split = _split_attn(case, max_rows=32, max_kv=end)
+    small = _split_attn(case, max_rows=1, max_kv=end)
+    whole = _split_attn(case, max_rows=1, max_kv=end, prefill_from=1 << 20)
+    row = [(1, p0, end - p0, 0)]
+    got, runs = _split_run(case, split, row, fixed=0)
+    cut, cut_runs = _split_run(case, small, row, fixed=0)
+    unsplit, one = _split_run(case, whole, row, fixed=0)
+    assert len(runs) == 1 and len(cut_runs) > 2 and len(one) == 1
+    assert sorted(got) == sorted(cut) == sorted(unsplit) == list(range(p0, end))
+    for p in range(p0, end):
+        assert torch.equal(got[p], cut[p]), p  # one launch and several
+    for p in range(p0, 64):
+        assert torch.equal(got[p], unsplit[p]), p  # p + 1 <= 64
+    assert any(not torch.equal(got[p], unsplit[p]) for p in range(64, end))
+    want = _full_ref([(end - p0, end)], case.fkv, case.table[[0, 1]], case.q[p0:end].contiguous(), case.kw, case.cos,
+                     case.sin, ps)
+    for p in range(p0, end):
+        assert (got[p].float() - want[p - p0].float()).abs().max().item() < 2e-2, p
 
 
 # -- the sliding window on our kernel (answer reproducibility: kernels/attn_window.py) --------------------------------

@@ -340,7 +340,8 @@ class ForcedRun:
 
     def add(self, rid: int) -> None:
         ids, refs = self.prompts[rid]
-        self.run.add(rid, ids, max_tokens=80, grammar=f"forced:{rid}", ignore_eos=False, images=refs)
+        self.run.add(rid, ids, max_tokens=max(80, len(self.answers[rid]) + 8), grammar=f"forced:{rid}",
+                     ignore_eos=False, images=refs)
 
     def steps(self, n: int) -> None:
         """`n` turns of the engine, their outputs kept (as `Run.run`)."""

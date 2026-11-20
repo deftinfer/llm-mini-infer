@@ -24,7 +24,7 @@ def make_cuda_runner(cfg: Config) -> Runner:
     vision = VisionOptions(encoder_rows=dim.encoder_cache_tokens or 0, encoder_budget=dim.encoder_budget or 0,
                            arena=cfg.pixel_arena, max_soft_tokens=im.max_soft_tokens) if im.enabled else None
     if is_gemma4(cfg.model.path):
-        from ...kernels.attn512 import fixed_split_keys
+        from ...kernels.attn512 import SPLIT_KEYS as FULL_SPLIT_KEYS
         from ...kernels.attn_window import SPLIT_KEYS
         from .gemma import GemmaRunner
 
@@ -43,8 +43,7 @@ def make_cuda_runner(cfg: Config) -> Runner:
                            draft_fp8=dsp.draft_head_dtype == "fp8", sparse_head=bool(o.sparse_head),
                            sparse_head_rows=o.sparse_head_rows or 1024, draft_universe=bool(dsp.draft_universe),
                            draft_query_next=dsp.draft_query_next, pdl=bool(o.pdl), always_split=bool(o.always_split),
-                           attn512_split_keys=fixed_split_keys(cfg.model.max_model_len + 1 +
-                                                               (sp.num_speculative_tokens or 0)) if inv else 0,
+                           attn512_split_keys=FULL_SPLIT_KEYS if inv else 0,
                            window_split_keys=SPLIT_KEYS if inv else 0, head_fixed_m=inv, encode_per_image=inv,
                            batch_invariant=inv, sync_check=o.sync_check, memory_history=o.memory_history,
                            logprobs=cfg.server.logprobs, penalties=cfg.server.penalties)
