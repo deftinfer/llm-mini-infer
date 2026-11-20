@@ -345,10 +345,8 @@ class Metrics:
                                       "Python garbage collections, by process (engine, or this frontend) and "
                                       "generation.", base, labels=("process", "generation"))
         self.engine_aborts = Counter("llm_mini_infer:engine_aborts_total",
-                                     "Aborts that found a live request in the engine (its remaining work saved), by "
-                                     "reason: disconnect (the client left), stop (a stop string ended it in the "
-                                     "frontend), failed (the frontend failed it: the engine stopped, a drain timed "
-                                     "out).", base, labels=("reason",))
+                                     "Aborts that found a live request in the engine, by reason. Reasons are "
+                                     "disconnect, stop, failed, and shutdown.", base, labels=("reason",))
         self.step_output_errors = Counter("llm_mini_infer:step_output_errors_total",
                                           "Engine outputs whose statistics or pixel releases this frontend failed to "
                                           "process, each logged, by part: stats, release. Their requests' tokens were "

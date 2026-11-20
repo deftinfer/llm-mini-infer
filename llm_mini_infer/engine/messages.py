@@ -104,9 +104,9 @@ class Shutdown(_Msg):
 # a preempted request's donation
 CHECKPOINT_SOURCES = ("prefill", "branch", "hint", "decode", "finish", "refine", "preempt")
 # Abort.reason, EngineStats.aborts order: the client left, a stop string ended the request in the frontend, the
-# frontend failed it (the engine stopped, a drain timed out)
-ABORT_REASONS = ("disconnect", "stop", "failed")
-ABORT_DISCONNECT, ABORT_STOP, ABORT_FAILED = range(3)
+# frontend failed it (the engine stopped, a drain timed out), or the engine shut down
+ABORT_REASONS = ("disconnect", "stop", "failed", "shutdown")
+ABORT_DISCONNECT, ABORT_STOP, ABORT_FAILED, ABORT_SHUTDOWN = range(4)
 # EngineStats.lost_tokens order: why an admission recomputed what the prefix cache held for it (`cache.radix`, Lost
 # tokens; `precise`: `sched.scheduler._count_lost`)
 LOST_CAUSES = ("writing", "checkpoint", "page", "precise")
