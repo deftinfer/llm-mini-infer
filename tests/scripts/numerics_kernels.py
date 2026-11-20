@@ -10,7 +10,7 @@ prefill moves bits between identical calls.
         [--rows 1,16,128]
     python3 -m tests.scripts.numerics_kernels nan-leak
     python3 -m tests.scripts.numerics_kernels timing
-    python3 -m tests.scripts.numerics_kernels attn-timing [--parts qwen-full,gemma-full] [--max-model-lens 8184,262144]
+    python3 -m tests.scripts.numerics_kernels attn-timing [--parts qwen-full,gemma-full] [--max-model-len 262144]
 
 They run on an SM120 GPU (an RTX PRO 6000: 188 SMs) with the kernel library and FlashInfer 0.7.2, from the GPU tests'
 image (`/opt/llm-mini-infer/test`); `--help` and the host-side helpers (tests/repo/test_numerics.py) run anywhere. Each
@@ -18,8 +18,9 @@ subcommand prints markdown tables and writes them, with its JSON results, into `
 `results/numerics/kernels/<UTC time>/`): `<subcommand>.md` and `<subcommand>.json` (non-finite numbers as null).
 `<subcommand> --help` describes each. `attn-timing` times (CUDA events, eagerly and in decode graphs) the attention
 kernels of both models' full layers, the batch-invariant path against the switch-off one, at a grid of prefill and
-decode shapes and `--max-model-lens`. Inputs are random from `--seed`, reseeded per case, so a case gets the same inputs
-alone or among others. A case that raises is recorded in the JSON and the run goes on; the exit status is then 1.
+decode shapes, both sized for `--max-model-len`. Inputs are random from `--seed`, reseeded per case, so a case gets the
+same inputs alone or among others. A case that raises is recorded in the JSON and the run goes on; the exit status is
+then 1.
 
 **Shapes.** Qwen3.8 27B's GDN layers: 16 q/k heads, 48 v heads, head dim 128, fp32 states [48, 128, 128], q and k
 L2-normalised by the caller, the decay passed as alpha = exp(g) (`kernels.flashinfer.flashinfer_gdn_prefill`); its full
