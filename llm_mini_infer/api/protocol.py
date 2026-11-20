@@ -282,7 +282,10 @@ def decode_detokenize(body: bytes) -> DetokenizeRequest:
 MAX_STOP_TOKEN_IDS = 16  # distinct ones (`validate_chat`)
 MAX_LOGIT_BIAS = 1024  # vLLM's v2 runner's limit, which it raises in its worker; here a 400
 _DEFAULT_ONLY = {"n": 1, "spaces_between_special_tokens": True, "continue_final_message": False, "echo": False}
-_F32_MIN, _F32_MAX = 1.1754943508222875e-38, 3.4028234663852886e+38  # the smallest normal float32, the largest
+_F32_MIN = 1.1754943508222875e-38  # the smallest normal float32
+# The midpoint between the largest float32 (3.4028234663852886e+38) and 2^128: every float64 below it rounds to a
+# finite float32 (3.4028235e+38 among them), and it rounds to infinity
+_F32_ROUND_UP = 3.4028235677973366e+38
 MAX_LOGPROBS = 20  # runner.base.MAX_LOGPROBS: the OpenAI API's limit, the default of vLLM's `--max-logprobs`
 
 
@@ -493,7 +496,7 @@ def validate_chat(req: ChatCompletionRequest, vocab: int, images: bool = False) 
             raise validation_error(f"repetition_penalty must be a finite number, got {r}.")
         if r <= 0.0:
             raise validation_error(f"repetition_penalty must be greater than zero, got {r}.")
-        if not _F32_MIN <= r <= _F32_MAX:  # ours: the sampler keeps it in float32 and uses 1/r
+        if not _F32_MIN <= r < _F32_ROUND_UP:  # ours: the sampler keeps it in float32 and uses 1/r
             raise validation_error("repetition_penalty must be a normal float32 number (from 1.1754944e-38 to "
                                    f"3.4028235e+38), got {r}.")
     if t is not None and t < 0:
