@@ -59,7 +59,9 @@ from ..support.forced_cases import (
     row_at,
     run,
     run_switches_workload,
+    structured_hybrid_count_workloads,
     structured_hybrid_workloads,
+    structured_window_count_workloads,
     structured_window_workloads,
 )
 from ..support.fuzzing import fuzz_settings, saved_on_failure
@@ -1297,7 +1299,7 @@ def test_the_counters_reach_metrics() -> None:
     for line in lines:
         assert line in page, line
 
-# -- the targeted fuzz suites (campaign suites `structured_window`, `structured_hybrid`) ------------------------------
+# -- the targeted fuzz suites (campaign suites `structured_window`, `structured_hybrid` and their `_counts`) ----------
 
 
 @fuzz_settings(200)
@@ -1311,6 +1313,23 @@ def test_random_structured_window_workloads(w) -> None:
 @given(structured_hybrid_workloads())
 def test_random_structured_hybrid_workloads(w) -> None:
     with saved_on_failure("structured_hybrid", w):
+        run_switches_workload(w)
+
+
+@fuzz_settings(200)
+@given(structured_window_count_workloads())
+def test_random_structured_window_count_workloads(w) -> None:
+    """Gemma 4's structured workloads with a draft count per step: every check of theirs, the verify-mask counters
+    against `MaskOracle` at each step's count."""
+    with saved_on_failure("structured_window_counts", w):
+        run_switches_workload(w)
+
+
+@fuzz_settings(200)
+@given(structured_hybrid_count_workloads())
+def test_random_structured_hybrid_count_workloads(w) -> None:
+    """Qwen's structured workloads with a draft count per step: every check of theirs, at each step's count."""
+    with saved_on_failure("structured_hybrid_counts", w):
         run_switches_workload(w)
 
 

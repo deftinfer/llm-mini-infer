@@ -37,13 +37,38 @@ def exercised(r: Run, schedule: tuple[int, ...]) -> None:
     assert r.drafts_checked.get(K) and any(r.drafts_checked.get(d) for d in range(1, K)), r.drafts_checked
 
 
-def run(pair, k: int, reqs: list[dict], oracle=None, rng=None, **kw) -> Run:
+def run(pair, k: int, reqs: list[dict], oracle=None, rng=None, masks=None, **kw) -> Run:
     r = Run(pair, k, **kw)
     if k:
         r.check_drafts()
+    if masks is not None:
+        recount_masks(r, masks)
     for q in reqs:
         r.add(**q)
     return r.run(oracle, rng)
+
+
+def recount_masks(r: Run, seen: dict[str, int]) -> None:
+    """The verify-mask counters' inputs from each step's results (`Scheduler.process` wrapped): `seen["read"]`, the
+    masks verification read (one a sample: `n_out` on each verify row with masks); `seen["lowered"]`, such rows at a
+    count below k; `seen["rejecting"]`, those that accepted fewer drafts than the step verified (each at most one
+    first rejection). No row samples more than its step's 1 + v."""
+    s, process = r.sched, r.sched.process
+    seen.update(read=0, lowered=0, rejecting=0)
+
+    def counted(inf, tokens, n_out, *a, **kw):
+        v = s._v(inf)
+        rows = (s.aid[inf.slots] == inf.aids) & inf.device
+        if inf.wpop is not None:
+            rows &= inf.wpop[:, 0] >= 0
+            n = np.asarray(n_out)[rows]
+            assert (n <= 1 + v).all(), (v, n)
+            seen["read"] += int(n.sum())
+            seen["lowered"] += int(rows.sum()) if v < r.k else 0
+            seen["rejecting"] += int((n - 1 < v).sum())
+        return process(inf, tokens, n_out, *a, **kw)
+
+    s.process = counted
 
 
 def greedy(max_tokens: int = 18, **extra) -> list[dict]:
@@ -107,12 +132,15 @@ def test_masked_outputs_equal_under_a_schedule_of_counts(pair, params) -> None:
                  ignore_eos=False, grammar=q.get("grammar", "")) for q in reqs]
     outs = []
     for k, schedule in ((0, ()), (K, (1, 3)), (K, (5, 2, 1)), (K, (2,))):
-        grammar = FakeGrammar(512, (EOS,))
-        r = run(pair, k, reqs, grammars=Grammars(grammar), caching=False,
+        grammar, seen = FakeGrammar(512, (EOS,)), {}
+        r = run(pair, k, reqs, masks=seen, grammars=Grammars(grammar), caching=False,
                 draft_counts=COUNTS if k else (), count_schedule=schedule)
-        assert r.sched.grammars.errors == 0
-        if k:
+        s = r.sched
+        assert s.grammars.errors == 0
+        if k:  # the counters count what each step verified at its count (`Scheduler._rejections`)
             exercised(r, schedule)
+            assert seen["lowered"] and s.window_masks.sum() == seen["read"], (s.window_masks.tolist(), seen)
+            assert s.window_masks_sum > 0 and 0 < s.first_rejections.sum() <= seen["rejecting"], seen
         outs.append((r.out, r.finish))
     assert all(o == outs[0] for o in outs[1:])
     assert outs[0][1][0] == FinishReason.STOP and outs[0][0][0][-1] == EOS

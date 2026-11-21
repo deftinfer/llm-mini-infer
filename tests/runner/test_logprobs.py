@@ -8,7 +8,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 import torch
-from hypothesis import given
+from hypothesis import assume, given
 
 # Keeps Hypothesis' mined constants, and so a seed's draws, as they were when this file's seeds were chosen (not
 # otherwise used).
@@ -23,7 +23,7 @@ from ..support.fuzzing import fuzz_settings, saved_on_failure, st
 from ..support.harness import Harness, Spec
 from ..support.logprob_workload import run_both, run_logprobs_workload
 from ..support.mask_words import words_of
-from ..support.mtp_workloads import mtp_workloads
+from ..support.mtp_workloads import mtp_workloads, with_counts
 from ..support.sched_cases import VOCAB
 from ..support.workloads import cache_workloads
 
@@ -219,10 +219,31 @@ def logprobs_workloads(draw):
     return dict(kind=kind, workload=w, tops=tops)
 
 
+@st.composite
+def logprobs_count_workloads(draw):
+    """`logprobs_workloads` of MTP's and the structured suites' kinds at k of 2 or more, with schedules of draft counts
+    (`mtp_workloads.with_counts`): a request's values and the plans do not depend on its logprobs as the counts change.
+    Not the policy: it does not time a step with logprobs rows (`Inflight.decode_only`), so its counts follow them."""
+    kind = draw(st.sampled_from(["mtp", "structured_window", "structured_hybrid"]))
+    w = draw({"mtp": mtp_workloads(), "structured_window": structured_window_workloads(),
+              "structured_hybrid": structured_hybrid_workloads()}[kind])
+    assume(w["mtp_k"] > 1)  # a count below k
+    w = with_counts(draw, w, adaptive=False)
+    tops = draw(st.lists(st.sampled_from([-1, -1, 0, 1, 5, 20]), min_size=len(w["specs"]), max_size=len(w["specs"])))
+    return dict(kind=kind, workload=w, tops=tops)
+
+
 @fuzz_settings(150)
 @given(logprobs_workloads())
 def test_random_logprobs_workloads(w) -> None:
     with saved_on_failure("logprobs", w):
+        run_logprobs_workload(w)
+
+
+@fuzz_settings(150)
+@given(logprobs_count_workloads())
+def test_random_logprobs_count_workloads(w) -> None:
+    with saved_on_failure("logprobs_counts", w):
         run_logprobs_workload(w)
 
 
