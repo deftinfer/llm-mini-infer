@@ -237,6 +237,8 @@ class MaskOracle:
             v = int(handle.v)  # the drafts the step verifies, as the scheduler's `_v` (its masks: 1 + v a row)
             seen = [(i, r.drafts[slot, :v].copy(), r._masks[handle.mask_off[i]:handle.mask_off[i] + 1 + v].copy())
                     for i, slot in enumerate(handle.rows[0].tolist()) if handle.mtp[i] and handle.masked[i]]
+            if seen and v < self.k:
+                event("verify rows with masks at a count below k")
             step = handle.step_id
             launch(handle, n_masks)
             res = handle.result

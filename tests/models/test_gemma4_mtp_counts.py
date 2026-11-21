@@ -49,24 +49,33 @@ def run(pair, k: int, reqs: list[dict], oracle=None, rng=None, masks=None, **kw)
 
 
 def recount_masks(r: Run, seen: dict[str, int]) -> None:
-    """The verify-mask counters' inputs from each step's results (`Scheduler.process` wrapped): `seen["read"]`, the
-    masks verification read (one a sample: `n_out` on each verify row with masks); `seen["lowered"]`, such rows at a
-    count below k; `seen["rejecting"]`, those that accepted fewer drafts than the step verified (each at most one
-    first rejection). No row samples more than its step's 1 + v."""
+    """The verify-mask counters recounted from each step's plan and results (`Scheduler.process` wrapped), apart from
+    the scheduler's window tables: `seen["read"]`, the masks verification read (one a sample: `n_out` on each live
+    MASKED verify row); `seen["lowered"]`, such rows at a count below k; `seen["rejected"]`, their first rejected
+    drafts (among the v the step verified, one that differs from the target's sample there), from the drafts the
+    slot's last SAMPLE row made. No row samples more than its step's 1 + v."""
     s, process = r.sched, r.sched.process
-    seen.update(read=0, lowered=0, rejecting=0)
+    made: dict[int, np.ndarray] = {}
+    seen.update(read=0, lowered=0, rejected=0)
 
-    def counted(inf, tokens, n_out, *a, **kw):
-        v = s._v(inf)
-        rows = (s.aid[inf.slots] == inf.aids) & inf.device
-        if inf.wpop is not None:
-            rows &= inf.wpop[:, 0] >= 0
-            n = np.asarray(n_out)[rows]
-            assert (n <= 1 + v).all(), (v, n)
-            seen["read"] += int(n.sum())
-            seen["lowered"] += int(rows.sum()) if v < r.k else 0
-            seen["rejecting"] += int((n - 1 < v).sum())
-        return process(inf, tokens, n_out, *a, **kw)
+    def counted(inf, tokens, n_out, gpu_busy_ns, status=None, drafts=None, *a, **kw):
+        v = r.k if inf.v < 0 else inf.v
+        live = s.aid[inf.slots] == inf.aids
+        masked = np.zeros(len(inf.slots), bool)
+        if inf.masked is not None:
+            masked[inf.masked] = True
+        toks, n = np.asarray(tokens), np.asarray(n_out)
+        for i in np.flatnonzero(live & inf.device & masked).tolist():
+            assert n[i] <= 1 + v, (v, int(n[i]))
+            acc, d = int(n[i]) - 1, made.get(int(inf.slots[i]))
+            seen["read"] += acc + 1
+            seen["lowered"] += v < r.k
+            seen["rejected"] += acc < v and d is not None and d[acc] != toks[i, acc]
+        out = process(inf, tokens, n_out, gpu_busy_ns, status, drafts, *a, **kw)
+        if drafts is not None:
+            for i in np.flatnonzero(live & inf.sample).tolist():
+                made[int(inf.slots[i])] = np.asarray(drafts)[i].copy()
+        return out
 
     s.process = counted
 
@@ -139,8 +148,8 @@ def test_masked_outputs_equal_under_a_schedule_of_counts(pair, params) -> None:
         assert s.grammars.errors == 0
         if k:  # the counters count what each step verified at its count (`Scheduler._rejections`)
             exercised(r, schedule)
-            assert seen["lowered"] and s.window_masks.sum() == seen["read"], (s.window_masks.tolist(), seen)
-            assert s.window_masks_sum > 0 and 0 < s.first_rejections.sum() <= seen["rejecting"], seen
+            assert seen["lowered"] and seen["rejected"] and s.window_masks_sum > 0, seen
+            assert (s.window_masks.sum(), s.first_rejections.sum()) == (seen["read"], seen["rejected"]), seen
         outs.append((r.out, r.finish))
     assert all(o == outs[0] for o in outs[1:])
     assert outs[0][1][0] == FinishReason.STOP and outs[0][0][0][-1] == EOS
