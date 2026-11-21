@@ -57,7 +57,9 @@ MIN_SPLIT_KEYS = 256  # an eager plan's splits hold at least this many keys of t
 MAX_SPLITS = 32  # the merge's lanes (csrc/attn512.cu MAX_MERGE_SPLITS)
 WAVE_FILL = 0.6  # a wave left under this share full takes about 5/3 of a wave (module docstring; fitted on SM120)
 SPLIT_KEYS = 256  # the fixed split's base for decode rows (module docstring, `split_size`)
-PREFILL_FROM = 8192  # the fixed split: a prefill query with at most this many keys takes them whole (module docstring)
+# The fixed split: a prefill query with at most this many keys takes them whole (module docstring); past it they split
+# at multiples of PREFILL_KEYS, one split up to that many, so here a query is whole up to 16,384 keys either way
+PREFILL_FROM = 8192
 # The fixed split's base for a prefill query past PREFILL_FROM (`split_size`): its full layers' prefill tiles of 2
 # positions already fill the GPU from a few hundred queries, so a split pays for a short chunk over a long history
 # only, and a smaller base costs a long chunk more than 3% (attn-timing on SM120)

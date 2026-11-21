@@ -33,7 +33,7 @@ from typing import Any
 import zmq
 
 from ..cache.pools import size_arena, size_pools
-from ..config import Config
+from ..config import Config, capped_invariance_note
 from ..gcstats import GcStats
 from ..logutil import setup_logging, traceback_without_messages
 from ..runner.base import UNION_BUCKETS, PoolConfig, Runner
@@ -554,6 +554,8 @@ def engine_main(cfg: Config, ready: Connection, ipc_path: str, heartbeat: Any = 
         if "max_model_len" in reasons:
             cfg.reasons["model.max_model_len"] = reasons.pop("max_model_len")
             max_model_len = cfg.model.max_model_len = sizes.max_model_len
+        if note := capped_invariance_note(cfg, len_derived):
+            log.warning(note)
         for k, v in reasons.items():
             cfg.reasons[f"dev.cache.{k}"] = v
         runner.configure(PoolConfig(page_size=page_size, num_pages=cc.num_pages,

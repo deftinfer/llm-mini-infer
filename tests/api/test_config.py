@@ -656,6 +656,53 @@ def test_the_prefill_split_threshold_needs_batch_invariance(tmp_path) -> None:
     assert config.derive(config.load(None, {**qwen, key: 2048})).dev.runner.cuda.prefill_split_from == 2048
     with pytest.raises(ValueError, match=r"^dev\.runner\.cuda\.prefill_split_from 2047: at least 2,048 on Qwen3\.8"):
         config.derive(config.load(None, {**qwen, key: 2047}))
+    top = 2**31 - 1  # a 32-bit int in our kernels
+    over = r"^dev\.runner\.cuda\.prefill_split_from 2147483648: at most 2,147,483,647 \(our kernels take it as a 32"
+    for model in ({"model.path": g}, qwen):
+        assert config.derive(config.load(None, {**model, key: top})).dev.runner.cuda.prefill_split_from == top
+        with pytest.raises(ValueError, match=over):
+            config.derive(config.load(None, {**model, key: top + 1}))
+
+
+def test_a_pool_capped_length_names_the_invariance_default_it_missed(tmp_path) -> None:
+    """A Qwen3.8 block-FP8 checkpoint whose derived model.max_model_len is past QWEN_INVARIANT_MAX_LEN gets batch
+    invariance off; once the KV pool caps that length to the limit or below, `capped_invariance_note` says so, and
+    stays empty where the length was set, is still long, the switch was set, the checkpoint is BF16 or it is Gemma 4."""
+    for d in ("q", "b", "g"):
+        (tmp_path / d).mkdir()
+    q = _model(tmp_path / "q", 248_320, 1)
+    conf = json.loads((q / "config.json").read_text())
+    conf["text_config"]["max_position_embeddings"] = 2 * config.QWEN_INVARIANT_MAX_LEN
+    (_model(tmp_path / "b", 248_320, 1) / "config.json").write_text(json.dumps(conf))
+    conf["quantization_config"] = {"quant_method": "fp8", "weight_block_size": [128, 128]}
+    (q / "config.json").write_text(json.dumps(conf))
+    key = "dev.runner.cuda.batch_invariant"
+
+    def derive(path, **kw) -> config.Config:
+        return config.derive(config.load(None, {"model.path": str(path), "structured_output.enabled": True,
+                                                "runner.cuda.fp8_cold_prefill": "fp8", **kw}))
+
+    cfg = derive(q)
+    assert cfg.model.max_model_len > config.QWEN_INVARIANT_MAX_LEN and "model.max_model_len" in cfg.reasons
+    assert cfg.reasons[key].startswith(config.LONG_REASON)
+    assert config.capped_invariance_note(cfg, True) == ""  # not capped yet
+    cfg.model.max_model_len = config.QWEN_INVARIANT_MAX_LEN
+    note = config.capped_invariance_note(cfg, True)
+    assert "32,768" in note and "model.max_model_len" in note and key in note
+    assert config.capped_invariance_note(cfg, False) == ""
+    cfg.model.max_model_len = config.QWEN_INVARIANT_MAX_LEN + 1
+    assert config.capped_invariance_note(cfg, True) == ""
+    for kw in ({key: True}, {key: False}):
+        forced = derive(q, **kw)
+        forced.model.max_model_len = config.QWEN_INVARIANT_MAX_LEN
+        assert config.capped_invariance_note(forced, True) == ""
+    bf16 = derive(tmp_path / "b")  # a long derived length: the BF16 reason wins
+    assert bf16.reasons[key].startswith("off: a BF16 checkpoint")
+    bf16.model.max_model_len = config.QWEN_INVARIANT_MAX_LEN
+    assert config.capped_invariance_note(bf16, True) == ""
+    gemma = config.derive(config.load(None, {"model.path": str(_gemma(tmp_path / "g"))}))
+    gemma.model.max_model_len = config.QWEN_INVARIANT_MAX_LEN
+    assert config.capped_invariance_note(gemma, True) == ""
 
 
 def test_the_budget_for_batch_invariance_is_the_schedulers(tmp_path) -> None:
