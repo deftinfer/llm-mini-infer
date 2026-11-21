@@ -12,6 +12,9 @@ different mask unions, so a token's column in the sparse head moves between them
   carries an image, encoded alone in one run and in one step with another request's image in the other (a tower call
   each, the tower's attention on FlashInfer's ragged kernel); its encoder rows are compared as the ENCODE wrote them,
   and its span, which takes the sliding kernel's bidirectional pass, through the positions after it.
+- **Long contexts:** the full layers' split sizes double with the position (16 keys to 512, then 32, then 64) and a
+  prefill row's queries past 64 keys split by 16 (`attn512_prefill`): a request whose prompt passes 64 and whose answer
+  passes 512 and 1024 positions, alone and beside requests that arrive while it runs.
 - **The forced prefix** (an answer's first tokens forced): taken whole by the final chunk, alone and beside.
 - **The dense head** (the sparse head off): its GEMM runs at each step's M, which batch invariance leaves as it is; an
   expected failure that records whether its logits' bits move.
@@ -40,6 +43,7 @@ pytestmark = [pytest.mark.gpu,
 VOCAB = 512  # the tiny models' (tests/support/tiny_gemma.py)
 INVARIANT = dict(sparse_head=True, draft_universe=True, pdl=True, always_split=True, attn512_split_keys=32,
                  window_split_keys=16, head_fixed_m=True, encode_per_image=True, batch_invariant=True)
+LONG = dict(max_model_len=1280, attn512_split_keys=16, attn512_prefill=(64, 16))  # sizes 16, 32, 64; prefill splits
 GOLDEN = golden.GOLDEN_DIR / "batch_invariance.json"
 
 
@@ -54,6 +58,8 @@ def text(n: int, seed: int) -> list[int]:
 CASES = {  # each request's prompt (its parts) and forced answer
     "text": ({0: [tokens(70, 1)], 1: [tokens(120, 2)], 2: [tokens(35, 3)], 3: [tokens(90, 4)]},
              {r: tokens(30 + 7 * r, 10 + r) for r in range(4)}),
+    "long": ({0: [tokens(600, 41)], 1: [tokens(120, 42)], 2: [tokens(200, 43)], 3: [tokens(90, 44)]},
+             {0: tokens(520, 45), 1: tokens(30, 46), 2: tokens(40, 47), 3: tokens(50, 48)}),
     "image": ({0: [text(20, 21), png(48, 36, 1), text(12, 22)], 1: [text(9, 23), png(40, 40, 2), text(5, 24)],
                2: [text(60, 25)], 3: [text(14, 26), png(30, 60, 3), text(8, 27)]},
               {r: text(30 + 7 * r, 30 + r) for r in range(4)}),
@@ -76,6 +82,10 @@ def run(pair, case: str, beside: bool, arena: str, forced: int = 0, **switches) 
     f = ForcedRun(pair, prompts, answers, device="cuda", arena=arena if case == "image" else None, window=W, wps=16,
                   max_num_seqs=8, budget=256, num_pages=2048, forced=forced, forced_prefix=forced > 0,
                   **{**INVARIANT, **switches})
+    if "attn512_prefill" in switches:  # the settings reached the full layers' kernel (a run without them is invariant)
+        a = f.run.r.attn_f
+        assert (a.split_keys, (a.prefill_from, a.prefill_keys)) == (switches["attn512_split_keys"],
+                                                                     switches["attn512_prefill"])
     if not beside:
         f.add(0)
     elif case == "text":  # 1 and 2 decode while 0's prompt prefills; 3's prompt prefills beside 0's answer
@@ -85,6 +95,15 @@ def run(pair, case: str, beside: bool, arena: str, forced: int = 0, **switches) 
         f.add(0)
         f.steps(4)
         f.add(3)
+    elif case == "long":  # 1 decodes while 0's prompt prefills in chunks; 3's prompt prefills beside 0's answer, and
+        # 2's (200 tokens) beside it again once it is well into its answer
+        f.add(1)
+        f.steps(3)
+        f.add(0)
+        f.steps(4)
+        f.add(3)
+        f.steps(40)
+        f.add(2)
     else:  # 0's image and 1's in one ENCODE (a tower call each) and one prefill beside 2's decode; then 3's image
         f.add(2)
         f.steps(3)
@@ -104,7 +123,7 @@ def runs(fp8_pair, mm_pair, tmp_path_factory):
         k = (case, beside, tuple(sorted(switches.items())))
         if k not in done:
             arena = str(tmp_path_factory.mktemp("arena") / "pixels")
-            done[k] = run(fp8_pair if case == "text" else mm_pair, case, beside, arena, **switches)
+            done[k] = run(mm_pair if case == "image" else fp8_pair, case, beside, arena, **switches)
         return done[k]
 
     return get
@@ -149,6 +168,21 @@ def test_a_requests_bits_do_not_depend_on_the_draft_counts(runs) -> None:
         assert n >= len(common) and not differ, \
             f"{schedule}: {len(differ)} of {n} logits differ, the first at {differ[:1]}"
         assert other.heads.sparse > 0
+
+
+def test_a_requests_bits_do_not_depend_on_the_requests_beside_it_past_the_split_sizes(runs) -> None:
+    """The full layers' split sizes double with a query's position (16 keys, 32 past 512, 64 past 1024) and a prefill
+    row splits the queries past 64 keys by 16: request 0's 600-token prompt (chunked by the budget, its queries past 64
+    split) and 520-token answer (its decode queries past 512 and 1024) have the same bits alone and beside requests
+    that arrive while it runs, a prefill row of 200 tokens among them."""
+    alone, beside = runs("long", False, **LONG), runs("long", True, **LONG)
+    assert max(alone.hidden) > 1024 and min(alone.hidden) < 600  # the answer passes both size boundaries
+    common = same_states(alone, beside, "long")
+    assert max(common) > 1024
+    n, moved, differ = logits_compared(alone, beside, common)
+    assert n >= len(common)
+    assert not differ, f"{len(differ)} of {n} logits differ, the first at (position, token) {differ[0]}"
+    assert alone.heads.sparse > 0 and beside.heads.sparse > 0 and moved > 0
 
 
 def test_the_forced_prefix_is_taken_whole(runs) -> None:

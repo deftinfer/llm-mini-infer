@@ -20,7 +20,7 @@ from llm_mini_infer import config
 from ..support.config_cases import _assistant, _gemma, _model
 from ..support.paths import DATA, MODELS_DIR
 
-MAXL = config.BATCH_INVARIANT_MAX_LEN - 8  # batch invariance's default range of model.max_model_len
+MAXL = 8184  # a model.max_model_len for the batch invariance tests (the engine benchmark's context)
 
 
 def test_draft_head_defaults(tmp_path) -> None:
@@ -543,29 +543,22 @@ def test_the_kernel_switches(tmp_path) -> None:
         assert config.derive(config.load(None, {"model.path": q, "dev.runner.cuda.pdl": on})).dev.runner.cuda.pdl is on
 
 
-def test_batch_invariance_needs_a_short_context(tmp_path) -> None:
-    """Batch invariance defaults on for Gemma 4 while a decode row's keys, its verify window's included, fit the full
-    layers' fixed split at 256 keys a split (32 splits): on at the range's top, off one step past it, the reason naming
-    what forcing it on costs; a set value wins. Off too where a prefill could starve (a token and a final chunk's
-    forced prefix next to max_num_seqs − 1 decode rows) or the window pages are not a multiple of 16 (our sliding
-    kernel's KV tile), which a set value refuses."""
-    g = str(_gemma(tmp_path / "g", positions=8192))
+def test_gemma_batch_invariance_is_on_at_any_context(tmp_path) -> None:
+    """Batch invariance defaults on for Gemma 4 at any model.max_model_len (the attention kernels size each query's
+    splits from its own position, so its bits do not follow the context); a set value wins. Off where a prefill could
+    starve (a token and a final chunk's forced prefix next to max_num_seqs − 1 decode rows) or the window pages are not
+    a multiple of 16 (our sliding kernel's KV tile), which a set value refuses."""
+    g = str(_gemma(tmp_path / "g", positions=262_144))
 
     def derive(n: int, **kw) -> config.Config:
         return config.derive(config.load(None, {"model.path": g, "model.max_model_len": n,
                                                 "structured_output.enabled": True, **kw}))
 
-    cfg = derive(MAXL)
-    assert cfg.dev.runner.cuda.batch_invariant is True
-    assert cfg.reasons["dev.runner.cuda.batch_invariant"].startswith("on: Gemma 4")
-    cfg = derive(config.BATCH_INVARIANT_MAX_LEN)
-    assert cfg.dev.runner.cuda.batch_invariant is False
-    why = cfg.reasons["dev.runner.cuda.batch_invariant"]
-    assert why.startswith(f"off: model.max_model_len {config.BATCH_INVARIANT_MAX_LEN} is past {MAXL:,}")
-    assert "fewer, longer splits" in why and "a prefill row one however long its history" in why
-    forced = derive(config.BATCH_INVARIANT_MAX_LEN, **{"dev.runner.cuda.batch_invariant": True})
-    assert forced.dev.runner.cuda.batch_invariant is True
-    assert derive(MAXL, **{"dev.runner.cuda.batch_invariant": False}).dev.runner.cuda.batch_invariant is False
+    for n in (MAXL, 262_144):
+        cfg = derive(n)
+        assert cfg.dev.runner.cuda.batch_invariant is True
+        assert cfg.reasons["dev.runner.cuda.batch_invariant"].startswith("on: Gemma 4")
+        assert derive(n, **{"dev.runner.cuda.batch_invariant": False}).dev.runner.cuda.batch_invariant is False
     # 64 sequences, no MTP: a token and the forced prefix (2 x 1) next to 63 decode rows of 1 token
     assert derive(MAXL, **{"scheduler.max_num_batched_tokens": 66}).dev.runner.cuda.batch_invariant is True
     tight = derive(MAXL, **{"scheduler.max_num_batched_tokens": 65})
@@ -583,19 +576,20 @@ def test_batch_invariance_needs_a_short_context(tmp_path) -> None:
 
 
 def test_qwen_batch_invariance(tmp_path) -> None:
-    """The Qwen runner's batch invariance defaults on for a block-FP8 checkpoint up to the range's top while a step can
-    always cut a prefill on the 64-token grid (max_num_batched_tokens past a grid, a final chunk's forced prefix and
-    max_num_seqs − 1 decode rows of 1 + k tokens; no chunk cap below the grid), its reason naming what it covers; off
-    for a BF16 checkpoint (its projections run at the step's M), past it, or where a prefill could starve, which a
-    set value refuses; a set value wins otherwise."""
-    for d in ("q", "b", "long"):
+    """The Qwen runner's batch invariance defaults on for a block-FP8 checkpoint up to QWEN_INVARIANT_MAX_LEN while a
+    step can always cut a prefill on the 64-token grid (max_num_batched_tokens past a grid, a final chunk's forced
+    prefix and max_num_seqs − 1 decode rows of 1 + k tokens; no chunk cap below the grid), its reason naming what it
+    covers; off for a BF16 checkpoint (its projections run at the step's M), past it (a long prompt's prefill falls
+    behind FlashInfer's), or where a prefill could starve, which a set value refuses; a set value wins otherwise."""
+    for d in ("q", "b", "edge", "long"):
         (tmp_path / d).mkdir()
     q = _model(tmp_path / "q", 248_320, 1)
     conf = json.loads((q / "config.json").read_text())
     conf["quantization_config"] = {"quant_method": "fp8", "weight_block_size": [128, 128]}
     (q / "config.json").write_text(json.dumps(conf))
-    conf["text_config"]["max_position_embeddings"] = 8192
-    (tmp_path / "long" / "config.json").write_text(json.dumps(conf))
+    for d, n in (("edge", config.QWEN_INVARIANT_MAX_LEN), ("long", 2 * config.QWEN_INVARIANT_MAX_LEN)):
+        conf["text_config"]["max_position_embeddings"] = n
+        (tmp_path / d / "config.json").write_text(json.dumps(conf))
 
     def derive(**kw) -> config.Config:  # no refine piece to fit next to the decode rows (tight budgets below)
         return config.derive(config.load(None, {"model.path": str(q), "structured_output.enabled": True,
@@ -608,9 +602,12 @@ def test_qwen_batch_invariance(tmp_path) -> None:
     bf16 = derive(**{"model.path": str(_model(tmp_path / "b", 248_320, 1))})
     assert bf16.dev.runner.cuda.batch_invariant is False
     assert bf16.reasons["dev.runner.cuda.batch_invariant"].startswith("off: a BF16 checkpoint")
-    long = derive(**{"model.path": str(tmp_path / "long")})  # its position limit, 8,192
+    assert derive(**{"model.path": str(tmp_path / "edge")}).dev.runner.cuda.batch_invariant is True  # 32,768: on
+    long = derive(**{"model.path": str(tmp_path / "long")})  # its position limit, 65,536
     assert long.dev.runner.cuda.batch_invariant is False
-    assert long.reasons["dev.runner.cuda.batch_invariant"].startswith(f"off: model.max_model_len 8192 is past {MAXL:,}")
+    why = long.reasons["dev.runner.cuda.batch_invariant"]
+    assert why.startswith(f"off: model.max_model_len 65536 is past {config.QWEN_INVARIANT_MAX_LEN:,}")
+    assert "FlashInfer" in why
     # k = 3 (the MTP layer): 64 + 2 x 4 + 63 x 4 = 324 tokens a step at 64 sequences
     assert derive(**{"scheduler.max_num_batched_tokens": 324}).dev.runner.cuda.batch_invariant is True
     tight = derive(**{"scheduler.max_num_batched_tokens": 323})
@@ -631,6 +628,34 @@ def test_qwen_batch_invariance(tmp_path) -> None:
     assert bf16.dev.runner.cuda.batch_invariant is False
     assert config.derive(config.load(None, {"model.path": str(tmp_path / "b"), "dev.runner.cuda.batch_invariant":
                                             True})).dev.runner.cuda.batch_invariant is True
+
+
+def test_the_prefill_split_threshold_needs_batch_invariance(tmp_path) -> None:
+    """dev.runner.cuda.prefill_split_from (the full layers' prefill split under batch invariance) is left unset by
+    default (the kernels' PREFILL_FROM), takes a positive value with batch invariance on and refuses one without it or
+    below 1; on Qwen3.8 one below its prefill split's base (2,048), where a query could take one split either way."""
+    g = str(_gemma(tmp_path / "g"))
+
+    def derive(**kw) -> config.Config:
+        return config.derive(config.load(None, {"model.path": g, **kw}))
+
+    key = "dev.runner.cuda.prefill_split_from"
+    assert derive().dev.runner.cuda.prefill_split_from is None
+    assert derive(**{key: 1 << 20}).dev.runner.cuda.prefill_split_from == 1 << 20
+    for bad in ({key: 0}, {key: 8192, "dev.runner.cuda.batch_invariant": False}):
+        with pytest.raises(ValueError, match=r"^dev\.runner\.cuda\.prefill_split_from \d+: at least 1, with "
+                                             r"dev\.runner\.cuda\.batch_invariant on"):
+            derive(**bad)
+    assert derive(**{key: 1}).dev.runner.cuda.prefill_split_from == 1  # Gemma 4: per query, any threshold
+    (tmp_path / "q").mkdir()
+    q = _model(tmp_path / "q", 248_320, 1)  # Qwen3.8 with a block-FP8 checkpoint: on by default
+    conf = json.loads((q / "config.json").read_text())
+    conf["quantization_config"] = {"quant_method": "fp8", "weight_block_size": [128, 128]}
+    (q / "config.json").write_text(json.dumps(conf))
+    qwen = {"model.path": str(q)}
+    assert config.derive(config.load(None, {**qwen, key: 2048})).dev.runner.cuda.prefill_split_from == 2048
+    with pytest.raises(ValueError, match=r"^dev\.runner\.cuda\.prefill_split_from 2047: at least 2,048 on Qwen3\.8"):
+        config.derive(config.load(None, {**qwen, key: 2047}))
 
 
 def test_the_budget_for_batch_invariance_is_the_schedulers(tmp_path) -> None:
@@ -758,7 +783,7 @@ def test_the_settings_split(tmp_path, monkeypatch, capsys, caplog) -> None:
     from llm_mini_infer import cli, entrypoint
 
     dev = [k.removeprefix("dev.") for k in config.leaves(config.Config) if k.startswith("dev.")]
-    assert len(config.SETTINGS) == 60 < 61 and len(dev) == 64 and not set(dev) & set(config.SETTINGS)
+    assert len(config.SETTINGS) == 60 < 61 and len(dev) == 65 and not set(dev) & set(config.SETTINGS)
     for name, value in (("runner.cuda.fused_ops", False), ("cache.num_pages", 10), ("runner.fake.step_ms", 1.0),
                         ("scheduler.mixed_step_row_tokens", 100)):
         got = config.load(None, {f"dev.{name}": value}).dev

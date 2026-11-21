@@ -62,15 +62,15 @@ def default_k() -> int:
 
 
 def example_settings() -> dict:
-    """What the example values ask for (tests/data/chart-values.yaml), read from them. Batch invariance
-    follows the context: on up to config.BATCH_INVARIANT_MAX_LEN less 8 positions."""
+    """What the example values ask for (tests/data/chart-values.yaml), read from them. Batch invariance is on
+    at any context for Gemma 4 (the example's model)."""
     values = yaml.safe_load(VALUES.read_text())
     cfg = values["config"]
     so = cfg["structured_output"]
     return {"served name": values["model"]["id"], "drafter": cfg["speculative"]["model"],
             "image tokens": cfg["images"]["max_soft_tokens"], "images per request": cfg["images"]["max_per_request"],
             "context": cfg["model"]["max_model_len"],
-            "batch invariant": cfg["model"]["max_model_len"] <= config.BATCH_INVARIANT_MAX_LEN - 8,
+            "batch invariant": True,
             "rows": cfg["scheduler"]["max_num_seqs"], "seed": cfg["scheduler"]["seed"],
             "runner": (cfg["runner"]["kind"], cfg["runner"]["cuda"]["memory_utilization"]),
             "keep-alive": cfg["server"]["keep_alive_s"],
@@ -79,10 +79,10 @@ def example_settings() -> dict:
 
 EXAMPLE = example_settings()
 IMAGE_CONFIG = yaml.safe_load((ROOT / "deploy" / "config.yaml").read_text())
-# What the image serves Gemma 4 31B FP8 with: the model's own context (262,144 positions, so no batch invariance) and
+# What the image serves Gemma 4 31B FP8 with: the model's own context (262,144 positions) and
 # image budget (280 soft tokens, processor_config.json's), the engine's defaults (16 images, 64 rows, a memory share
 # of 0.9, keep-alive 5 s), and the seed and grammar of deploy/config.yaml
-IMAGE = {**EXAMPLE, "image tokens": 280, "images per request": 16, "context": 262_144, "batch invariant": False,
+IMAGE = {**EXAMPLE, "image tokens": 280, "images per request": 16, "context": 262_144, "batch invariant": True,
          "rows": 64, "runner": (IMAGE_CONFIG["runner"]["kind"], 0.9), "keep-alive": 5,
          "seed": IMAGE_CONFIG["scheduler"]["seed"],
          "grammar": (IMAGE_CONFIG["structured_output"]["backend"],

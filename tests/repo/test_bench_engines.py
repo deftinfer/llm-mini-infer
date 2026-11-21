@@ -12,6 +12,7 @@ import stat
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -661,6 +662,126 @@ def test_an_interrupted_start_kills_every_group_already_running(tmp_path, monkey
     else:
         os.kill(pid, 9)
         pytest.fail("the exited leader's sleep outlived the interrupt")
+
+
+# -- the context and family L ------------------------------------------------------------------------------------------
+
+def test_the_default_context_leaves_every_arm_as_it_was():
+    assert arms.CONTEXT == 8184
+    for family_arms in arms.arms("gemma").values():
+        for a in family_arms:
+            assert a.context == arms.CONTEXT and "ctx" not in a.name
+            cmd = arms.argv(a, "/x/bin")
+            flag = {"ours": "--set", "vllm": "--max-model-len", "sglang": "--context-length"}[a.engine]
+            want = "model.max_model_len=8184" if a.engine == "ours" else "8184"
+            assert want in [cmd[i + 1] for i, c in enumerate(cmd) if c == flag]
+    assert [a.name for a in arms.arms("gemma")["I"]] == [
+        "ours", "ours-nobi", "vllm", "vllm-bi-nodg", "sglang", "sglang-bi"]
+
+
+def test_a_longer_context_is_in_every_engines_flags_and_the_unit_name():
+    for a in arms.arms("gemma", 32768)["A1"]:
+        cmd = arms.argv(a, "/x/bin")
+        assert a.name == f"{a.engine}-ctx32768" and a.context == 32768
+        want = "model.max_model_len=32768" if a.engine == "ours" else "32768"
+        assert want in cmd and "8184" not in " ".join(cmd)
+    qwen = arms.argv(arms.Arm("vllm", "qwen", context=65536), "/x/bin")
+    assert qwen[qwen.index("--max-model-len") + 1] == "65536"
+
+
+def test_ours_is_invariant_by_default_on_gemma_and_on_qwen_up_to_its_limit_and_family_i_and_l_pair_it_with_the_other():
+    default = arms.default_batch_invariant
+    assert default("ours", 8184, "gemma") and default("ours", 262144, "gemma")
+    assert default("ours", 32768, "qwen") and not default("ours", 32769, "qwen")
+    assert not default("vllm", 8184, "gemma") and not default("sglang", 32768, "gemma")
+    for family in ("I", "L"):
+        ours = [a for a in arms.arms("gemma", 32768)[family] if a.engine == "ours"]
+        assert [a.name for a in ours] == ["ours-ctx32768", "ours-ctx32768-nobi"]
+        assert [arms.batch_invariant(a) for a in ours] == [True, False]
+        assert "dev.runner.cuda.batch_invariant=false" in arms.argv(ours[1], "/x/bin")
+        assert not any("batch_invariant" in x for x in arms.argv(ours[0], "/x/bin"))
+        assert [a.name for a in arms.arms("gemma", 32768)[family] if a.engine == "vllm"] == [
+            "vllm-ctx32768", "vllm-ctx32768-bi-nodg"]
+    for context, names in ((32768, ["ours-ctx32768", "ours-ctx32768-nobi"]),
+                           (65536, ["ours-ctx65536", "ours-ctx65536-bi"])):
+        ours = [a for a in arms.arms("qwen", context)["I"] if a.engine == "ours"]  # on at 32,768, off past it
+        assert [a.name for a in ours] == names
+
+
+def test_the_invariance_limit_is_the_packages():
+    from llm_mini_infer import config
+
+    assert arms.OURS_INVARIANT_MAX_LEN == {"gemma": None, "qwen": config.QWEN_INVARIANT_MAX_LEN}
+
+
+def test_family_l_keeps_the_loads_that_fit_the_context():
+    def fits(context):
+        kept, skipped = drive.long_loads(context)
+        return [s.name for s in kept], skipped
+
+    chat = ["chat-c16", "chat-c64", "chat-c64-r2", "chat-c64-r3"]
+    names = ["decode-c1-h1k", "decode-c1-h8k", "decode-c1-h32k", *chat, "prefill-32k", "prefill-128k", "cached-32k",
+             "cached-128k"]
+    kept, skipped = fits(8184)
+    assert kept == ["decode-c1-h1k", *chat] and len(skipped) == 6
+    assert "decode-c1-h8k skipped" in skipped[0] and "8,448" in skipped[0] and "8,184" in skipped[0]
+    kept, skipped = fits(32768)  # the "32k" loads fit a 32,768 context beside their replies
+    assert kept == [*names[:7], "prefill-32k", "cached-32k"]
+    assert [n.split()[1] for n in skipped] == ["prefill-128k", "cached-128k"]
+    assert fits(131072) == (names, [])
+    assert fits(262144) == (names, [])
+
+
+def test_family_l_loads_have_their_own_first_indexes_and_their_own_timeouts():
+    kept, _ = drive.long_loads(262144)
+    firsts = [s.args[s.args.index("--first-index") + 1] for s in kept]
+    assert len(set(firsts)) == len(firsts)
+    by = {s.name: s for s in kept}
+    first = {n: by[n].args[by[n].args.index("--first-index") + 1] for n in by}
+    assert first["chat-c16"] == "1000000" and first["chat-c64"] == "2000000"  # where family I's start
+    assert (first["chat-c64-r2"], first["chat-c64-r3"]) == ("2100000", "2200000")
+    assert by["prefill-128k"].args[by["prefill-128k"].args.index("--input-tokens") + 1] == "130000"
+    assert by["cached-32k"].args[by["cached-32k"].args.index("--shared-prefix-tokens") + 1] == "32000"
+    bounded = [n for n in by if n.startswith(("decode", "prefill", "cached"))]
+    assert all("--requests" in by[n].args and "--duration" not in by[n].args for n in bounded)
+    assert all(by[n].fixed == {"--timeout": "900"} for n in bounded if not n.startswith("decode"))
+    assert "--requests" not in by["chat-c16"].args
+
+
+def test_family_l_dry_run_names_the_skipped_loads_and_the_manifest_does_too(rig, capsys):
+    rig.mp.undo()  # the real loads_for
+    argv = ["--out", str(rig.out), "--model", "gemma", "--family", "L", "--engines", "ours", "--context", "32768"]
+    assert drive.main([*argv, "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert [ln.split(":")[0] for ln in out.splitlines() if ln.startswith("L ")] == ["L ours-ctx32768",
+                                                                                  "L ours-ctx32768-nobi"]
+    assert "load prefill-32k:" in out and "load prefill-128k:" not in out and "prefill-128k skipped" in out
+    assert not rig.out.exists()
+
+
+def test_load_keeps_only_the_named_loads():
+    args = drive.parser().parse_args(["--out", "x", "--model", "gemma", "--family", "L", "--context", "262144",
+                                      "--load", "prefill-128k", "--load", "cached-128k"])
+    unit = drive.build_units(args)[0]
+    assert [s.name for s in drive.loads_for(SimpleNamespace(args=args), unit)] == ["prefill-128k", "cached-128k"]
+    args = drive.parser().parse_args(["--out", "x", "--model", "gemma", "--family", "L", "--context", "32768",
+                                      "--load", "prefill-128k", "--load", "cached-32k"])
+    with pytest.raises(LookupError, match=r"^--load prefill-128k: not among family L's loads here \(.*cached-32k"):
+        drive.loads_for(SimpleNamespace(args=args, log=print), drive.build_units(args)[0])  # past the context
+
+
+def test_a_manifest_names_the_loads_kept(rig):
+    rig.mp.setattr(drive, "loads_for", lambda ctx, unit: [])
+    assert rig.run("--context", "32768", "--arm", "vllm-ctx32768", "--load", "chat-c64", family="L") == 0
+    assert "only the loads chat-c64 (--load)" in rig.manifest("vllm-ctx32768", "L")["deviations"]
+
+
+def test_a_family_l_manifest_records_the_context_and_the_skipped_loads(rig):
+    rig.mp.setattr(drive, "loads_for", lambda ctx, unit: [])
+    assert rig.run("--context", "32768", "--arm", "vllm-ctx32768", family="L") == 0
+    m = rig.manifest("vllm-ctx32768", "L")
+    assert m["arm"] == "vllm-ctx32768" and m["argv"][m["argv"].index("--max-model-len") + 1] == "32768"
+    assert any("load prefill-128k skipped" in d for d in m["deviations"])
 
 
 def fake_children(monkeypatch, code=0, report: str | None = "{}", timed_out=False, only="run.py"):

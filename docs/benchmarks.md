@@ -86,7 +86,7 @@ The record's README gives [the full definitions](../bench/reports/v0.8.0/README.
 
 - The record's README names the two measured commits of llm-mini-infer, from the project's history before its first public commit, and the digests of their GPU tests' images, which were not published. Their serving code (`llm_mini_infer/`, `deploy/`, `pyproject.toml`, `uv.lock`) is this tree's, apart from comments, docstrings, version numbers, pyproject's authors, URLs and ruff exclude, and one test marker's description.
 - vLLM v0.33.0 and SGLang v0.5.23, each in a venv of its own. `freeze-diff.txt` compares each venv with its vendor image.
-- Batch invariance: llm-mini-infer's `dev.runner.cuda.batch_invariant` (on by default at a context of 8,184 or less), vLLM's `VLLM_BATCH_INVARIANT=1` (with `VLLM_USE_DEEP_GEMM=0` to hold), and SGLang's `--enable-deterministic-inference`.
+- Batch invariance: llm-mini-infer's `dev.runner.cuda.batch_invariant` (on by default on Gemma 4, and on Qwen3.8 up to a context of 32,768), vLLM's `VLLM_BATCH_INVARIANT=1` (with `VLLM_USE_DEEP_GEMM=0` to hold), and SGLang's `--enable-deterministic-inference`.
 - `commands.sh` gives every server's command and flags.
 
 ## Running it again
@@ -98,7 +98,7 @@ uv run python bench/load/run.py --model RedHatAI/gemma-4-31B-it-FP8-block --work
     --input-tokens 1024 --max-tokens 256 --ignore-eos
 ```
 
-The benchmark's llm-mini-infer ran with the image's configuration file and `--set model.max_model_len=8184`. The [quickstart](../README.md#quickstart) runs at the model's own context limit, where batch invariance is off. [bench/README.md](../bench/README.md) describes the tools.
+The benchmark's llm-mini-infer ran with the image's configuration file and `--set model.max_model_len=8184`. [bench/README.md](../bench/README.md) describes the tools.
 
 ## What not to conclude
 

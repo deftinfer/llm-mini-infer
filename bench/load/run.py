@@ -22,7 +22,10 @@ requests at the same arrivals against each engine, so they can be compared on on
   conversation and the turn: every engine's clients pause alike; a pause ends at the end of the window and tail at the
   latest); none after the last turn or a failed request. With think time the conversations in flight are fewer than
   `--concurrency`: the report's `in_flight` shows how many were.
-  The replies are kept in memory for the next turn, never in the report.
+  The replies are kept in memory for the next turn, never in the report. `--shared-prefix-tokens N` starts every
+  request's prompt (with `--turns`, each conversation's first message) with the same N tokens of random words, seeded
+  by the seed alone and followed by a blank line: the server's prefix cache holds them after the first requests, so
+  a later request's TTFT is a short turn over a long cached history.
 - `catalog`: text only, structured: each request asks for a numbered catalog's entries
   (tests/support/catalog_schema.py's prompts, so no two are the same), with the catalog schema
   (tests/data/catalog.schema.json) as a strict response format, its list of entries held to at least
@@ -220,18 +223,33 @@ def next_turn_messages(messages: list[dict[str, Any]], reply: str, user_text: st
     return [*messages, {"role": "assistant", "content": reply}, {"role": "user", "content": user_text}]
 
 
-def chat_workload(tok: Any, input_tokens: int, max_tokens: int, seed: int, tool_tokens: int = 0) -> Workload:
+def shared_prefix(tok: Any, tokens: int, seed: int) -> str:
+    """`tokens` tokens of random words seeded by the seed alone (the same for every request), cut to that many tokens
+    and decoded, then a blank line that ends the prefix."""
+    rng = random.Random(f"shared:{seed}")
+    text = " ".join(rng.choice(WORDS) for _ in range(tokens))
+    return tok.decode(tok.encode(text, add_special_tokens=False).ids[:tokens]) + "\n\n"
+
+
+def chat_workload(tok: Any, input_tokens: int, max_tokens: int, seed: int, tool_tokens: int = 0,
+                  shared_tokens: int = 0, prefix_seed: int | None = None) -> Workload:
     """Text requests, each prompt `input_tokens` tokens of random words (a request's index first, so no two share a
-    prefix), cut to that many tokens and decoded; `tool_tokens`: the size of a session's follow-up messages."""
+    prefix), cut to that many tokens and decoded; `tool_tokens`: the size of a session's follow-up messages;
+    `shared_tokens`: tokens of one text every prompt starts with, before its own part, drawn from `prefix_seed`
+    (default: `seed`; the warm-up's workload keeps the measured one's, so its requests cache the same prefix)."""
+    prefix = shared_prefix(tok, shared_tokens, seed if prefix_seed is None else prefix_seed) if shared_tokens else ""
 
     def body(i: int) -> dict[str, Any]:
         rng = random.Random(seed * 1_000_003 + i)
         head = f"Request {i}. Repeat these words in reverse order: "
         text = head + " ".join(rng.choice(WORDS) for _ in range(input_tokens))
         ids = tok.encode(text, add_special_tokens=False).ids[:input_tokens]
-        return {"messages": [{"role": "user", "content": tok.decode(ids)}], "max_tokens": max_tokens}
+        return {"messages": [{"role": "user", "content": prefix + tok.decode(ids)}], "max_tokens": max_tokens}
 
-    return Workload("chat", body, None, {"mode": "chat", "input_tokens": input_tokens, "max_tokens": max_tokens},
+    summary = {"mode": "chat", "input_tokens": input_tokens, "max_tokens": max_tokens}
+    if shared_tokens:
+        summary["shared_prefix_tokens"] = shared_tokens
+    return Workload("chat", body, None, summary,
                     tool_message=lambda conversation, turn: tool_text(tok, tool_tokens, seed, conversation, turn))
 
 
@@ -271,7 +289,8 @@ def make_workload(args: argparse.Namespace) -> Workload:
         return schema_workload(inputs, args.max_tokens or SCHEMA_MAX_TOKENS)
     tok = load_tokenizer(args.tokenizer or args.model)
     if args.workload == "chat":
-        return chat_workload(tok, args.input_tokens, args.max_tokens or CHAT_MAX_TOKENS, args.seed, args.tool_tokens)
+        return chat_workload(tok, args.input_tokens, args.max_tokens or CHAT_MAX_TOKENS, args.seed, args.tool_tokens,
+                             getattr(args, "shared_prefix_tokens", 0), getattr(args, "prefix_seed", None))
     inputs = synthetic_inputs(lambda text: len(tok.encode(text).ids), args.prompt_tokens, args.tall_share)
     return schema_workload(inputs, args.max_tokens or SCENE_MAX_TOKENS)
 
@@ -841,10 +860,19 @@ def numbers(text: str, kind: type) -> list:
         raise argparse.ArgumentTypeError(f"{text!r}: comma-separated numbers") from exc
 
 
+def warm_up_args(args: argparse.Namespace) -> argparse.Namespace:
+    """The warm-up's arguments: `--seed + 1`, and the measured run's shared prefix (`--shared-prefix-tokens`), which
+    the warm-up requests then put in the server's prefix cache."""
+    prefix = args.seed if getattr(args, "prefix_seed", None) is None else args.prefix_seed
+    return argparse.Namespace(**{**vars(args), "seed": args.seed + 1, "prefix_seed": prefix})
+
+
 async def warm_up(run: Run, args: argparse.Namespace, count: int) -> None:
-    """`count` unrecorded requests at concurrency min(count, 4), from the workload built with `--seed + 1`, at the
-    indexes from `WARMUP_OFFSET`: `run.offset` is not touched. A failed request ends the run."""
-    warm = dataclasses.replace(run, workload=make_workload(argparse.Namespace(**{**vars(args), "seed": args.seed + 1})),
+    """`count` unrecorded requests at concurrency min(count, 4), from the workload built with `warm_up_args`, at the
+    indexes from `WARMUP_OFFSET`: `run.offset` is not touched. With `--shared-prefix-tokens`, one at a time: the second
+    then branches at the prefix's end, where the server's cache writes a checkpoint, so the measured requests hit it
+    (two at once would each prefill the whole prefix, and neither leaves one there). A failed request ends the run."""
+    warm = dataclasses.replace(run, workload=make_workload(warm_up_args(args)),
                                offset=WARMUP_OFFSET)
     taken = 0
 
@@ -858,7 +886,8 @@ async def warm_up(run: Run, args: argparse.Namespace, count: int) -> None:
                 raise SystemExit(f"warm-up request {j} failed: {rec.get('error') or rec.get('status')}")
 
     print(f"[{time.strftime('%H:%M:%S')}] {count} warm-up requests", file=sys.stderr, flush=True)
-    await asyncio.gather(*(client() for _ in range(min(count, 4))))
+    clients = 1 if getattr(args, "shared_prefix_tokens", 0) else min(count, 4)
+    await asyncio.gather(*(client() for _ in range(clients)))
 
 
 async def main_async(args: argparse.Namespace) -> dict[str, Any]:
@@ -976,6 +1005,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--tall-share", type=float, default=synthetic.TALL_SHARE,
                     help="scene: the share of tall images, 0 to 1 (default: %(default)s)")
     ap.add_argument("--input-tokens", type=int, default=512, help="chat: each prompt's tokens")
+    ap.add_argument("--shared-prefix-tokens", type=int, default=0, metavar="N",
+                    help="chat: every prompt starts with the same N tokens (with --turns, each conversation's first "
+                         "message), so the prefix cache holds them (default: %(default)s, none)")
     ap.add_argument("--turns", type=int, default=1,
                     help="chat, with --concurrency: requests per conversation, each one the last one's messages, its "
                          "reply and a new user message (default: %(default)s, single requests)")
@@ -1004,6 +1036,10 @@ def main(argv: list[str] | None = None) -> int:
         ap.error(f"--tall-share {args.tall_share}: a share from 0 to 1")
     if args.prompt_tokens < 1:
         ap.error(f"--prompt-tokens {args.prompt_tokens}: at least 1")
+    if args.shared_prefix_tokens < 0:
+        ap.error(f"--shared-prefix-tokens {args.shared_prefix_tokens}: at least 0")
+    if args.shared_prefix_tokens and args.workload != "chat":
+        ap.error("--shared-prefix-tokens needs --workload chat")
     if args.turns < 1:
         ap.error(f"--turns {args.turns}: at least 1")
     if args.turns > 1 and (args.rates or args.find_rate or args.workload != "chat"):

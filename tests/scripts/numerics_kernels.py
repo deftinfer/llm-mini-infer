@@ -10,13 +10,17 @@ prefill moves bits between identical calls.
         [--rows 1,16,128]
     python3 -m tests.scripts.numerics_kernels nan-leak
     python3 -m tests.scripts.numerics_kernels timing
+    python3 -m tests.scripts.numerics_kernels attn-timing [--parts qwen-full,gemma-full] [--max-model-len 262144]
 
 They run on an SM120 GPU (an RTX PRO 6000: 188 SMs) with the kernel library and FlashInfer 0.7.2, from the GPU tests'
 image (`/opt/llm-mini-infer/test`); `--help` and the host-side helpers (tests/repo/test_numerics.py) run anywhere. Each
 subcommand prints markdown tables and writes them, with its JSON results, into `--out` (default
 `results/numerics/kernels/<UTC time>/`): `<subcommand>.md` and `<subcommand>.json` (non-finite numbers as null).
-`<subcommand> --help` describes each. Inputs are random from `--seed`, reseeded per case, so a case gets the same inputs
-alone or among others. A case that raises is recorded in the JSON and the run goes on; the exit status is then 1.
+`<subcommand> --help` describes each. `attn-timing` times (CUDA events, eagerly and in decode graphs) the attention
+kernels of both models' full layers, the batch-invariant path against the switch-off one, at a grid of prefill and
+decode shapes, both sized for `--max-model-len`. Inputs are random from `--seed`, reseeded per case, so a case gets the
+same inputs alone or among others. A case that raises is recorded in the JSON and the run goes on; the exit status is
+then 1.
 
 **Shapes.** Qwen3.8 27B's GDN layers: 16 q/k heads, 48 v heads, head dim 128, fp32 states [48, 128, 128], q and k
 L2-normalised by the caller, the decay passed as alpha = exp(g) (`kernels.flashinfer.flashinfer_gdn_prefill`); its full
@@ -57,12 +61,11 @@ from typing import Any
 
 import numpy as np
 
-from llm_mini_infer.config import BATCH_INVARIANT_MAX_LEN
-
 from ..support.paths import ROOT
 from .numerics_forced import HelpFormatter, md, parse_ids, results_dir
 from .numerics_fp32 import recurrence
 
+BENCH_CONTEXT = 8184  # the engine benchmark's context (bench/engines/arms.py CONTEXT)
 DEV = "cuda"
 GDN_HK, GDN_HV, GDN_D = 16, 48, 128  # Qwen3.8 27B's GDN layers: q/k heads, v heads, head dim
 KEYS = ("q", "k", "v", "a", "b")  # a GDN row's per-token inputs (`_gdn_seq`'s names: a the decay alpha, b beta)
@@ -225,6 +228,42 @@ def gdn_fp32(rows: list[dict[str, Any]],
                 got[i][t1] = h[i].clone()
     o = torch.cat(outs, 1)
     return [(o[i, :lens[i]], h[i], got[i]) for i in range(len(rows))]
+
+
+
+def case_history(case: AttnCase) -> int:
+    """The positions before a single-shape case's rows' queries (attn-timing's grids)."""
+    return int(case.ub[0] - case.nq[0])
+
+
+def timing_cases(short_chunks: list[int], histories: list[int], long_chunk: int, long_histories: list[int],
+                 decode_rows: list[int], decode_histories: list[int], k: int) -> list[AttnCase]:
+    """attn-timing's steps, their KV lengths exact (lb = ub): one prefill row of each of `short_chunks` queries over
+    each of `histories` positions, one of `long_chunk` over each of `long_histories`, and per `decode_rows` count
+    verify rows of 1 + k queries over each of `decode_histories`. Each row has the shape's one length."""
+
+    def one(name: str, rows: int, nq: int, history: int, n_dec: int) -> AttnCase:
+        kv = np.full(rows, history + nq, np.int64)
+        return AttnCase(name, np.full(rows, nq, np.int64), kv, kv.copy(), n_dec)
+
+    out = [one(f"prefill-short-{c}-h{h}", 1, c, h, 0) for c in short_chunks for h in histories]
+    out += [one(f"prefill-long-{long_chunk}-h{h}", 1, long_chunk, h, 0) for h in long_histories]
+    return out + [one(f"decode-{n}-h{h}", n, 1 + k, h, n) for n in decode_rows for h in decode_histories]
+
+
+def timing_variants(case: AttnCase, prefill_keys: list[int], splits_prefill: bool) -> list[int | None]:
+    """The prefill split bases the batch-invariant path of `case` is timed at: each of `prefill_keys` for a prefill
+    step on a part whose prefill rows split (the full layers'), else one, None (the default; a decode row's split comes
+    from its own position, whatever the context)."""
+    return list(prefill_keys) if splits_prefill and not case.n_dec else [None]
+
+
+def timing_ratios(recs: list[dict[str, Any]]) -> None:
+    """Each timed batch-invariant record's `ratio`: its median over the switch-off record's of its case and mode."""
+    off = {(r["case"], r["mode"]): r["median_us"] for r in recs if r.get("impl") == "off" and "median_us" in r}
+    for r in recs:
+        if r.get("impl") == "on" and "median_us" in r and (r["case"], r["mode"]) in off:
+            r["ratio"] = r["median_us"] / off[r["case"], r["mode"]]
 
 
 # -- output ---------------------------------------------------------------------------------------------------------
@@ -964,7 +1003,7 @@ class _QwenFull(_AttnPart):
     def __init__(self, args: argparse.Namespace, dev: Any):
         import torch
 
-        from llm_mini_infer.kernels.attn512 import fixed_split_keys
+        from llm_mini_infer.kernels.attn512 import SPLIT_KEYS
         from llm_mini_infer.kernels.attn_window import FullAttention
         from llm_mini_infer.kernels.flashinfer import FlashInferAttention
 
@@ -976,7 +1015,7 @@ class _QwenFull(_AttnPart):
         self.check = _self_check(self.fi)
         self.ours = FullAttention(ns, self.H, self.HKV, self.D, dev, max_tokens=args.max_tokens,
                                   max_rows=args.max_num_seqs, max_kv=self.max_kv, scale=self.D ** -0.5,
-                                  qo_per_row=self.L, split_keys=fixed_split_keys(self.max_kv))
+                                  qo_per_row=self.L, split_keys=SPLIT_KEYS)
         self.arange = torch.arange(self.max_pages, device=dev)
 
     def setup(self, case: AttnCase, seed: int) -> None:
@@ -1143,16 +1182,16 @@ class _GemmaSliding(_AttnPart):
 class _GemmaFull(_AttnPart):
     """Gemma 4's full layers on `attn512.Attn512`: the wave split (`split_keys` 0, the switch-off path's) eagerly and
     in a decode bucket's tables (`plan_graph`: the split counts of the replay's real rows), against the fixed split
-    (`fixed_split_keys`, the switch-on path's) and fp32: SDPA's math backend over K = RoPE(V ⊙ k_norm) rounded as the
-    kernel rounds it (`gemma_ops.k_from_v`, `attention_ref`), kept in fp32 (test_gemma_kernels.py's `_full_ref` rounds
-    it to BF16)."""
+    (`split_size` from `SPLIT_KEYS`, the switch-on path's) and fp32: SDPA's math backend over K = RoPE(V ⊙ k_norm)
+    rounded as the kernel rounds it (`gemma_ops.k_from_v`, `attention_ref`), kept in fp32 (test_gemma_kernels.py's
+    `_full_ref` rounds it to BF16)."""
 
     name = "gemma-full"
     impls = ("wave", "wave-graph", "fixed")
     H, HKV, D, ROT = 32, 4, 512, 64
 
     def __init__(self, args: argparse.Namespace, dev: Any):
-        from llm_mini_infer.kernels.attn512 import Attn512, fixed_split_keys
+        from llm_mini_infer.kernels.attn512 import SPLIT_KEYS, Attn512
 
         from ..support.kernel_cases import _Pools, _rope_tables, _Rot
 
@@ -1161,7 +1200,7 @@ class _GemmaFull(_AttnPart):
         kw = dict(max_tokens=args.max_tokens, max_rows=args.max_num_seqs, qo_per_row=self.L)
         self.wave = Attn512(_Pools(None, PS), _Rot(self.cos, self.sin), self.H, self.HKV, self.ROT, dev, **kw)
         self.fixed = Attn512(_Pools(None, PS), _Rot(self.cos, self.sin), self.H, self.HKV, self.ROT, dev,
-                             split_keys=fixed_split_keys(self.max_kv), max_kv=self.max_kv, **kw)
+                             split_keys=SPLIT_KEYS, max_kv=self.max_kv, **kw)
 
     def setup(self, case: AttnCase, seed: int) -> None:
         from ..support.kernel_cases import _full_case, _Pools
@@ -1560,6 +1599,456 @@ def cmd_timing(args: argparse.Namespace) -> int:
     return 1 if any("error" in c for c in result["cases"]) else 0
 
 
+# -- attn-timing ----------------------------------------------------------------------------------------------------
+
+
+def _graph(fn: Callable[[], Any]) -> Any:
+    """`fn`'s launches captured in a CUDA graph, after a warm-up on a side stream (as torch requires)."""
+    import torch
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(3):
+            fn()
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        fn()
+    torch.cuda.synchronize()
+    return g
+
+
+class _TimedPart:
+    """One layer kind's timing probe: the switch-off path (`off`) and the batch-invariant one (`on`, per prefill split
+    base it is timed at), made once, and per case a KV pool, page table and queries. `prepare` plans one of them for the
+    case, in a `mode` (eager: the step's own plan; bucket: the decode bucket's plan, run eagerly; graph: the same, for
+    the caller to capture), and returns the callable that launches the kernels, nothing else: the output and the
+    padded queries are made before it."""
+
+    name = ""
+    H = HKV = D = 0
+    splits_prefill = True  # whether the batch-invariant path splits prefill rows (`timing_variants`)
+    real_rows = True  # whether its plan_graph takes the real rows
+
+    def __init__(self, args: argparse.Namespace, dev: Any, sizes: SimpleNamespace):
+        self.args, self.dev, self.sizes, self.L = args, dev, sizes, 1 + args.k
+        self.ons: dict[int, Any] = {}
+        self.pool = self.table = self.q = self.out = self.pools = self.layer = self._bucket = None
+
+    def off_split_keys(self) -> int | None:
+        return None
+
+    def on_split_keys(self) -> int:
+        from llm_mini_infer.kernels.attn512 import SPLIT_KEYS
+
+        return SPLIT_KEYS
+
+    def make(self, prefill_keys: int | None) -> Any:
+        raise NotImplementedError
+
+    def prefill(self, prefill_keys: int | None) -> dict[str, int]:
+        return {"prefill_from": self.args.prefill_from, "prefill_keys": prefill_keys or self.prefill_default()}
+
+    def prefill_default(self) -> int:
+        from llm_mini_infer.kernels.attn512 import PREFILL_KEYS
+
+        return PREFILL_KEYS
+
+    def on(self, prefill_keys: int | None) -> Any:
+        a = self.ons.get(prefill_keys)
+        if a is None:
+            a = self.ons[prefill_keys] = self.make(prefill_keys)
+        a.pools = self.pools
+        return a
+
+    def instances(self) -> list[Any]:
+        return list(self.ons.values())
+
+    def pools_of(self, kv: Any) -> Any:
+        raise NotImplementedError
+
+    def build(self, case: AttnCase, seed: int) -> None:
+        """The case's pool, page table and queries."""
+        raise NotImplementedError
+
+    def queries(self, case: AttnCase, seed: int) -> Any:
+        import torch
+
+        g = torch.Generator(device=DEV).manual_seed(seed + 1)
+        return (torch.randn(int(case.nq.sum()), self.H, self.D, generator=g, device=DEV) * 0.1).to(torch.bfloat16)
+
+    def setup(self, case: AttnCase, seed: int) -> None:
+        import torch
+
+        self._bucket = None
+        self.build(case, seed)
+        self.out = torch.empty_like(self.q)
+        for a in self.instances():
+            a.pools = self.pools
+
+    def release(self) -> None:
+        for a in self.instances():
+            a.pools = None
+        self.pool = self.table = self.q = self.out = self.pools = self._bucket = None
+
+    def meta(self, rows: int) -> SimpleNamespace:
+        return SimpleNamespace(page_table=self.table, wpage_table=self.table, fix_len=False, n_rows=rows,
+                               kv_len_dev=None, bidi_plan=None)
+
+    def bucket(self, case: AttnCase) -> tuple[int, np.ndarray, Any, Any]:
+        """The decode bucket of the case's rows: its size, its row table (the padding rows on slot 0's null page with
+        1 + k keys), the queries with the padding rows' (zeros) and the output."""
+        if self._bucket is None:
+            n, L = len(case.nq), self.L
+            b = decode_bucket(n, self.sizes.buckets)
+            rb = np.zeros((b, 4), np.int32)
+            rb[:, 1], rb[:, 2], rb[:, 3] = np.arange(b) * L, L, L
+            rb[:n] = np.stack([np.arange(1, n + 1), case.starts, case.nq, case.ub], axis=1)
+            qb = self.q.new_zeros((b * L, *self.q.shape[1:]))
+            qb[:self.q.shape[0]] = self.q
+            self._bucket = (b, rb, qb, self.q.new_empty(qb.shape))
+        return self._bucket
+
+    def drive(self, a: Any, case: AttnCase, mode: str) -> Callable[[], Any]:
+        """Plan one of our backends (`a`) for the case and return its launch."""
+        n = len(case.nq)
+        if mode == "eager":
+            rows = np.stack([np.arange(1, n + 1), case.starts, case.nq, case.ub], axis=1).astype(np.int32)
+            meta, q, out = self.meta(n), self.q, self.out
+            a.plan(meta, parity=0, rows=rows, stage=_timing_stage, fixed_rows=case.n_dec)
+        else:
+            b, rb, q, out = self.bucket(case)
+            meta = self.meta(b)
+            a.plan_graph(meta, bucket=b, rows=rb, stage=_timing_stage, **({"real": n} if self.real_rows else {}))
+        return lambda: a.run(meta, self.layer, q, out)
+
+    def off(self, case: AttnCase, mode: str) -> Callable[[], Any]:
+        raise NotImplementedError
+
+    def prepare(self, impl: str, case: AttnCase, mode: str, prefill_keys: int | None) -> Callable[[], Any]:
+        return self.drive(self.on(prefill_keys), case, mode) if impl == "on" else self.off(case, mode)
+
+
+def _timing_stage(a: np.ndarray) -> Any:
+    from ..support.kernel_cases import _stage
+
+    return _stage(a)
+
+
+class _TimedQwen(_TimedPart):
+    """Qwen3.8's full layers: `FlashInferAttention` (eager plan, and the decode bucket's graph wrapper as the runner
+    plans it) against `attn_window.FullAttention`."""
+
+    name = "qwen-full"
+    H, HKV, D = 24, 4, 256
+
+    def __init__(self, args: argparse.Namespace, dev: Any, sizes: SimpleNamespace):
+        import torch
+
+        from llm_mini_infer.kernels.flashinfer import FlashInferAttention
+
+        super().__init__(args, dev, sizes)
+        self.max_pages = -(-sizes.max_kv // PS) + 2
+        self.fi = FlashInferAttention(SimpleNamespace(kv=None, page_size=PS), self.H, self.HKV, self.D,
+                                      torch.bfloat16, dev, max_rows=sizes.max_rows, max_pages=self.max_pages,
+                                      qo_per_row=self.L)
+        self.arange = torch.arange(self.max_pages, device=dev)
+        self.layer = 0
+
+    def prefill_default(self) -> int:
+        from llm_mini_infer.kernels.attn_window import FULL_PREFILL_KEYS
+
+        return FULL_PREFILL_KEYS
+
+    def make(self, prefill_keys: int | None) -> Any:
+        from llm_mini_infer.kernels.attn_window import FullAttention
+
+        return FullAttention(None, self.H, self.HKV, self.D, self.dev, max_tokens=self.sizes.max_tokens,
+                             max_rows=self.sizes.max_rows, max_kv=self.sizes.max_kv, scale=self.D ** -0.5,
+                             qo_per_row=self.L, split_keys=self.on_split_keys(), **self.prefill(prefill_keys))
+
+    def build(self, case: AttnCase, seed: int) -> None:
+        import torch.nn.functional as F
+
+        from ..support.kernel_cases import _window_setup
+
+        self.pool, table = _window_setup([int(x) for x in case.ub], self.HKV, self.D, PS, seed)
+        self.table = F.pad(table, (0, self.max_pages - table.shape[1]))  # as wide as the graph wrappers' buffers
+        self.pools = SimpleNamespace(kv=self.pool[None], page_size=PS)
+        self.q = self.queries(case, seed)
+
+    def off(self, case: AttnCase, mode: str) -> Callable[[], Any]:
+        from llm_mini_infer.kernels.flashinfer import page_indices
+
+        n, L, fi, pool = len(case.nq), self.L, self.fi, self.pool
+        slots = np.arange(1, n + 1)
+        if mode == "eager":
+            pages = -(-case.ub // PS)
+            indptr = np.concatenate([[0], np.cumsum(pages)])
+            idx = page_indices(self.table, _dev64(slots), _dev64(pages), _dev64(indptr), int(pages.max()),
+                               int(indptr[-1]), self.arange)
+            w = fi.plan(None, parity=0, qo_indptr=_timing_stage(case.qo_indptr), kv_indptr=_timing_stage(indptr),
+                        kv_indices=idx, last_page_len=_timing_stage(case.ub - (pages - 1) * PS),
+                        kv_lens=_timing_stage(case.ub), max_q=int(case.nq.max()))
+            q, out = self.q, self.out
+            return lambda: w.run(q, pool, out=out)
+        b, _, qb, ob = self.bucket(case)
+        kv, sl = np.full(b, L), np.zeros(b, np.int64)  # padding rows: slot 0's null page, 1 + k keys
+        kv[:n], sl[:n] = case.ub, slots
+        pages = -(-kv // PS)
+        indptr = np.concatenate([[0], np.cumsum(pages)])
+        w = fi.plan_graph(None, rows=b, parity=0, qo_indptr=_timing_stage(np.arange(b + 1) * L),
+                          kv_indptr=_timing_stage(indptr), last_page_len=_timing_stage(kv - (pages - 1) * PS),
+                          kv_lens=_timing_stage(kv), max_q=L)
+        fi.fix_lengths(w, b, _dev64(kv))
+        fi.graph_page_indices(b, self.table, _dev64(sl))
+        return lambda: w.run(qb, pool, out=ob, enable_pdl=False)
+
+
+class _TimedSliding(_TimedPart):
+    """Gemma 4's sliding layers: `FlashInferWindowAttention` (eager plan, and the decode bucket's graph wrapper, each
+    row named from its first window page) against `attn_window.WindowAttention`, whose split does not follow M."""
+
+    name = "gemma-sliding"
+    H, HKV, D, W = 32, 16, 256, 1024
+    splits_prefill = False
+    real_rows = False
+
+    def __init__(self, args: argparse.Namespace, dev: Any, sizes: SimpleNamespace):
+        import torch
+
+        from llm_mini_infer.kernels.flashinfer import FlashInferWindowAttention
+
+        super().__init__(args, dev, sizes)
+        wpages = -(-(self.W + PS + 2 * self.L) // PS) + 1  # the runner's: a decode row's window pages at most
+        self.fi = FlashInferWindowAttention(SimpleNamespace(wkv=None, page_size=PS), self.H, self.HKV, self.D,
+                                            torch.bfloat16, dev, self.W, max_rows=sizes.max_rows, max_pages=wpages,
+                                            qo_per_row=self.L, upper_bounds=True)
+        self.arange = torch.arange(-(-(self.W + sizes.max_tokens) // PS) + 2, device=dev)
+        self.layer = SimpleNamespace(index=0)
+
+    def on_split_keys(self) -> int:
+        from llm_mini_infer.kernels.attn_window import SPLIT_KEYS
+
+        return SPLIT_KEYS
+
+    def make(self, prefill_keys: int | None) -> Any:
+        from llm_mini_infer.kernels.attn_window import SPLIT_KEYS, WindowAttention
+
+        return WindowAttention(None, self.H, self.HKV, self.D, self.dev, self.W, max_tokens=self.sizes.max_tokens,
+                               max_rows=self.sizes.max_rows, qo_per_row=self.L, split_keys=SPLIT_KEYS)
+
+    def build(self, case: AttnCase, seed: int) -> None:
+        from ..support.kernel_cases import _window_setup
+
+        self.pool, self.table = _window_setup([int(x) for x in case.ub], self.HKV, self.D, PS, seed)
+        self.pools = SimpleNamespace(wkv=self.pool[None], page_size=PS)
+        self.q = self.queries(case, seed)
+
+    def off(self, case: AttnCase, mode: str) -> Callable[[], Any]:
+        from llm_mini_infer.kernels.flashinfer import window_page_indices
+
+        n, L, fi, pool = len(case.nq), self.L, self.fi, self.pool
+        slots = np.arange(1, n + 1)
+        wlo = np.maximum(case.ub - case.nq - self.W + 1, 0) // PS  # each row's first window page
+        kvw = case.ub - wlo * PS
+        if mode == "eager":
+            pages = -(-kvw // PS)
+            indptr = np.concatenate([[0], np.cumsum(pages)])
+            idx = window_page_indices(self.table, _dev64(slots), _dev64(wlo), _dev64(pages), _dev64(indptr),
+                                      int(pages.max()), int(indptr[-1]), self.arange)
+            w = fi.plan(None, parity=0, qo_indptr=_timing_stage(case.qo_indptr), kv_indptr=_timing_stage(indptr),
+                        kv_indices=idx, last_page_len=_timing_stage(kvw - (pages - 1) * PS),
+                        kv_lens=_timing_stage(kvw), max_q=int(case.nq.max()))
+            q, out = self.q, self.out
+            return lambda: w.run(q, pool, out=out)
+        b, _, qb, ob = self.bucket(case)
+        kv, first, sl = np.full(b, L), np.zeros(b, np.int64), np.zeros(b, np.int64)
+        kv[:n], first[:n], sl[:n] = kvw, wlo, slots  # padding rows: slot 0's null page, column 0
+        pages = -(-kv // PS)
+        indptr = np.concatenate([[0], np.cumsum(pages)])
+        w = fi.plan_graph(None, rows=b, parity=0, qo_indptr=_timing_stage(np.arange(b + 1) * L),
+                          kv_indptr=_timing_stage(indptr), last_page_len=_timing_stage(kv - (pages - 1) * PS),
+                          kv_lens=_timing_stage(kv), max_q=L)
+        fi.g_first[:b].copy_(_dev64(first))
+        fi.fix_lengths(w, b, _dev64(kv))
+        fi.graph_window_indices(b, self.table, _dev64(sl))
+        return lambda: w.run(qb, pool, out=ob, enable_pdl=False)
+
+
+class _TimedGemmaFull(_TimedPart):
+    """Gemma 4's full layers on `attn512.Attn512`: the wave split (`split_keys` 0) against the fixed split."""
+
+    name = "gemma-full"
+    H, HKV, D, ROT = 32, 4, 512, 64
+
+    def __init__(self, args: argparse.Namespace, dev: Any, sizes: SimpleNamespace):
+        from ..support.kernel_cases import _rope_tables
+
+        super().__init__(args, dev, sizes)
+        self.cos, self.sin = _rope_tables(self.D, self.ROT, sizes.max_kv + PS)
+        self.wave = self.make(None, fixed=False)  # the switch-off path
+
+    def off_split_keys(self) -> int | None:
+        return 0
+
+    def instances(self) -> list[Any]:
+        return [*super().instances(), self.wave]
+
+    def make(self, prefill_keys: int | None, fixed: bool = True) -> Any:
+        """The fixed split at a prefill base (None or 0: the default), or the wave split (`fixed` False)."""
+        from llm_mini_infer.kernels.attn512 import Attn512
+
+        from ..support.kernel_cases import _Pools, _Rot
+
+        return Attn512(_Pools(None, PS), _Rot(self.cos, self.sin), self.H, self.HKV, self.ROT, self.dev,
+                       max_tokens=self.sizes.max_tokens, max_rows=self.sizes.max_rows, qo_per_row=self.L,
+                       split_keys=self.on_split_keys() if fixed else 0, max_kv=self.sizes.max_kv,
+                       **self.prefill(prefill_keys))
+
+    def build(self, case: AttnCase, seed: int) -> None:
+        from ..support.kernel_cases import _full_case, _Layer, _Pools
+
+        rows = [(int(m), int(u)) for m, u in zip(case.nq, case.ub)]
+        fkv, self.table, self.q, kw, _, _ = _full_case(rows, self.H, self.HKV, PS, seed)
+        self.pool, self.pools, self.layer = fkv, _Pools(fkv[None], PS), _Layer(kw)
+
+    def off(self, case: AttnCase, mode: str) -> Callable[[], Any]:
+        return self.drive(self.wave, case, mode)
+
+    def release(self) -> None:
+        super().release()
+        self.layer = None
+
+
+TIMED_PARTS: dict[str, type[_TimedPart]] = {"qwen-full": _TimedQwen, "gemma-sliding": _TimedSliding,
+                                            "gemma-full": _TimedGemmaFull}
+
+
+def _time_case(part: _TimedPart, case: AttnCase, args: argparse.Namespace, recs: list[dict[str, Any]]) -> int:
+    """Time the switch-off path and the batch-invariant one at each prefill split base of `case` (`timing_variants`),
+    in each mode, into `recs`; the number of variants that raised."""
+    import torch
+
+    n = len(case.nq)
+    base = {"case": case.name, "rows": n, "nq": int(case.nq[0]), "history": case_history(case),
+            "kv_len": int(case.ub.max())}
+    modes = ("eager", "bucket", "graph") if case.n_dec else ("eager",)
+    errors = 0
+
+    def variant(impl: str, sp: int | None, mode: str, split_keys: int | None) -> None:
+        nonlocal errors
+        rec = {**base, "impl": impl, "sp": sp, "mode": mode, "split_keys": split_keys}
+        recs.append(rec)
+        try:
+            fn = part.prepare(impl, case, mode, sp)
+            torch.cuda.synchronize()
+            g = _graph(fn) if mode == "graph" else None
+            t = _timed(g.replay if g else fn, args.iters, args.warmup)
+            rec.update(median_us=t["median_ms"] * 1e3, p10_us=t["p10_ms"] * 1e3, p90_us=t["p90_ms"] * 1e3)
+            del g
+        except Exception as exc:
+            errors += 1
+            rec.update(_failed(f"attn-timing {part.name} {case.name} {impl} {mode}", exc))
+        torch.cuda.synchronize()
+
+    for mode in modes:
+        variant("off", None, mode, part.off_split_keys())
+    for sp in timing_variants(case, parse_ids(args.prefill_keys), part.splits_prefill):
+        for mode in modes:
+            variant("on", sp, mode, part.on_split_keys())
+    return errors
+
+
+def _timing_table(part: str, recs: list[dict[str, Any]], args: argparse.Namespace) -> str:
+    def us(r: dict[str, Any], key: str) -> str:
+        return f"{r[key]:.1f}" if key in r else "-"
+
+    rows = []
+    for r in recs:
+        if "case" not in r:
+            continue
+        impl = "off" if r["impl"] == "off" else "on" if not r["sp"] else f"on, Sp {r['sp']}"
+        note = r.get("error", "")[:60]
+        rows.append([r["case"], r["rows"], r["nq"], r["history"], impl, r["mode"], r["split_keys"],
+                     note or us(r, "median_us"), us(r, "p10_us"), us(r, "p90_us"),
+                     f"{r['ratio']:.2f}" if "ratio" in r else "-"])
+    return md_table(f"{part}: attention kernel time per call, batch-invariant (on; a prefill step at each prefill "
+                    f"split base Sp past {args.prefill_from:,} keys) against switch-off (off; "
+                    f"CUDA events, {args.iters} calls after {args.warmup}; the graph rows replay a CUDA graph)",
+                    ["case", "rows", "nq", "history", "impl", "mode", "split_keys", "median us", "p10", "p90",
+                     "on/off"], rows)
+
+
+def cmd_attn_timing(args: argparse.Namespace) -> int:
+    """CUDA-event timings (`_timed`: median, p10 and p90 of `--iters` calls after `--warmup`) of the attention kernels
+    of the full layers (`--parts`: `qwen-full`, `gemma-full`; `gemma-sliding` too), the batch-invariant path (on: our
+    kernels, the fixed split, a decode query's from its own position, a prefill query's past `--prefill-from` keys at
+    each base of `--prefill-keys`) against the switch-off one (off: FlashInfer, or `Attn512`'s wave split), each sized
+    for rows of `--max-model-len` + 1 + k keys. Steps (`timing_cases`, exact KV lengths): one prefill row of each of
+    `--short-chunks` queries over each of `--histories` positions; one of `--long-chunk` over each of
+    `--long-histories`; per `--decode-rows` count, verify rows of 1 + k queries (`--k`) over each of
+    `--decode-histories`. The plan is
+    made once per path, outside the timed region, and only the kernels' launches are timed: eagerly, and for the
+    verify rows in their decode bucket (`bucket`: its plan, run eagerly; `graph`: replayed from a CUDA graph, the
+    padding rows on the null page). Per step, path and mode: the median, p10 and p90 in microseconds and the ratio of
+    on to off. The eager rows of a kernel of a few microseconds count its launch's host time too: read the decode
+    steps' graph rows. Needs room for the pools: 64 rows of 32k positions are about 8 GiB on either model's full
+    layers, and their setup draws them in fp32 first (about 4 times that at its peak); the sliding layers' are 4
+    times as large, past a 96 GB card at that step."""
+    torch = _cuda(library=True)
+    from llm_mini_infer.runner.cuda.runner import default_decode_buckets
+
+    out = _out(args)
+    dev = torch.device(DEV, torch.cuda.current_device())
+    k = args.k
+    cases = timing_cases(parse_ids(args.short_chunks), parse_ids(args.histories), args.long_chunk,
+                         parse_ids(args.long_histories), parse_ids(args.decode_rows),
+                         parse_ids(args.decode_histories), k)
+    if max(c.n_dec for c in cases) > args.max_num_seqs:
+        raise SystemExit(f"--decode-rows past --max-num-seqs {args.max_num_seqs}")
+    buckets = default_decode_buckets(args.max_num_seqs)
+    sizes = SimpleNamespace(
+        buckets=buckets, max_rows=max([decode_bucket(c.n_dec, buckets) for c in cases if c.n_dec] + [1]),
+        max_tokens=max(int(c.nq.sum()) for c in cases),
+        max_kv=max(args.max_model_len + 1 + k, max(int(c.ub.max()) for c in cases)))
+    result: dict[str, Any] = {"device": _device(), "settings": {x: v for x, v in vars(args).items() if x != "func"},
+                              "parts": {}}
+    tables, errors = [], 0
+    for pname in names(args.parts):
+        recs: list[dict[str, Any]] = []
+        result["parts"][pname] = {"records": recs}
+        try:
+            part = TIMED_PARTS[pname](args, dev, sizes)
+        except Exception as exc:
+            errors += 1
+            result["parts"][pname].update(_failed(f"attn-timing {pname}", exc))
+            continue
+        for ci, case in enumerate(cases):
+            try:
+                part.setup(case, args.seed * 1000 + ci)
+                errors += _time_case(part, case, args, recs)
+                print(f"{pname} {case.name}: done", flush=True)
+            except Exception as exc:
+                errors += 1
+                recs.append({"case": case.name, **_failed(f"attn-timing {pname} {case.name}", exc)})
+            finally:
+                part.release()
+                torch.cuda.empty_cache()
+            timing_ratios(recs)
+            _save(out, "attn-timing", result, tables)
+        table = _timing_table(pname, recs, args)
+        print(table, flush=True)
+        tables.append(table)
+        del part
+        torch.cuda.empty_cache()
+    result["peak_gb"] = torch.cuda.max_memory_allocated() / 2 ** 30
+    _save(out, "attn-timing", result, tables)
+    return 1 if errors else 0
+
+
 # -- the command line -----------------------------------------------------------------------------------------------
 
 
@@ -1611,7 +2100,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--true", default="rand,lb", help="true lengths: lb, rand, ub")
     p.add_argument("--logit-std", type=float, default=2.0, help="the spread of q·k × scale")
     p.add_argument("--bad", type=float, default=0.05, help="a (row, query)'s relative RMS error counted bad above")
-    p.add_argument("--max-model-len", type=int, default=BATCH_INVARIANT_MAX_LEN - 8,
+    p.add_argument("--max-model-len", type=int, default=BENCH_CONTEXT,
                    help="sizes the fixed splits and the page tables")
     p.add_argument("--max-num-seqs", type=int, default=128, help="decode rows at most (the graph buckets)")
     p.add_argument("--max-tokens", type=int, default=4096, help="a step's tokens at most (our kernels' tables)")
@@ -1622,10 +2111,25 @@ def build_parser() -> argparse.ArgumentParser:
     p = add("timing", cmd_timing, "GDN prefill timings: checkpoints, routes, padding")
     p.add_argument("--iters", type=int, default=50, help="timed calls a variant")
     p.add_argument("--warmup", type=int, default=5, help="untimed calls before them")
-    p.add_argument("--single", default=f"512,1024,2048,4096,{BATCH_INVARIANT_MAX_LEN - 8}",
+    p.add_argument("--single", default=f"512,1024,2048,4096,{BENCH_CONTEXT}",
                    help="single-sequence lengths")
     p.add_argument("--padded", default="1000,300,2000,70,700;100,128,70,300,200",
                    help="packed mixes for the padded call (;-separated)")
+    p = add("attn-timing", cmd_attn_timing, "attention kernels' time: batch-invariant against switch-off")
+    p.add_argument("--parts", default="qwen-full,gemma-full", help="the layer kinds to time (gemma-sliding too)")
+    p.add_argument("--max-model-len", type=int, default=262144, help="the context both paths are sized for")
+    p.add_argument("--prefill-from", type=int, default=8192, help="a prefill query's keys taken whole up to this")
+    p.add_argument("--prefill-keys", default="0", help="the prefill split bases to time past it (0: each part's)")
+    p.add_argument("--short-chunks", default="64,256", help="short prefill rows' queries")
+    p.add_argument("--histories", default="8192,32768,131072", help="the positions before the short prefill rows")
+    p.add_argument("--long-chunk", type=int, default=2048, help="the long prefill row's queries")
+    p.add_argument("--long-histories", default="0,32768", help="the positions before the long prefill row")
+    p.add_argument("--decode-rows", default="1,64", help="verify rows a step")
+    p.add_argument("--decode-histories", default="1024,8192,32768", help="the positions before the verify rows' keys")
+    p.add_argument("--k", type=int, default=3, help="drafts: verify rows of 1 + k queries (all parts)")
+    p.add_argument("--max-num-seqs", type=int, default=128, help="decode rows at most (the graph buckets)")
+    p.add_argument("--iters", type=int, default=50, help="timed calls a variant")
+    p.add_argument("--warmup", type=int, default=5, help="untimed calls before them")
     return ap
 
 

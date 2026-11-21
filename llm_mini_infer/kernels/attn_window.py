@@ -44,14 +44,27 @@ import numpy as np
 import torch
 
 from . import build
-from .attn512 import ROWS, plan_items, tiles
+from .attn512 import (
+    MAX_SPLITS,
+    PREFILL_FROM,
+    ROWS,
+    launches,
+    plan_items,
+    range_splits,
+    split_major,
+    tile_items,
+    tile_positions,
+    tiles,
+)
 from .ops import _check, _p, _stream
 
 D = 256  # the kernels' head dim
 KT = 16  # keys a KV tile
 PROWS = 64  # query rows a prefill tile (csrc/attn_window.cu)
-MAX_SPLITS = 32  # the merge's (csrc/attn_window.cu MAX_MERGE_SPLITS)
 SPLIT_KEYS = 256  # a decode row's split, in keys (module docstring)
+# Full attention's prefill split base past attn512.PREFILL_FROM keys (`FullAttention`): a prefill tile is one CTA an SM,
+# so a short chunk over a long history runs on a few dozen CTAs unless split (attn-timing on SM120)
+FULL_PREFILL_KEYS = 2048
 
 
 def prefill_items(nq: np.ndarray, group: int, kv_heads: int, first_row: int) -> np.ndarray:
@@ -116,6 +129,16 @@ class WindowAttention:
         self.p_items = [torch.zeros((self.max_prefill_items, 4), dtype=torch.int32, device=device) for _ in range(2)]
         self.kend = [torch.zeros(max_tokens, dtype=torch.int32, device=device) for _ in range(2)]
         self.g_tabs: dict[int, tuple[torch.Tensor, torch.Tensor, int, torch.Tensor, int]] = {}
+
+    @staticmethod
+    def staging_bound(max_rows: int, max_tokens: int, group: int, kv_heads: int, qo_per_row: int, window: int,
+                      split_keys: int) -> int:
+        """The int32 staging one step's plan takes at most (its row, decode item, group and prefill item tables and the
+        span ends), for the runner's page-locked buffer."""
+        groups = max(1, max_rows) * tiles(qo_per_row, group) * kv_heads
+        per_tile = splits_per_tile(window, ROWS // group, split_keys)
+        prefill = (-(-max_tokens * group // PROWS) + max_rows) * kv_heads
+        return 4 * (max_rows + 1) + 4 * groups * per_tile + 2 * groups + 4 * prefill + max_tokens
 
     def plan(self, meta: Any, *, parity: int, rows: np.ndarray, stage: Any, fixed_rows: int = 0,
              span_end: np.ndarray | None = None) -> None:
@@ -193,43 +216,66 @@ class FullAttention:
     slot's own page table. The output gate and the partial RoPE stay outside: q comes rotated, K and V from the pool.
 
     **Decode rows** (device input: a decode or MTP verify row) split their keys as `kernels.attn512`'s fixed split does
-    (its module docstring), `split_keys` keys a split, by their planned (upper-bound) lengths; **prefill rows** take
-    their keys whole, in tiles of 64 query rows, as `WindowAttention`'s do (module docstring)."""
+    (its module docstring): each query at multiples of its own size from `split_keys`, a group taking the most splits
+    its rows may need between their lowest possible and planned lengths. **Prefill rows** run in tiles of 64 query
+    rows, as `WindowAttention`'s do (module docstring): a tile whose queries all hold at most `prefill_from` keys, or
+    that holds one such query, on the unsplit kernel, whose code stays the unsplit path's; a tile with a query past
+    that, also in its splits (sizes from `prefill_keys`), each split an item whose partials the prefill merge combines
+    in split order for those queries only. `prefill_from` is at least `prefill_keys`, so a query past it takes two
+    splits or more and every tile holding it splits. A step's split items past the partials run in more launches."""
 
     name = "attn_window"
     replans = kept = unsplit = 0  # as `WindowAttention`'s
 
     def __init__(self, pools: Any, num_heads: int, num_kv_heads: int, head_dim: int, device: torch.device,
                  max_tokens: int, max_rows: int, max_kv: int, scale: float, qo_per_row: int = 1,
-                 split_keys: int = SPLIT_KEYS):
+                 split_keys: int = SPLIT_KEYS, prefill_from: int = PREFILL_FROM,
+                 prefill_keys: int = FULL_PREFILL_KEYS):
         """`max_rows`: decode rows a step holds at most; `max_kv`: the longest row's keys (max_model_len + 1 + k);
-        `qo_per_row`: a decode row's queries (1 + k under MTP); `split_keys`: a decode row's split (class docstring)."""
-        from .attn512 import fixed_splits
-
+        `qo_per_row`: a decode row's queries (1 + k under MTP); `split_keys`: a decode row's split base,
+        `prefill_from` and `prefill_keys` a prefill query's (class docstring; the tests make them small)."""
         if head_dim != D or num_heads % num_kv_heads:
             raise ValueError(f"attention on attn_window's kernels: head dim {D} and whole GQA groups (got head dim "
                              f"{head_dim}, {num_heads} heads over {num_kv_heads})")
-        if split_keys < KT or split_keys % KT:
-            raise ValueError(f"attention on attn_window's kernels: a split of {split_keys} keys (a multiple of {KT})")
-        self.max_splits = int(fixed_splits(max_kv, split_keys))
-        if self.max_splits > MAX_SPLITS:
-            raise ValueError(f"attention on attn_window's kernels: rows of {max_kv} keys take {self.max_splits} splits "
-                             f"of {split_keys} keys (the merge takes {MAX_SPLITS}: `attn512.fixed_split_keys`)")
+        for what, keys in (("decode", split_keys), ("prefill", prefill_keys)):
+            if keys < KT or keys % KT:
+                raise ValueError(f"attention on attn_window's kernels: a {what} split of {keys} keys (a multiple of "
+                                 f"{KT})")
+        if prefill_from < prefill_keys:  # so a query past it takes 2 splits or more, and every tile holding it splits
+            raise ValueError(f"attention on attn_window's kernels: prefill queries whole up to {prefill_from} keys, "
+                             f"below the prefill split's {prefill_keys} (a query between them would take one split, "
+                             "on the unsplit kernel or in the splits by its tile)")
+        self.max_splits = int(range_splits(0, max_kv - 1, split_keys))  # at most MAX_SPLITS
         self.pools = pools
         self.h, self.hkv, self.scale = num_heads, num_kv_heads, scale
         self.group = num_heads // num_kv_heads
         self.split_keys, self.device, self.qo_per_row = split_keys, device, qo_per_row
+        self.prefill_from, self.prefill_keys = prefill_from, prefill_keys
         per_row = tiles(qo_per_row, self.group) * num_kv_heads  # a decode row's groups
         self.max_split_items = max(1, max_rows) * per_row * self.max_splits
-        self.o_part = torch.empty((self.max_split_items, ROWS, D), dtype=torch.float32, device=device)
-        self.ml_part = torch.empty((self.max_split_items, ROWS, 2), dtype=torch.float32, device=device)
-        # Tables, per parity, as `WindowAttention`'s but without the span ends
+        # Split partials: the decode rows' [items, 16, D] and the prefill split's [items, 64, D] views of one buffer
+        # (their launches run in stream order), the prefill's at least one group's MAX_SPLITS items
+        self.max_prefill_split = max(self.max_split_items * ROWS // PROWS, MAX_SPLITS)
+        n = max(self.max_split_items * ROWS, self.max_prefill_split * PROWS)
+        o_buf = torch.empty(n * D, dtype=torch.float32, device=device)
+        ml_buf = torch.empty(n * 2, dtype=torch.float32, device=device)
+        self.o_part = o_buf[:self.max_split_items * ROWS * D].view(self.max_split_items, ROWS, D)
+        self.ml_part = ml_buf[:self.max_split_items * ROWS * 2].view(self.max_split_items, ROWS, 2)
+        self.o_part_p = o_buf[:self.max_prefill_split * PROWS * D].view(self.max_prefill_split, PROWS, D)
+        self.ml_part_p = ml_buf[:self.max_prefill_split * PROWS * 2].view(self.max_prefill_split, PROWS, 2)
+        # Tables, per parity, as `WindowAttention`'s but without the span ends; the prefill split's items (a group's
+        # up to MAX_SPLITS) and groups
         self.max_prefill_items = (-(-max_tokens * self.group // PROWS) + max_rows) * num_kv_heads
         max_groups = max(1, max_rows) * per_row
         self.rows = [torch.zeros((max_rows + 1, 4), dtype=torch.int32, device=device) for _ in range(2)]
         self.items = [torch.zeros((self.max_split_items, 4), dtype=torch.int32, device=device) for _ in range(2)]
         self.groups = [torch.zeros((max_groups, 2), dtype=torch.int32, device=device) for _ in range(2)]
         self.p_items = [torch.zeros((self.max_prefill_items, 4), dtype=torch.int32, device=device) for _ in range(2)]
+        self.s_items = [torch.zeros((self.max_prefill_items * MAX_SPLITS, 4), dtype=torch.int32, device=device)
+                        for _ in range(2)]
+        self.s_groups = [torch.zeros((self.max_prefill_items, 2), dtype=torch.int32, device=device) for _ in range(2)]
+        self.s_orders = [torch.zeros(self.max_prefill_items * MAX_SPLITS, dtype=torch.int32, device=device)
+                         for _ in range(2)]
         # decode buckets: the static row, item and group tables, and the split counts their item and group tables
         # were last built for
         self.g_tabs: dict[int, tuple[torch.Tensor, torch.Tensor, int, torch.Tensor, int]] = {}
@@ -238,40 +284,60 @@ class FullAttention:
     @staticmethod
     def staging_bound(max_rows: int, max_tokens: int, group: int, kv_heads: int, qo_per_row: int, split_keys: int,
                       max_kv: int) -> int:
-        """The int32 staging one step's plan takes at most (its row, item, group and prefill item tables), for the
-        runner's page-locked buffer."""
-        from .attn512 import fixed_splits
-
+        """The int32 staging one step's plan takes at most (its row, item, group and prefill item tables, the prefill
+        split's items, their split-major orders and its groups), for the runner's page-locked buffer."""
         groups = max(1, max_rows) * tiles(qo_per_row, group) * kv_heads
         prefill = (-(-max_tokens * group // PROWS) + max_rows) * kv_heads
-        return 4 * (max_rows + 1) + 4 * groups * int(fixed_splits(max_kv, split_keys)) + 2 * groups + 4 * prefill
+        n_splits = int(range_splits(0, max_kv - 1, split_keys))
+        return 4 * (max_rows + 1) + 4 * groups * n_splits + 2 * groups + 4 * prefill * (1 + MAX_SPLITS) + \
+            prefill * MAX_SPLITS + 2 * prefill
 
-    def plan(self, meta: Any, *, parity: int, rows: np.ndarray, stage: Any, fixed_rows: int = 0) -> None:
+    def plan(self, meta: Any, *, parity: int, rows: np.ndarray, stage: Any, fixed_rows: int = 0,
+             lb: np.ndarray | None = None) -> None:
         """Eager steps and breakable graphs: `rows` int32 [n, 4] (slot, first token, n_query, KV length after the step;
         the decode rows' planned for their upper bound), the first `fixed_rows` of them decode rows, split by their
-        lengths; the rest prefill rows, whole. `stage` as in `attn512.Attn512.plan`. The plan goes into
-        `meta.attn_plan`."""
-        from .attn512 import fixed_splits
-
-        nq = rows[:, 2].astype(np.int64)
+        queries' positions from their lowest possible KV length `lb` (per row; None: the planned ones); the rest
+        prefill rows (class docstring). `stage` as in `attn512.Attn512.plan`. The plan goes into `meta.attn_plan`."""
+        nq, kv = rows[:, 2].astype(np.int64), rows[:, 3].astype(np.int64)
         dr, di, dg, pi = self.rows[parity], self.items[parity], self.groups[parity], self.p_items[parity]
         dr[:len(rows)].copy_(stage(rows.reshape(-1)).view(-1, 4), non_blocking=True)
         n_items = n_groups = 0
         if fixed_rows:
-            items, grp = plan_items(nq[:fixed_rows], self.group, self.hkv,
-                                    fixed_splits(rows[:fixed_rows, 3], self.split_keys))
+            d = slice(0, fixed_rows)
+            low = kv[d] if lb is None else np.asarray(lb, np.int64)[d]
+            items, grp = plan_items(nq[d], self.group, self.hkv, range_splits(low - nq[d], kv[d] - 1, self.split_keys))
             if len(items) > self.max_split_items:
                 raise RuntimeError(f"attention: {fixed_rows} decode rows over the partials' {self.max_split_items} "
                                    "items")
             di[:len(items)].copy_(stage(items.reshape(-1)).view(-1, 4), non_blocking=True)
             dg[:len(grp)].copy_(stage(grp.reshape(-1)).view(-1, 2), non_blocking=True)
             n_items, n_groups = len(items), len(grp)
-        pre = prefill_items(nq[fixed_rows:], self.group, self.hkv, fixed_rows)
+        # prefill rows: each tile's split count; the tiles with a query taken whole (or all) on the unsplit kernel
+        pnq, pkv = nq[fixed_rows:], kv[fixed_rows:]
+        first, last = tile_positions(pnq, pkv, self.group, PROWS)
+        n_tile = range_splits(first, last, self.prefill_keys, self.prefill_from)
+        whole = (n_tile == 1) | (first + 1 <= self.prefill_from)
+        pre = prefill_items(pnq, self.group, self.hkv, fixed_rows)
+        pre = pre[np.repeat(whole, self.hkv)]
         if len(pre) > self.max_prefill_items:
             raise RuntimeError(f"attention: {len(pre)} prefill items over {self.max_prefill_items}")
         if len(pre):
             pi[:len(pre)].copy_(stage(pre.reshape(-1)).view(-1, 4), non_blocking=True)
-        meta.attn_plan = (dr, di, n_items, dg, n_groups, pi, len(pre))
+        runs: list[tuple[int, int, int, int]] = []
+        if (n_tile > 1).any():  # the split tiles' items, in launches within the prefill partials
+            items, grp = tile_items(pnq, self.group, self.hkv, np.where(n_tile > 1, n_tile, 0), PROWS)
+            keep = grp[:, 1] > 0
+            items[:, 0] += fixed_rows
+            grp = grp[keep]
+            si, sg, so = self.s_items[parity], self.s_groups[parity], self.s_orders[parity]
+            si[:len(items)].copy_(stage(items.reshape(-1)).view(-1, 4), non_blocking=True)
+            for i0, ni, g0, ng in launches(grp, self.max_prefill_split):
+                rel = grp[g0:g0 + ng].copy()
+                rel[:, 0] -= i0
+                sg[g0:g0 + ng].copy_(stage(rel.reshape(-1)).view(-1, 2), non_blocking=True)
+                so[i0:i0 + ni].copy_(stage(split_major(items[i0:i0 + ni])), non_blocking=True)  # (as attn512's)
+                runs.append((i0, ni, g0, ng))
+        meta.attn_plan = (dr, di, n_items, dg, n_groups, pi, len(pre), tuple(runs), parity)
 
     def graph_tables(self, bucket: int) -> tuple[torch.Tensor, torch.Tensor, int, torch.Tensor, int]:
         """A decode bucket's static row table and its item and group tables at its capacity (every row at
@@ -287,16 +353,18 @@ class FullAttention:
             self.g_last[bucket] = b""
         return got
 
-    def plan_graph(self, meta: Any, *, bucket: int, rows: np.ndarray, stage: Any, real: int) -> None:
+    def plan_graph(self, meta: Any, *, bucket: int, rows: np.ndarray, stage: Any, real: int,
+                   lb: np.ndarray | None = None) -> None:
         """Before a decode graph's replay: its row table (int32 [bucket, 4], padding rows included) into the static
         buffer the captured launch reads; the item and group tables when its first `real` rows' split counts changed
-        (padding rows take one split: their KV is the null page's 1 + k positions)."""
-        from .attn512 import fixed_splits
-
+        (from their lowest possible KV lengths `lb`, None: the planned ones; padding rows take one split: their KV is
+        the null page's 1 + k positions)."""
         dr, it, cap, gt, n_groups = self.graph_tables(bucket)
         dr.copy_(stage(rows.reshape(-1)).view(-1, 4), non_blocking=True)
+        nq, kv = rows[:real, 2].astype(np.int64), rows[:real, 3].astype(np.int64)
+        low = kv if lb is None else np.asarray(lb, np.int64)[:real]
         ns = np.ones(bucket, np.int64)
-        ns[:real] = fixed_splits(rows[:real, 3], self.split_keys)
+        ns[:real] = range_splits(low - nq, kv - 1, self.split_keys)
         key = ns.tobytes()
         if self.g_last[bucket] != key:  # stream order: replays already queued read the old tables first
             items, grp = plan_items(np.full(bucket, self.qo_per_row, np.int64), self.group, self.hkv, ns)
@@ -304,7 +372,7 @@ class FullAttention:
             it.copy_(stage(items.reshape(-1)).view(-1, 4), non_blocking=True)
             gt.copy_(stage(grp.reshape(-1)).view(-1, 2), non_blocking=True)
             self.g_last[bucket] = key
-        meta.attn_plan = (dr, it, cap, gt, n_groups, None, 0)
+        meta.attn_plan = (dr, it, cap, gt, n_groups, None, 0, (), 0)
 
     def fix_lengths(self, plan: Any, rows: int, true_len: torch.Tensor) -> None:
         """Rewrite rows [0, rows)'s KV lengths in the plan's row table from their true lengths on the device (int64
@@ -315,7 +383,7 @@ class FullAttention:
         """FlashInfer's packed page indices in a decode graph: none here (the kernels read the page table)."""
 
     def run(self, meta: Any, index: int, q: torch.Tensor, out: torch.Tensor) -> None:
-        rows, items, n_items, groups, n_groups, p_items, n_pre = meta.attn_plan
+        rows, items, n_items, groups, n_groups, p_items, n_pre, runs, parity = meta.attn_plan
         if meta.fix_len:  # the true KV lengths, decided on the device (as attn512's)
             rows[:meta.n_rows, 3].copy_(meta.kv_len_dev[:meta.n_rows])
         kv = self.pools.kv[index]  # [pages, 2, page_size, Hkv, 256]
@@ -330,3 +398,9 @@ class FullAttention:
             _check(lib.lmk_attn_full_prefill(
                 _p(q), self.h, self.hkv, _p(kv), kv.stride(0), kv.stride(1), kv.shape[2], _p(pt), pt.stride(0),
                 self.scale, _p(rows), _p(p_items), n_pre, _p(out), _stream(q)), "attn_full_prefill")
+        si, sg, so = self.s_items[parity], self.s_groups[parity], self.s_orders[parity]
+        for i0, ni, g0, ng in runs:  # after the unsplit tiles: a straddling tile's split queries are written last
+            _check(lib.lmk_attn_full_prefill_split(
+                _p(q), self.h, self.hkv, _p(kv), kv.stride(0), kv.stride(1), kv.shape[2], _p(pt), pt.stride(0),
+                self.scale, _p(rows), _p(si[i0:]), ni, _p(sg[g0:]), ng, self.prefill_from, self.prefill_keys,
+                _p(so[i0:]), _p(out), _p(self.o_part_p), _p(self.ml_part_p), _stream(q)), "attn_full_prefill_split")

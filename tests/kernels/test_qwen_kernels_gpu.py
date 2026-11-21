@@ -10,6 +10,7 @@ CUDA and the kernel library only (FlashInfer for the GDN tests)."""
 
 from __future__ import annotations
 
+import itertools
 from types import SimpleNamespace
 
 import numpy as np
@@ -26,6 +27,7 @@ from ..support.kernel_cases import (
     _gdn_step,
     _packed_reference,
     _run,
+    _stage,
     _window_ref,
     _window_setup,
 )
@@ -35,11 +37,12 @@ pytestmark = pytest.mark.gpu(reason="needs a CUDA GPU and the kernel library")
 H, HKV, D, PS = 24, 4, 256, 16  # Qwen3.8 27B's full layers: a GQA group of 6
 
 
-def _full(max_rows: int = 24, qo: int = 4, split_keys: int = 256, max_kv: int = 4096, pool=None):
+def _full(max_rows: int = 24, qo: int = 4, split_keys: int = 256, max_kv: int = 4096, pool=None, **split):
     from llm_mini_infer.kernels.attn_window import FullAttention
 
     return FullAttention(SimpleNamespace(kv=pool[None], page_size=PS), H, HKV, D, torch.device(DEV), max_tokens=4096,
-                         max_rows=max_rows, max_kv=max_kv, scale=D ** -0.5, qo_per_row=qo, split_keys=split_keys)
+                         max_rows=max_rows, max_kv=max_kv, scale=D ** -0.5, qo_per_row=qo, split_keys=split_keys,
+                         **split)
 
 
 @pytest.mark.parametrize("split_keys", [96, 128, 256])  # 32 splits hold the longest row, 3,001 keys
@@ -113,6 +116,157 @@ def test_full_attention_is_batch_invariant() -> None:
         want = _window_ref(pool, table, 1, (qsub[p:p + 1].float() * D ** -0.5).to(BF), p, 1 << 30, PS)[0]
         for got in (decode[0][p], prefill[0][p]):
             assert (got.float() - want).abs().max().item() < 2e-2, p
+
+
+def _step(a, table, rows, q, *, decode: int, bucket: int = 0, true=None, lb=None):
+    """`_run` with the rows' lowest possible KV lengths `lb` (per row; None: the planned ones) given to the plan, and
+    the step's meta returned beside the output: (output, meta)."""
+    rr = np.asarray(rows, np.int32)
+    kv = torch.as_tensor(rr[:, 3] if true is None else np.asarray(true), dtype=torch.int64, device=DEV)
+    meta = SimpleNamespace(page_table=table, fix_len=True, n_rows=len(rr), kv_len_dev=kv)
+    if bucket:
+        a.plan_graph(meta, bucket=bucket, rows=rr, stage=_stage, real=decode, lb=lb)
+    else:
+        a.plan(meta, parity=0, rows=rr, stage=_stage, fixed_rows=decode, lb=lb)
+    out = torch.full_like(q, float("nan"))
+    a.run(meta, 0, q, out)
+    torch.cuda.synchronize()
+    return out, meta
+
+
+def _scaled(q: torch.Tensor) -> torch.Tensor:
+    """`q` as the reference takes it: the kernel's softmax scale folded into the BF16 queries."""
+    return (q.float() * D ** -0.5).to(BF)
+
+
+def test_full_attention_query_sizes_are_batch_invariant() -> None:
+    """With the split small (`split_keys` 16: a query's split doubles past 512 keys and again past 1,024) a verify row's
+    queries, at positions inside a size and straddling the two size boundaries (a row's 4 queries at 6 heads each
+    straddle tiles too), give the same bits whatever carries them: the row alone, at another offset of its window,
+    beside other verify rows, in a decode bucket's static tables with padding rows, planned for an upper bound of its
+    length over a lower bound (the true lengths on the device, as under MTP), and beside a prefill row; and each
+    within BF16 rounding of the fp32 reference."""
+    qo = 4
+    lens = [1300, 1100, 520, 1030, 200, 700, 33, 1290, 600]  # slot 1 the subject's
+    pool, table = _window_setup(lens, HKV, D, PS, seed=11)
+    torch.manual_seed(12)
+    qsub = (torch.randn(lens[0], H, D, device=DEV) * 0.5).to(BF)
+    a = _full(max_rows=12, qo=qo, split_keys=16, pool=pool, prefill_from=64, prefill_keys=16)
+
+    def go(spec, decode: int | None = None, bucket: int = 0):
+        """spec: (slot, first position, queries, planned extra over the true length, true length over its lower bound);
+        the subject's (slot 1) queries by position."""
+        rows, qs, true, low, at, where = [], [], [], [], 0, {}
+        for slot, p0, n, extra, drop in spec:
+            rows.append((slot, at, n, p0 + n + extra))
+            true.append(p0 + n)
+            low.append(max(n, p0 + n - drop))
+            qs.append(qsub[p0:p0 + n] if slot == 1 else (torch.randn(n, H, D, device=DEV) * 0.5).to(BF))
+            if slot == 1:
+                where.update({p0 + i: at + i for i in range(n)})
+            at += n
+        real = len(rows) if decode is None else decode
+        for _ in range(bucket - len(rows)):  # padding rows: slot 0's null page, 1 + k keys
+            rows.append((0, at, qo, qo))
+            true.append(qo)
+            low.append(qo)
+            qs.append(torch.zeros(qo, H, D, dtype=BF, device=DEV))
+            at += qo
+        out, _ = _step(a, table, rows, torch.cat(qs), decode=real, bucket=bucket, true=true, lb=np.asarray(low))
+        return {p: out[i] for p, i in where.items()}
+
+    others = [(s, lens[s - 1] - qo, qo, 0, 0) for s in range(2, 10)]
+    for p in (5, 300, 508, 509, 510, 511, 512, 515, 1021, 1022, 1023, 1024, 1027, 1200):
+        def at(j: int, extra: int = 0, drop: int = 0, p: int = p) -> tuple[int, int, int, int, int]:
+            return (1, p - j, qo, extra, drop)
+
+        got = [go([at(0)]), go([at(3)]), go([at(1, 5), *others[:2]]), go([*others, at(2)]),
+               go([at(1, 2, 3), *others[:2]], bucket=8), go([at(3, 40, 40), *others], bucket=16),
+               go([at(2, 600, 3)]), go([at(0, 9, 1), *others[2:5]], bucket=8),
+               go([at(2), (2, 600, 40, 0, 0)], decode=1), go([*others[:3], at(1), (3, 400, 77, 0, 0)], decode=4)]
+        for c, cand in enumerate(got[1:], 1):
+            for pos in cand.keys() & got[0].keys():
+                assert torch.equal(got[0][pos], cand[pos]), (p, pos, c)
+        want = _window_ref(pool, table, 1, _scaled(qsub[p:p + 1]), p, 1 << 30, PS)[0]
+        assert (got[0][p].float() - want).abs().max().item() < 2e-2, p
+
+
+def test_full_attention_prefill_split_is_chunk_invariant() -> None:
+    """With the prefill split small (`prefill_from` 64 keys, `prefill_keys` 16: past 512 keys the split doubles) every
+    query of a prompt gives the same bits as one prefill row and as chunks of different lengths and offsets (a chunk
+    starting below 64 and ending past it, so a tile straddles the threshold; one ending exactly at it; chunks of 1
+    token; tiles that start at other positions), run alone, beside decode rows, and beside another prefill row before
+    or after it; each within BF16 rounding of the fp32 reference."""
+    qo, n, first = 4, 900, 30
+    lens = [n, 700, 1000, 420]  # slot 1 the prompt, slot 4 the other prefill row's
+    pool, table = _window_setup(lens, HKV, D, PS, seed=21)
+    torch.manual_seed(22)
+    qs = (torch.randn(n, H, D, device=DEV) * 0.5).to(BF)
+    qother = (torch.randn(400, H, D, device=DEV) * 0.5).to(BF)[100:]  # slot 4's positions 100..399
+    a = _full(max_rows=8, qo=qo, split_keys=16, pool=pool, prefill_from=64, prefill_keys=16)
+    decode_rows = [(s, lens[s - 1] - qo, qo, lens[s - 1]) for s in (2, 3)]
+
+    def prompt(cuts: list[int], beside: str = "") -> torch.Tensor:
+        """The prompt's positions [cuts[0], cuts[-1]) by chunks between the cuts, each its own step;
+        `beside`: "d" decode rows, "p" another prefill row after the chunk, "q" before it."""
+        out = torch.full((n, H, D), float("nan"), device=DEV)
+        for lo, hi in itertools.pairwise(cuts):
+            rows = [(s, qo * i, qo, kv) for i, (s, _, _, kv) in enumerate(decode_rows)] if "d" in beside else []
+            qq = [(torch.randn(qo, H, D, device=DEV) * 0.5).to(BF) for _ in rows]
+            decode = len(rows)
+            if "q" in beside:
+                rows.append((4, qo * decode, 300, 400))
+                qq.append(qother)
+            at = qo * decode + (300 if "q" in beside else 0)
+            rows.append((1, at, hi - lo, hi))
+            qq.append(qs[lo:hi])
+            if "p" in beside:
+                rows.append((4, at + hi - lo, 300, 400))
+                qq.append(qother)
+            got, _ = _step(a, table, rows, torch.cat(qq), decode=decode)
+            out[lo:hi] = got[at:at + hi - lo]
+        return out
+
+    base = prompt([first, n])
+    want = _window_ref(pool, table, 1, _scaled(qs[first:n]), first, 1 << 30, PS)
+    err = (base[first:].float() - want).abs()
+    assert err.max().item() < 2e-2 and err.mean().item() < 2e-3, (err.max().item(), err.mean().item())
+    cases = [([first, 90, 200, 201, 520, n], ""), ([first, 60, 63, 64, 65, 300, 512, n], ""),
+             ([first, 47, 333, n], ""), ([first, 63, 64, 65, 66, 67, n], ""), ([first, 300, n], ""),
+             ([first, 100, 101, 600, n], "d"), ([first, 90, 200, 201, 520, n], "p"), ([first, 47, 333, n], "q"),
+             ([first, 64, 333, n], "dp"), ([first, n], "d"), ([first, n], "dq")]
+    for cuts, beside in cases:
+        got = prompt(cuts, beside)
+        assert torch.equal(base[first:], got[first:]), (cuts, beside)
+
+
+def test_full_attention_prefill_below_the_threshold_is_unsplit() -> None:
+    """A prefill query holding at most `prefill_from` keys gives the bits of an instance whose threshold lies past the
+    prompt (no split: the unsplit kernel), at any chunk offset (a tile straddling the threshold keeps its low queries'
+    unsplit bits) while the queries past it differ (the split is in play); and the split's launches cut by a small
+    prefill partial buffer (`max_prefill_split` at its floor of 32, one group's items) or a large one give the same
+    bits for every query."""
+    n = 900
+    pool, table = _window_setup([n], HKV, D, PS, seed=31)
+    torch.manual_seed(32)
+    qs = (torch.randn(n, H, D, device=DEV) * 0.5).to(BF)
+    plain = _full(max_rows=1, qo=1, split_keys=16, pool=pool, prefill_from=4096, prefill_keys=16)
+    small = _full(max_rows=1, qo=1, split_keys=16, pool=pool, prefill_from=64, prefill_keys=16)
+    large = _full(max_rows=24, qo=4, split_keys=16, pool=pool, prefill_from=64, prefill_keys=16)
+    assert small.max_prefill_split == 32 and large.max_prefill_split > 32
+
+    for p0 in (0, 3, 30, 59):
+        rows, q = [(1, 0, n - p0, n)], qs[p0:]
+        want, _ = _step(plain, table, rows, q, decode=0)
+        got, meta = _step(small, table, rows, q, decode=0)
+        big, big_meta = _step(large, table, rows, q, decode=0)
+        low = 64 - p0  # the queries at positions < 64: p + 1 <= 64
+        assert torch.equal(want[:low], got[:low]), p0
+        assert not torch.equal(want[low:], got[low:]), p0
+        assert len(meta.attn_plan[7]) > len(big_meta.attn_plan[7]) >= 1, p0
+        assert torch.equal(got, big), p0
+        ref = _window_ref(pool, table, 1, _scaled(q[:low + 40]), p0, 1 << 30, PS)
+        assert (got[:low + 40].float() - ref).abs().max().item() < 2e-2, p0
 
 
 @pytest.mark.parametrize(("n", "k"), [(96, 5120), (8, 128)])  # Qwen3.8 27B's in_proj_ba, a tiny model's
