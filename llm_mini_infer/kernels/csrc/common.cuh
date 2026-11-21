@@ -42,6 +42,54 @@ __device__ __forceinline__ float block_sum(float v, float* smem) {
   return warp_sum(v);
 }
 
+// The fixed split of our batch-invariant attention kernels (csrc/attn512.cu, csrc/attn_window.cu; kernels/attn512.py
+// `split_size`, `query_splits`): a query at absolute position p splits its keys [0, p] at multiples of keys · 2^m, the
+// least m >= 0 that keeps its p + 1 keys within LMK_MAX_SPLITS splits (the merges' lanes). A query whose p + 1 keys are
+// at most `whole` takes them whole.
+constexpr int LMK_MAX_SPLITS = 32;
+
+__device__ __forceinline__ int lmk_split_size(int p, int keys) {
+  long long s = keys;
+  while ((long long)p + 1 > s * LMK_MAX_SPLITS) s *= 2;
+  return (int)s;
+}
+
+// Query p's keys in split j, [lo, hi) (empty when lo >= hi): taken whole in split 0 while p + 1 <= whole.
+__device__ __forceinline__ void lmk_split_range(int p, int j, int keys, int whole, int& lo, int& hi) {
+  if (p + 1 <= whole) {
+    lo = 0;
+    hi = j == 0 ? p + 1 : 0;
+    return;
+  }
+  const int s = lmk_split_size(p, keys);
+  lo = j * s;
+  hi = min(lo + s, p + 1);
+}
+
+// The last position whose query splits as p's does (the same size, or whole).
+__device__ __forceinline__ int lmk_split_class_end(int p, int keys, int whole) {
+  return p + 1 <= whole ? whole - 1 : lmk_split_size(p, keys) * LMK_MAX_SPLITS - 1;
+}
+
+// The hull [lo, hi) of split j's ranges over the consecutive positions [p0, p1]: the least interval holding them all
+// (one size class at a time, each class's largest range at its last position; across a size boundary it spans the gap
+// between the classes' ranges, which every row masks); lo = hi = 0 when empty.
+__device__ __forceinline__ void lmk_split_hull(int p0, int p1, int j, int keys, int whole, int& lo, int& hi) {
+  lo = 0x7fffffff;
+  hi = 0;
+  for (int p = p0; p <= p1;) {
+    const int e = min(lmk_split_class_end(p, keys, whole), p1);
+    int a, b;
+    lmk_split_range(e, j, keys, whole, a, b);
+    if (a < b) {
+      lo = min(lo, a);
+      hi = max(hi, b);
+    }
+    p = e + 1;
+  }
+  if (lo >= hi) lo = hi = 0;
+}
+
 static inline int lmk_status() { return (int)cudaGetLastError(); }
 
 // Programmatic dependent launch (PDL; docs/architecture.md, "CUDA graphs"). While the library's flag is on

@@ -3,6 +3,7 @@ no server, no network, no tokenizer download."""
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import importlib.util
 import json
@@ -197,6 +198,63 @@ def test_a_closed_loop_client_holds_a_conversation_for_n_turns_then_starts_anoth
     assert r["cache_by_turn"] is not None and [t["turn"] for t in r["cache_by_turn"]] == [0, 1, 2]
     assert '"reply"' not in json.dumps(r) and "r1" not in json.dumps(r["answers"])
     assert any(k.endswith(".1") for k in r["answers"]) and "0" in r["answers"]
+
+
+def test_shared_prefix_tokens_zero_leaves_the_bodies_unchanged() -> None:
+    plain = load.chat_workload(WordTokenizer(), 6, 16, seed=3, tool_tokens=5)
+    zero = load.chat_workload(WordTokenizer(), 6, 16, seed=3, tool_tokens=5, shared_tokens=0)
+    assert all(plain.body(i) == zero.body(i) for i in range(5))
+    assert "shared_prefix_tokens" not in zero.summary
+
+
+def test_shared_prefix_tokens_start_every_prompt_alike() -> None:
+    tok = WordTokenizer()
+    chat = load.chat_workload(tok, 6, 16, seed=3, shared_tokens=20)
+    a, b = (chat.body(i)["messages"][0]["content"] for i in (1, 7))
+    ids_a, ids_b = tok.encode(a).ids, tok.encode(b).ids
+    assert ids_a[:20] == ids_b[:20] and ids_a[20:] != ids_b[20:] and len(ids_a) == 26
+    assert a.startswith(load.shared_prefix(tok, 20, 3)) and a.split("\n\n", 1)[1].startswith("Request 1.")
+    other = load.chat_workload(tok, 6, 16, seed=4, shared_tokens=20).body(1)["messages"][0]["content"]
+    assert tok.encode(other).ids[:20] != ids_a[:20]  # the seed picks the prefix
+    assert chat.summary["shared_prefix_tokens"] == 20
+
+
+def test_the_warm_up_caches_the_measured_runs_shared_prefix() -> None:
+    tok = WordTokenizer()
+    args = argparse.Namespace(seed=3, other=1)
+    warm = load.warm_up_args(args)
+    assert (warm.seed, warm.prefix_seed, warm.other) == (4, 3, 1) and args.seed == 3
+    measured = load.chat_workload(tok, 12, 16, seed=3, shared_tokens=20).body(0)["messages"][0]["content"]
+    warmed = load.chat_workload(tok, 12, 16, seed=warm.seed, shared_tokens=20, prefix_seed=warm.prefix_seed)
+    content = warmed.body(0)["messages"][0]["content"]
+    assert tok.encode(content).ids[:20] == tok.encode(measured).ids[:20] and content != measured
+
+
+@pytest.mark.parametrize(("shared", "most"), [(0, 4), (64, 1)])
+def test_a_shared_prefix_warms_up_one_request_at_a_time(monkeypatch, shared, most) -> None:
+    """The warm-up's requests run 4 at a time, and one at a time with a shared prefix: the second then branches at the
+    prefix's end, where the server's cache writes a checkpoint, so the measured requests hit it."""
+    live, peak = [0], [0]
+
+    async def send(session, url, headers, body, timeout):
+        live[0] += 1
+        peak[0] = max(peak[0], live[0])
+        await asyncio.sleep(0.005)
+        live[0] -= 1
+        return {"status": 200}
+
+    monkeypatch.setattr(load, "send", send)
+    monkeypatch.setattr(load, "make_workload", lambda args: _count_workload(args.seed))
+    run = load.Run(None, "", {}, _count_workload(), {}, 5.0, 0.0, 1.0, 0.0, metrics_url=None)
+    asyncio.run(load.warm_up(run, argparse.Namespace(seed=0, shared_prefix_tokens=shared), 6))
+    assert peak[0] == most
+
+
+@pytest.mark.parametrize("argv", [["--workload", "catalog"], ["--workload", "scene"]])
+def test_shared_prefix_tokens_is_refused_outside_chat(argv, capsys) -> None:
+    with pytest.raises(SystemExit) as exc:
+        load.main(["--model", "m", "--concurrency", "1", "--shared-prefix-tokens", "8", *argv])
+    assert exc.value.code == 2 and "--shared-prefix-tokens needs --workload chat" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(("argv", "why"), [

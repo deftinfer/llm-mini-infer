@@ -90,8 +90,8 @@ SIGNATURES: dict[str, list] = {
     "lmk_g4_sandwich": [_P, _I64, _P, _P, _P, _P, _P, _P, _I64, _I, _F, _P],
     "lmk_gelu_tanh_mul": [_P, _I64, _P, _I64, _I, _P],
     "lmk_g4_qkv": [_P, _I64, _I, _P, _P, _P, _P, _P, _P, _P, _I64, _I, _P, _P, _I64, _I, _I, _I, _F, _P],
-    "lmk_attn512": [_P, _I, _I, _P, _I64, _I, _P, _I64, _P, _P, _P, _I, _F, _P, _P, _I, _P, _I, _I, _I, _P, _P, _P,
-                    _P],
+    "lmk_attn512": [_P, _I, _I, _P, _I64, _I, _P, _I64, _P, _P, _P, _I, _F, _P, _P, _I, _P, _I, _I, _I, _I, _I, _I,
+                    _P, _P, _P, _P, _P],
     "lmk_attn512_occupancy": [],
     # Gemma 4's sliding layers, batch-invariant: csrc/attn_window.cu
     "lmk_attn_window": [_P, _I, _I, _P, _I64, _I64, _I, _P, _I64, _I, _F, _P, _P, _I, _P, _I, _I, _P, _P, _P, _P],
@@ -99,6 +99,8 @@ SIGNATURES: dict[str, list] = {
     # Qwen3.8's full layers on the same kernels, batch-invariant: csrc/attn_window.cu
     "lmk_attn_full": [_P, _I, _I, _P, _I64, _I64, _I, _P, _I64, _F, _P, _P, _I, _P, _I, _I, _P, _P, _P, _P],
     "lmk_attn_full_prefill": [_P, _I, _I, _P, _I64, _I64, _I, _P, _I64, _F, _P, _P, _I, _P, _P],
+    "lmk_attn_full_prefill_split": [_P, _I, _I, _P, _I64, _I64, _I, _P, _I64, _F, _P, _P, _I, _P, _I, _I, _I, _P, _P,
+                                    _P, _P, _P],
     # Gemma 4's quantizing producers: csrc/gemma.cu
     "lmk_g4_rmsnorm_quant": [_P, _I64, _P, _P, _P, _I64, _I64, _I, _F, _P],
     "lmk_g4_sandwich_quant": [_P, _I64, _P, _P, _P, _P, _P, _P, _P, _I64, _I64, _I, _F, _P],

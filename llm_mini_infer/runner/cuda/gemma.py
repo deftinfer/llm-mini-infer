@@ -283,7 +283,7 @@ class GemmaRunner(Runner):
                  assistant: str | Path | None = None, draft_vocab: int = 0, draft_fp8: bool = False,
                  sparse_head: bool = False, sparse_head_rows: int = 1024, draft_universe: bool = False,
                  draft_query_next: bool = False, pdl: bool = False, always_split: bool = False,
-                 attn512_split_keys: int = 0,
+                 attn512_split_keys: int = 0, attn512_prefill: tuple[int, int] | None = None,
                  head_fixed_m: bool = False, encode_per_image: bool = False, window_split_keys: int = 0,
                  batch_invariant: bool = False, sync_check: str | None = None, memory_history: str | None = None,
                  logprobs: bool = False, penalties: bool = False):
@@ -292,9 +292,11 @@ class GemmaRunner(Runner):
         `draft_universe`: the grammar-aware heads (`runner.cuda.heads`; with `grammar` only, the universe with MTP).
         `draft_query_next`: the assistant's queries at RoPE position p + 1 instead of p (the module docstring). `pdl`:
         programmatic dependent launch. `always_split` (with `grammar`): every step runs as a forward and a
-        sampling, masked or not, and only those graphs are captured. `attn512_split_keys`: the full layers' fixed split
-        (`kernels.attn512`; 0: the wave split). `head_fixed_m`: the sparse head's GEMM at one M for every step (its
-        `max_num_seqs` × (1 + k) rows). `encode_per_image`: one tower call per image (`runner.cuda.images`).
+        sampling, masked or not, and only those graphs are captured. `attn512_split_keys`: the full layers' fixed
+        split's base for decode rows (`kernels.attn512`; 0: the wave split), `attn512_prefill` its prefill rows' (whole
+        up to that many keys, base; None: `attn512.PREFILL_FROM`, `PREFILL_KEYS`). `head_fixed_m`: the sparse head's
+        GEMM at one M for every step (its `max_num_seqs` × (1 + k) rows). `encode_per_image`: one tower call per image
+        (`runner.cuda.images`).
         `window_split_keys`: the sliding layers on our kernel, decode rows split by that many keys, image spans in its
         prefill rows' pass (`kernels.attn_window`; 0: FlashInfer's). `batch_invariant`: reported to the scheduler, whose
         final chunks then take their forced prefix whole (the parts above are the runner's; `make_cuda_runner` sets them
@@ -331,6 +333,7 @@ class GemmaRunner(Runner):
         self.grammar = grammar
         self.always_split = always_split
         self.attn512_split_keys = attn512_split_keys
+        self.attn512_prefill = attn512_prefill
         self.window_split_keys = window_split_keys
         self.inv = batch_invariant
         self.max_model_len = min(max_model_len or cfg.max_position_embeddings, cfg.max_position_embeddings)
@@ -681,9 +684,17 @@ class GemmaRunner(Runner):
             cap_i += (STOP_W + 2) * slots + 8 * slots
         if self.logprobs:  # the LOGPROBS samples' indices
             cap_i += smax + LP_CHUNK
-        groups = (-(-pc.max_num_batched_tokens * (cfg.num_heads // cfg.full_kv_heads) // 16) + slots) * \
-            cfg.full_kv_heads
-        n32 = 16 * slots + 64 + 8 * (slots + 1) + 4 * (groups * 32 + 4 * slots)  # FlashInfer plans; rows; items
+        from ...kernels.attn512 import Attn512
+
+        n32 = 16 * slots + 64 + 8 * (slots + 1)  # FlashInfer plans; rows
+        n32 += Attn512.staging_bound(slots, pc.max_num_batched_tokens, cfg.num_heads // cfg.full_kv_heads,
+                                     cfg.full_kv_heads)  # attn512's items, orders and groups (`kernels.attn512`)
+        if self.window_split_keys and self.attn_kind == "flashinfer":  # our sliding kernel's tables
+            from ...kernels.attn_window import WindowAttention
+
+            n32 += WindowAttention.staging_bound(slots, pc.max_num_batched_tokens,
+                                                 cfg.num_heads // cfg.sliding_kv_heads, cfg.sliding_kv_heads, L,
+                                                 self.window, self.window_split_keys)
         if self.mm:
             n32 += 4 * (tmax + 2)  # the spans' FlashInfer plan
         if self.k:  # the drafter's: a FlashInfer plan and attn512's rows and items (at most 9/5 of a wave and a margin)
@@ -721,10 +732,13 @@ class GemmaRunner(Runner):
                                                         upper_bounds=bool(self.k))
                 workspace = self.attn_w.workspace
             self.stats.update(window_split_keys=self.window_split_keys)
+            from ...kernels.attn512 import PREFILL_FROM, PREFILL_KEYS
+
+            whole, pkeys = self.attn512_prefill or (PREFILL_FROM, PREFILL_KEYS)
             self.attn_f: Any = Attn512(self.pools, self.rotary, cfg.num_heads, cfg.full_kv_heads,
                                        cfg.full_rope_angles, dev, max_tokens=pc.max_num_batched_tokens,
                                        max_rows=pc.max_num_seqs, qo_per_row=L, split_keys=self.attn512_split_keys,
-                                       max_kv=self.max_model_len + L)
+                                       max_kv=self.max_model_len + L, prefill_from=whole, prefill_keys=pkeys)
             self.stats.update(attn512_resident=self.attn_f.resident, attn512_split_keys=self.attn512_split_keys)
             log.info("attn512: %d CTAs resident at once (%d an SM)", self.attn_f.resident,
                      self.attn_f.resident // self.attn_f.sms)
@@ -1949,7 +1963,8 @@ class GemmaRunner(Runner):
                              kv_indptr=st.put32(indptr), kv_indices=kv_indices,
                              last_page_len=st.put32(kv_w - (n_wp - 1) * ps), kv_lens=st.put32(kv_w), max_q=lay.max_q,
                              lb=lay.r_kv_lb - lay.wlo * ps if uncertain else None)
-        self.attn_f.plan(meta, parity=parity, rows=lay.full_rows, stage=st.put32, fixed_rows=lay.n_dev)
+        self.attn_f.plan(meta, parity=parity, rows=lay.full_rows, stage=st.put32, fixed_rows=lay.n_dev,
+                         lb=lay.r_kv_lb)
         if uncertain:  # eagerly, after the plans' copies (stream order), before the body
             self._fix_target(meta, n, self.static.r_slot[:n])
         if lay.spans is not None and self.attn_wb is not None:  # the span queries' second plan, without the causal mask
@@ -1986,7 +2001,7 @@ class GemmaRunner(Runner):
                                    kv_indptr=st.put32(indptr), last_page_len=st.put32(kvw - (npg - 1) * ps),
                                    kv_lens=st.put32(kvw), max_q=L, lb=lb if (lb < kvw).any() else None)
             self.attn_w.g_first[:rows].copy_(st.i(lay.g_first, rows))
-        self.attn_f.plan_graph(meta, bucket=rows, rows=full, stage=st.put32, real=n)
+        self.attn_f.plan_graph(meta, bucket=rows, rows=full, stage=st.put32, real=n, lb=lay.r_kv_lb)
 
     def _drafter_meta(self, lay: _Layout, st: _Staging, parity: int, kind: str, size: int) -> Gemma4Meta:
         """The drafter's rows (MTP): one query per sample row at its last committed position p, over the target's KV of

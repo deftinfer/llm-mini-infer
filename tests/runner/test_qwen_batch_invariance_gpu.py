@@ -11,6 +11,9 @@ Qwen3.8 27B's attention shape (head dim 256, a GQA group of 6: `tiny_qwen.QWEN38
 serves them, and their in_proj_ba is BF16 as the real checkpoints'.
 
 - **Text and an image,** alone against beside (decode rows of others take the prompt's budget, so its cuts move).
+- **Long contexts:** the full layers' split sizes double with the position (16 keys to 512, then 32, then 64) and a
+  prefill row's queries past 64 keys split by 16 (`attn_prefill`): a request whose prompt passes 64 and whose answer
+  passes 512 and 1024 positions, alone and beside requests that arrive while it runs.
 - **The chunking:** the same request alone under chunk caps (64, 100: off the grid; 128 with a 1-token final chunk),
   with and without the prefix cache.
 - **A prefix hit on a checkpoint its prefill wrote:** a request that resumes at 64 from an earlier request's
@@ -40,6 +43,7 @@ pytestmark = [pytest.mark.gpu,
 VOCAB = 512  # the tiny models' (tests/support/tiny_qwen.py); image tokens 496-499
 INVARIANT = dict(sparse_head=True, draft_universe=True, pdl=True, always_split=True, batch_invariant=True,
                  attn_split_keys=64)  # splits of 64 keys: the tiny contexts span several
+LONG = dict(max_model_len=1280, attn_split_keys=16, attn_prefill=(64, 16))  # sizes 16, 32, 64; prefill splits past 64
 GOLDEN = golden.GOLDEN_DIR / "batch_invariance.json"
 
 
@@ -51,6 +55,8 @@ SHARED = tokens(72, 99)  # a shared prefix: an earlier request's prefill leaves 
 CASES = {  # each request's prompt (its parts) and forced answer
     "text": ({0: [tokens(300, 1)], 1: [tokens(120, 2)], 2: [tokens(35, 3)], 3: [tokens(90, 4)]},
              {r: tokens(30 + 7 * r, 10 + r) for r in range(4)}),
+    "long": ({0: [tokens(600, 41)], 1: [tokens(120, 42)], 2: [tokens(200, 43)], 3: [tokens(90, 44)]},
+             {0: tokens(520, 45), 1: tokens(30, 46), 2: tokens(40, 47), 3: tokens(50, 48)}),
     "image": ({0: [tokens(20, 21), png(48, 36, 1), tokens(12, 22)], 1: [tokens(9, 23), png(40, 40, 2), tokens(5, 24)],
                2: [tokens(60, 25)], 3: [tokens(14, 26), png(30, 60, 3), tokens(8, 27)]},
               {r: tokens(30 + 7 * r, 30 + r) for r in range(4)}),
@@ -80,6 +86,10 @@ def run(model, case: str, arm: str, arena: str | None, forced: int = 0, cap: int
     f = QwenForcedRun(model, prompts, answers, device="cuda", arena=arena if case == "image" else None, forced=forced,
                       max_num_seqs=8, budget=256, num_pages=2048, page_size=16, caching=caching, ckpt_slots=8,
                       forced_prefix=forced > 0, **{**INVARIANT, **switches})
+    if "attn_prefill" in switches:  # the settings reached the full layers' kernel (a run without them is invariant)
+        a = f.run.r.attn
+        assert (a.split_keys, (a.prefill_from, a.prefill_keys)) == (switches["attn_split_keys"],
+                                                                     switches["attn_prefill"])
     f.run.sched.chunk_cap = cap
     subject = 3 if case == "hit" else 0
     if case == "hit":  # request 0 writes the shared prefix's checkpoint at 64 first; then 3 resumes there (or not)
@@ -96,6 +106,15 @@ def run(model, case: str, arm: str, arena: str | None, forced: int = 0, cap: int
         f.add(1)
         f.steps(4)
         f.add(3)
+    elif case == "long":  # 1 decodes while 0's prompt prefills in chunks; 3's prompt prefills beside 0's answer, and
+        # 2's (200 tokens) beside it again once it is well into its answer
+        f.add(1)
+        f.steps(3)
+        f.add(0)
+        f.steps(4)
+        f.add(3)
+        f.steps(40)
+        f.add(2)
     else:  # 1 and 2 decode while 0's prompt prefills; 3's prompt prefills beside 0's answer
         f.add(1)
         f.add(2)
@@ -145,6 +164,17 @@ def test_a_requests_bits_do_not_depend_on_the_requests_beside_it(runs, case) -> 
         assert alone.encodes == [1] and 2 in beside.encodes and set(beside.calls) == {1}
         assert len(alone.images) == 1
     same_bits(alone, beside, len(CASES[case][1][0]))
+    assert alone.heads.sparse > 0 and beside.heads.sparse > 0
+
+
+def test_a_requests_bits_do_not_depend_on_the_requests_beside_it_past_the_split_sizes(runs) -> None:
+    """The full layers' split sizes double with a query's position (16 keys, 32 past 512, 64 past 1024) and a prefill
+    row splits the queries past 64 keys by 16: request 0's 600-token prompt (cut on the 64-token grid, its queries past
+    64 split) and 520-token answer (its decode queries past 512 and 1024) have the same bits alone and beside requests
+    that arrive while it runs, a prefill row of 200 tokens among them."""
+    alone, beside = runs("long", "alone", **LONG), runs("long", "beside", **LONG)
+    assert max(alone.hidden) > 1024 and min(alone.hidden) < 600  # the answer passes both size boundaries
+    same_bits(alone, beside, len(CASES["long"][1][0]))
     assert alone.heads.sparse > 0 and beside.heads.sparse > 0
 
 

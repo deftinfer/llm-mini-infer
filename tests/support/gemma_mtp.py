@@ -24,17 +24,17 @@ class Run:
 
     def __init__(self, pair, k: int, *, caching: bool = True, max_num_seqs: int = 4, budget: int = 64,
                  num_pages: int = 512, interval: int = 8, grammars=None, make=gemma_cpu_runner, window: int = W,
-                 wps: int = 4, forced_prefix: bool = False, **runner_kw):
+                 wps: int = 4, forced_prefix: bool = False, max_model_len: int = 256, **runner_kw):
         target, assistant = pair
         pc = gemma_pools(max_num_seqs=max_num_seqs, budget=budget, page_size=wps, num_pages=num_pages,
-                         max_model_len=256, mtp_k=k)
+                         max_model_len=max_model_len, mtp_k=k)
         self.r = make(target, pc, mtp_k=k, assistant=assistant if k else None, **runner_kw)
         self.k = k
         caps = self.r.capabilities()
         mm = dict(encoder_rows=caps.encoder_rows, encoder_budget=caps.encoder_budget,
                   bidirectional_images=caps.bidirectional_images, positions=vf.load(target).positions) \
             if caps.images else {}
-        self.sched = Scheduler(max_num_seqs=max_num_seqs, max_num_batched_tokens=budget, max_model_len=256,
+        self.sched = Scheduler(max_num_seqs=max_num_seqs, max_num_batched_tokens=budget, max_model_len=max_model_len,
                                page_size=pc.page_size, num_pages=pc.num_pages, num_state_slots=max_num_seqs + 1,
                                eos_token_ids=(EOS,), mtp_k=k, prefix_caching=caching, checkpoint_grid=wps,
                                decode_checkpoint_interval=interval, window=window, window_page_size=wps,

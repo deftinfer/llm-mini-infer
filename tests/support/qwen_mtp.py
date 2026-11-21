@@ -29,9 +29,10 @@ class Run:
 
     def __init__(self, model, k: int, *, caching: bool = False, max_num_seqs: int = 4, budget: int = 128,
                  num_pages: int = 512, ckpt_slots: int = 0, interval: int = 256, page_size: int = 4, grammars=None,
-                 forced_prefix: bool = False, eos_free_finish: bool = False, make=cpu_runner, **runner_kw):
+                 forced_prefix: bool = False, eos_free_finish: bool = False, make=cpu_runner, max_model_len: int = 1024,
+                 **runner_kw):
         pc = pools(max_num_seqs=max_num_seqs, budget=budget, mtp_k=k, num_pages=num_pages, page_size=page_size,
-                   state_slots=max_num_seqs + 1 + ckpt_slots)
+                   state_slots=max_num_seqs + 1 + ckpt_slots, max_model_len=max_model_len)
         self.r = make(model, pc, **runner_kw)
         self.k = k
         caps = self.r.capabilities()
