@@ -2737,8 +2737,8 @@ class Scheduler:
         self.spec_accepted += int(acc.sum())
         self.spec_accepted_per_pos[:v] += (acc[:, None] > np.arange(v)[None, :]).sum(axis=0)
         self.spec_verified_per_pos[:v] += len(rows)
-        if self.count_policy is not None:
-            self.count_policy.observe_accept(v, acc)
+        if self.count_policy is not None:  # a step's rows in one call or several (`_deliver_held`): one decay
+            self.count_policy.observe_accept(v, acc, inf.step_id)
         if inf.wpop is not None:
             self._rejections(inf, rows, acc, tokens)
 

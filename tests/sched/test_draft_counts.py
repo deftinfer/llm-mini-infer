@@ -199,11 +199,11 @@ def test_a_positions_evidence_ages_while_the_count_runs_below_it() -> None:
 
 
 def test_a_run_of_rejections_at_one_row_does_not_leave_the_count_low() -> None:
-    """One decode row, acceptance in runs: 60 steps that accept the first draft on 4 of 10 steps and nothing after it,
-    then 40 that accept every draft. k gives the most tokens per device-ms, and the policy runs it. Before, a run of
-    rejections at k drove the estimate past the first draft low, count 1 won, and positions 2 to 5 were then verified
-    only at the probes: their estimate stayed low (here 64% of k's tokens per ms; chat at one request in flight ran
-    count 1 on 78% of its steps, 6% under k = 5)."""
+    """One decode row, acceptance in runs: 150 steps that accept the first draft on 4 of 10 steps and nothing after
+    it, then 100 that accept every draft. k gives the most tokens per device-ms, and the policy runs it. Before, a run
+    of rejections at k drove the estimate past the first draft low, count 1 won, and positions 2 to 5 were then verified
+    only at the probes: their estimate stayed low (here 60 to 66% of k's tokens per ms; chat at one request in flight
+    ran count 1 on 78% of its steps, 6% under k = 5)."""
 
     def run(fixed: int = 0) -> tuple[float, list[int]]:
         p = DraftCounts((1, 2, 3), K)
@@ -213,7 +213,7 @@ def test_a_run_of_rejections_at_one_row_does_not_leave_the_count_low() -> None:
             v, d = (c, c) if c <= held else (held, K)
             if c > held and not fixed:
                 p.raised()
-            a = (min(v, 1) if (i * 7) % 10 < 4 else 0) if i % 100 < 60 else v
+            a = (min(v, 1) if (i * 7) % 10 < 4 else 0) if i % 250 < 150 else v
             t = 25.0 + 0.3 * v + 0.9 * d
             p.observe_accept(v, np.array([a]))
             p.observe_cost(1, v, d, int(t * 1e6))

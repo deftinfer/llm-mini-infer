@@ -60,6 +60,7 @@ class DraftCounts:
         self.surv = np.ones(k, np.float64)  # s_1 .. s_k (optimistic until measured: k runs first)
         self.held_rows = np.zeros(k, np.float64)  # per position: the verify rows that held it, decayed
         self.accepted_rows = np.zeros(k, np.float64)  # ... and those that accepted it
+        self._decayed_at: int | None = None  # the step whose verify rows last decayed them (`observe_accept`)
         self.cost: dict[tuple[int, int, int], list[float]] = {}  # (bucket, v, d) -> [device ms, steps]
         self.steps: dict[int, int] = {}  # bucket -> decode steps chosen
         self.current: dict[int, int] = {}  # bucket -> the count it runs
@@ -127,14 +128,17 @@ class DraftCounts:
                 return self.counts[j]
         return None
 
-    def observe_accept(self, v: int, accepted: np.ndarray) -> None:
+    def observe_accept(self, v: int, accepted: np.ndarray, step: int | None = None) -> None:
         """A verify step of v drafts a row: each row's accepted drafts (`accepted`, ints). Every position's counts
-        decay; the first v gain this step's rows (module docstring)."""
+        decay, once a step (`step`: the step's id, for the calls that deliver a step's rows in parts; None: every
+        call); the first v gain this step's rows (module docstring)."""
         if v <= 0 or not len(accepted):
             return
         a = np.asarray(accepted, np.int64)
-        self.held_rows *= 1.0 - SURVIVAL_ALPHA
-        self.accepted_rows *= 1.0 - SURVIVAL_ALPHA
+        if step is None or step != self._decayed_at:
+            self._decayed_at = step
+            self.held_rows *= 1.0 - SURVIVAL_ALPHA
+            self.accepted_rows *= 1.0 - SURVIVAL_ALPHA
         self.held_rows[:v] += len(a)
         self.accepted_rows[:v] += (a[:, None] >= np.arange(1, v + 1)[None, :]).sum(axis=0)
         self.surv = np.minimum.accumulate((self.accepted_rows + PRIOR_ROWS) / (self.held_rows + PRIOR_ROWS))
