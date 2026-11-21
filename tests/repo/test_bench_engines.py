@@ -766,7 +766,11 @@ def test_load_keeps_only_the_named_loads():
     assert [s.name for s in drive.loads_for(SimpleNamespace(args=args), unit)] == ["prefill-128k", "cached-128k"]
     args = drive.parser().parse_args(["--out", "x", "--model", "gemma", "--family", "L", "--context", "32768",
                                       "--load", "prefill-128k", "--load", "cached-32k"])
-    with pytest.raises(LookupError, match=r"^--load prefill-128k: not among family L's loads here \(.*cached-32k"):
+    unit = drive.build_units(args)[0]
+    assert [s.name for s in drive.loads_for(SimpleNamespace(args=args, log=print), unit)] == ["cached-32k"]
+    args = drive.parser().parse_args(["--out", "x", "--model", "gemma", "--family", "L", "--context", "32768",
+                                      "--load", "prefill-128k"])
+    with pytest.raises(LookupError, match=r"^--load prefill-128k: none among family L's loads here \(.*cached-32k"):
         drive.loads_for(SimpleNamespace(args=args, log=print), drive.build_units(args)[0])  # past the context
 
 

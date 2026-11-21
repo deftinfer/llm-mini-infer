@@ -259,7 +259,9 @@ def test_the_engines_window_from_its_metrics() -> None:
     assert hostcheck.engine_delta(va, vb, completed=20)["accept"]["per_pos"] == [0.9, 0.8]  # 160 of the 200 held 1
     vb = hostcheck.prometheus(METRICS % {**_PAGE_BASE, "drafts": 300, "p0": 230, "p1": 60}
                               + held % ("0", 300) + held % ("1", 140))
-    assert hostcheck.engine_delta(va, vb, completed=20)["accept"]["per_pos"] == [0.9, 0.4]  # 40 of 100
+    held_less = hostcheck.engine_delta(va, vb, completed=20)["accept"]  # 40 of 100
+    assert held_less == {"drafts": 200, "per_pos": [0.9, 0.4], "tokens_per_verify": 2.3,
+                         "tokens_per_verify_realized": 2.1, "verify_steps_per_request": 10.0}  # 1 + 220 / 200
     # vLLM's page: acceptance per position from its counters, none of llm-mini-infer's
     v = [hostcheck.prometheus(VLLM_METRICS % kw) for kw in (dict(drafts=10, p0=8, p1=6, p2=4, gen=100),
                                                             dict(drafts=110, p0=88, p1=66, p2=44, gen=500))]
@@ -344,7 +346,7 @@ def test_the_loads_verdicts(tmp_path) -> None:
                                   ref, "mounted")
     assert bad["requests"].startswith("FAILED") and bad["plans_kept"].startswith("FAILED")
     assert bad["e2e"] == "SLOW: beyond 1.25x the reference" and bad["gpu_idle"].startswith("SLOW")
-    assert bad["accept"] == "LOW: below 0.9x the reference (per position: 0.90 / 0.80)"
+    assert bad["accept"] == "LOW: k-wide acceptance below 0.9x the reference (per position: 0.90 / 0.80)"
     assert bad["reply"].startswith("differs")
     assert "reply" not in hostcheck.load_verdicts(load(reply_tokens={"mean": 30}), ref, "synthetic")
     assert hostcheck.load_verdicts(load(rate=7.0), ref, "mounted")["e2e"] == "no reference at this rate"

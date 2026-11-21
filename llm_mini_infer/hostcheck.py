@@ -441,8 +441,8 @@ def schema_name(schema: dict[str, Any]) -> str:
 def load_reference(path: Path) -> list[dict[str, Any]]:
     """A reference file: one object or a list of them, each with `card` (what it was measured on, as text), `card_w`
     (its power class, `power_class`; default 600), `startup_s` (the warm starts' range), `loads` by rate with `e2e`,
-    `ttft`, `reply`, `tpv`, `power` and `sm`, and optionally `accept_per_pos` (the acceptance per draft position) and
-    the labels a run must match (`LABELS`, and `workload`: an object)."""
+    `ttft`, `reply`, `tpv` (the k-wide tokens per verify step), `power` and `sm`, and optionally `accept_per_pos` (the
+    acceptance per draft position) and the labels a run must match (`LABELS`, and `workload`: an object)."""
     try:
         raw = json.loads(path.read_text())
     except (OSError, ValueError) as exc:
@@ -861,14 +861,22 @@ def engine_delta(a: dict[str, float], b: dict[str, float], completed: int) -> di
     # each position's acceptance over the verify steps that held it: all of them at a fixed k, fewer with
     # dev.speculative.adaptive (llm_mini_infer:spec_decode_num_verified_per_pos; another engine: its drafts)
     va, vb = (by_label(s, "llm_mini_infer:spec_decode_num_verified_per_pos_total", "position") for s in (a, b))
+
+    def held(p: str) -> float:
+        return vb[p] - va.get(p, 0.0) if p in vb else drafts
+
     def share(p: str) -> float:
-        held = vb[p] - va.get(p, 0.0) if p in vb else drafts
-        return round((pb[p] - pa.get(p, 0.0)) / held, 3) if held > 0 else 0.0
+        return round((pb[p] - pa.get(p, 0.0)) / held(p), 3) if held(p) > 0 else 0.0
 
     if drafts > 0:
         per = [share(p) for p in sorted(pb, key=int)]
         out["accept"] = {"drafts": round(drafts), "per_pos": per, "tokens_per_verify": round(1 + sum(per), 3),
                          "verify_steps_per_request": round(drafts / completed, 2) if completed else None}
+        if any(held(p) != drafts for p in pb):
+            # tokens_per_verify is the k-wide estimate (as if every step verified every position), like for like
+            # with a reference; with a count per step fewer steps verify the later positions
+            out["accept"]["tokens_per_verify_realized"] = round(
+                1 + sum(pb[p] - pa.get(p, 0.0) for p in pb) / drafts, 3)
     busy, idle = d("llm_mini_infer:gpu_busy_seconds_total"), d("llm_mini_infer:gpu_idle_seconds_total")
     out["gpu_idle_pct"] = round(100 * idle / (idle + busy), 4) if busy else None
     ha, hb = (by_label(s, "llm_mini_infer:grammar_head_steps_total", "path") for s in (a, b))
@@ -1001,7 +1009,7 @@ def load_verdicts(load: dict[str, Any], ref: dict[str, Any] | None, mode: str) -
     tpv = (eng.get("accept") or {}).get("tokens_per_verify")
     per_pos = " / ".join(f"{a:.2f}" for a in ref.get("accept_per_pos") or [])
     v["accept"] = "n/a" if tpv is None else "ok" if tpv >= 0.9 * r["tpv"] else \
-        "LOW: below 0.9x the reference" + (f" (per position: {per_pos})" if per_pos else "")
+        "LOW: k-wide acceptance below 0.9x the reference" + (f" (per position: {per_pos})" if per_pos else "")
     reply = load["reply_tokens"].get("mean")
     if mode == "mounted" and reply:
         v["reply"] = "ok" if 0.8 * r["reply"] <= reply <= 1.25 * r["reply"] else \
@@ -1255,7 +1263,7 @@ def as_reference(r: dict[str, Any]) -> dict[str, Any]:
         e, t = load["e2e_ms"], load["ttft_ms"]
         out["loads"][f"{load['rate']:g}"] = {
             "e2e": [e.get("p50"), e.get("p99")], "ttft": [t.get("p50"), t.get("p99")],
-            "reply": load["reply_tokens"].get("mean"), "tpv": acc.get("tokens_per_verify"),
+            "reply": load["reply_tokens"].get("mean"), "tpv": acc.get("tokens_per_verify"),  # the k-wide estimate
             "power": gpu.get("power_w"), "sm": gpu.get("sm_mhz")}
         out.setdefault("accept_per_pos", acc.get("per_pos"))
     return out
@@ -1345,8 +1353,10 @@ def gemma_rows(r: dict[str, Any]) -> list[tuple[str, str, str, str]]:
         rows.append((f"{head}: reply tokens mean / p99 / max", f"{load['reply_tokens'].get('mean')} / "
                      f"{load['reply_tokens'].get('p99')} / {load['reply_tokens'].get('max')}",
                      f"mean {lr['reply']}" if lr else "", v.get("reply", "")))
-        rows.append((f"{head}: acceptance per position", f"{acc.get('per_pos')} ({acc.get('tokens_per_verify')} a "
-                     "verify step)", f"{lr['tpv']} a verify step" if lr else "", v.get("accept", "")))
+        real = acc.get("tokens_per_verify_realized")
+        mine = f"{acc.get('tokens_per_verify')} a verify step" + (f" at k, {real} realized" if real else "")
+        rows.append((f"{head}: acceptance per position", f"{acc.get('per_pos')} ({mine})",
+                     f"{lr['tpv']} a verify step" if lr else "", v.get("accept", "")))
         rows.append((f"{head}: GPU idle due to the CPU", f"{eng.get('gpu_idle_pct')}%", "under 3%",
                      v.get("gpu_idle", "")))
         rows.append((f"{head}: power, SM clock", f"{gpu.get('power_w')} W, {gpu.get('sm_mhz')} MHz",
