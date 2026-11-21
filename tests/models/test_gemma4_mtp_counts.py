@@ -118,6 +118,26 @@ def test_masked_outputs_equal_under_a_schedule_of_counts(pair, params) -> None:
     assert outs[0][1][0] == FinishReason.STOP and outs[0][0][0][-1] == EOS
 
 
+@pytest.mark.parametrize("given, k_list, lists", [
+    (None, [1, 2, 4, 8], {1: [1, 2, 4, 8, 16], 2: [1, 2, 4, 8, 16], 3: [1, 2, 4, 8, 12]}),
+    ([1, 2, 4, 8], [1, 2, 4, 8], {1: [1, 2, 4, 8, 16], 2: [1, 2, 4, 8, 16], 3: [1, 2, 4, 8, 12]}),
+    ([1, 2, 4, 8, 32], [1, 2, 4, 8], {1: [1, 2, 4, 8, 16], 2: [1, 2, 4, 8, 16], 3: [1, 2, 4, 8, 12]}),
+    ([1, 2, 4], [1, 2, 4], {1: [1, 2, 4], 2: [1, 2, 4], 3: [1, 2, 4]}),
+    ([32, 64], [], {1: [], 2: [], 3: []}),
+])
+def test_decode_buckets_are_cut_at_each_counts_rows(pair, given, k_list, lists) -> None:
+    """A given decode_buckets list is cut at each width's rows (budget // (1 + v), at most max_num_seqs); one that
+    reaches k's rows gets each count's own rows appended where it stops short of them; one that stops below k's rows
+    is kept as given; no list: each width's defaults."""
+    from ..support.tiny_gemma import gemma_cpu_runner, gemma_pools
+
+    target, assistant = pair
+    pc = gemma_pools(max_num_seqs=16, budget=48, mtp_k=K)  # rows: 8 at k, 16 at counts 1 and 2, 12 at 3
+    r = gemma_cpu_runner(target, pc, mtp_k=K, assistant=assistant, draft_counts=COUNTS, decode_buckets=given)
+    assert r.decode_buckets == k_list and r._dbuckets(K) == k_list
+    assert {v: r._dbuckets(v) for v in COUNTS} == lists
+
+
 def test_counts_change_across_a_preemption_and_a_readmission(pair) -> None:
     """Requests preempted mid-decode (with a decode step in flight) and readmitted from the cache while the counts
     change every step: a readmitted slot holds no drafts until its final chunk's SAMPLE row drafts (`Scheduler.held`),

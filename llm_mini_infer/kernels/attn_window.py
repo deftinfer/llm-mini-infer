@@ -91,11 +91,12 @@ class WindowAttention:
 
     def __init__(self, pools: Any, num_heads: int, num_kv_heads: int, head_dim: int, device: torch.device,
                  window: int, max_tokens: int, max_rows: int, scale: float = 1.0, qo_per_row: int = 1,
-                 split_keys: int = SPLIT_KEYS, share: WindowAttention | None = None):
+                 split_keys: int = SPLIT_KEYS, share: WindowAttention | None = None, graph_only: bool = False):
         """`window`: keys a query sees, its own included; `max_rows`: decode rows a step holds at most;
         `qo_per_row`: a decode row's queries (1 + k under MTP); `split_keys`: a decode row's split (module
         docstring). `share`: an instance whose split partials this one uses when large enough (one step runs one
-        width's sliding backend, and each call merges its splits before the next call's split on the same stream)."""
+        width's sliding backend, and each call merges its splits before the next call's split on the same stream).
+        `graph_only`: decode graphs only (`plan_graph`), so no eager tables."""
         if head_dim != D or num_heads % num_kv_heads or ROWS % (num_heads // num_kv_heads):
             raise ValueError(f"attn_window: head dim {D} and query heads per KV head dividing {ROWS} (got head dim "
                              f"{head_dim}, {num_heads} heads over {num_kv_heads})")
@@ -119,15 +120,17 @@ class WindowAttention:
         else:
             self.o_part = torch.empty((self.max_split_items, ROWS, D), dtype=torch.float32, device=device)
             self.ml_part = torch.empty((self.max_split_items, ROWS, 2), dtype=torch.float32, device=device)
-        # Tables, per parity (a step is planned while the previous one may be queued): the decode rows' items and
+        # Eager tables, per parity (a step is planned while the previous one may be queued): the decode rows' items and
         # groups, the prefill rows' items, the span queries' key ends
+        self.graph_only = graph_only
         max_groups = max(1, max_rows) * tiles(qo_per_row, self.group) * num_kv_heads
         self.max_prefill_items = (-(-max_tokens * self.group // PROWS) + max_rows) * num_kv_heads
-        self.rows = [torch.zeros((max_rows + 1, 4), dtype=torch.int32, device=device) for _ in range(2)]
-        self.items = [torch.zeros((self.max_split_items, 4), dtype=torch.int32, device=device) for _ in range(2)]
-        self.groups = [torch.zeros((max_groups, 2), dtype=torch.int32, device=device) for _ in range(2)]
-        self.p_items = [torch.zeros((self.max_prefill_items, 4), dtype=torch.int32, device=device) for _ in range(2)]
-        self.kend = [torch.zeros(max_tokens, dtype=torch.int32, device=device) for _ in range(2)]
+        n = 0 if graph_only else 2
+        self.rows = [torch.zeros((max_rows + 1, 4), dtype=torch.int32, device=device) for _ in range(n)]
+        self.items = [torch.zeros((self.max_split_items, 4), dtype=torch.int32, device=device) for _ in range(n)]
+        self.groups = [torch.zeros((max_groups, 2), dtype=torch.int32, device=device) for _ in range(n)]
+        self.p_items = [torch.zeros((self.max_prefill_items, 4), dtype=torch.int32, device=device) for _ in range(n)]
+        self.kend = [torch.zeros(max_tokens, dtype=torch.int32, device=device) for _ in range(n)]
         self.g_tabs: dict[int, tuple[torch.Tensor, torch.Tensor, int, torch.Tensor, int]] = {}
 
     @staticmethod
@@ -146,6 +149,8 @@ class WindowAttention:
         planned for their upper bound), the first `fixed_rows` of them decode rows, split; the rest prefill rows, whole
         (module docstring). `span_end`: int32 [the step's tokens], each image-span query's span end, 0 elsewhere (None:
         no spans). `stage` as in `attn512.Attn512.plan`."""
+        if self.graph_only:
+            raise RuntimeError("attn_window: an instance for decode graphs only plans no eager step")
         nq = rows[:, 2].astype(np.int64)
         dr, di, dg, pi = self.rows[parity], self.items[parity], self.groups[parity], self.p_items[parity]
         dr[:len(rows)].copy_(stage(rows.reshape(-1)).view(-1, 4), non_blocking=True)

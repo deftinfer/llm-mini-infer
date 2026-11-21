@@ -369,7 +369,9 @@ class DevCudaConfig(_Group):
     # Our CUDA kernels and the FP8 GEMMs; false: their torch references (the sampler stays fused on CUDA), with no CUDA
     # graphs or PDL; Gemma 4 then needs `attention: torch` (its full attention is our kernel)
     fused_ops: bool = True
-    decode_buckets: list[int] | None = None  # batch sizes with a decode graph (default: default_decode_buckets)
+    # Batch sizes with a decode graph (default: default_decode_buckets), cut at each width's row limit; with draft
+    # counts (dev.speculative.adaptive) a count's limit is added when the list reaches k's and stops below it
+    decode_buckets: list[int] | None = None
     token_buckets: list[int] | None = None  # token counts with a breakable graph (default: default_token_buckets)
     vision_buckets: list[int] | None = None  # patch counts with a vision-tower graph ([]: eager; default: derived)
     fp8_gemm: Literal["auto", "cutlass", "sglang", "flashinfer", "torch"] = "auto"  # block-FP8 GEMMs (kernels.fp8)

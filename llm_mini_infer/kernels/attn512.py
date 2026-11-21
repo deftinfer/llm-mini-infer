@@ -196,11 +196,12 @@ class Attn512:
     def __init__(self, pools: Any, rotary: Any, num_heads: int, num_kv_heads: int, rot: int, device: torch.device,
                  max_tokens: int, max_rows: int, scale: float = 1.0, qo_per_row: int = 1, share: Attn512 | None = None,
                  split_keys: int = 0, max_kv: int = 0, prefill_from: int = PREFILL_FROM,
-                 prefill_keys: int = PREFILL_KEYS):
+                 prefill_keys: int = PREFILL_KEYS, graph_only: bool = False):
         """`qo_per_row`: a decode graph row's queries (1 + k under MTP). `share`: an instance whose split partials this
         one uses when large enough (the MTP drafter's attention runs after the target's, on the same stream).
         `split_keys`: the fixed split's base for decode rows (module docstring; 0: the wave split), for rows of up to
-        `max_kv` keys; `prefill_from` and `prefill_keys`: a prefill query's (the tests make them small)."""
+        `max_kv` keys; `prefill_from` and `prefill_keys`: a prefill query's (the tests make them small). `graph_only`:
+        decode graphs only (`plan_graph`), so no eager tables, whose size follows `max_tokens`."""
         self.pools = pools
         self.cos, self.sin = rotary.cos["full_attention"], rotary.sin["full_attention"]
         self.h, self.hkv, self.rot, self.scale = num_heads, num_kv_heads, rot, scale
@@ -232,13 +233,17 @@ class Attn512:
             self.max_split_items = max_items
             self.o_part = torch.empty((max_items, ROWS, 512), dtype=torch.float32, device=device)
             self.ml_part = torch.empty((max_items, ROWS, 2), dtype=torch.float32, device=device)
-        # Tables, per parity (module docstring): under the fixed split a prefill group may take up to MAX_SPLITS items
+        # Eager tables, per parity (module docstring): under the fixed split a prefill group may take up to MAX_SPLITS
+        # items
+        self.graph_only = graph_only
         max_groups = (tiles(max_tokens, self.group) + max_rows) * num_kv_heads
-        self.rows = [torch.zeros((max_rows + 1, 4), dtype=torch.int32, device=device) for _ in range(2)]
         n_items = max_groups * MAX_SPLITS if split_keys else max_groups + max_items
-        self.items = [torch.zeros((n_items, 4), dtype=torch.int32, device=device) for _ in range(2)]
-        self.orders = [torch.zeros(n_items if split_keys else 1, dtype=torch.int32, device=device) for _ in range(2)]
-        self.groups = [torch.zeros((max_groups, 2), dtype=torch.int32, device=device) for _ in range(2)]
+        parities = 0 if graph_only else 2
+        self.rows = [torch.zeros((max_rows + 1, 4), dtype=torch.int32, device=device) for _ in range(parities)]
+        self.items = [torch.zeros((n_items, 4), dtype=torch.int32, device=device) for _ in range(parities)]
+        self.orders = [torch.zeros(n_items if split_keys else 1, dtype=torch.int32, device=device)
+                       for _ in range(parities)]
+        self.groups = [torch.zeros((max_groups, 2), dtype=torch.int32, device=device) for _ in range(parities)]
         # decode buckets: static row, item and group tables, the launch's sizes (items, groups, split), the host
         # tables per real row count (the wave split) and what the bucket's last replay's tables were made for (its
         # real rows; the fixed split: every row's split count)
@@ -268,6 +273,8 @@ class Attn512:
         fixed split, the first `fixed_rows` rows are decode rows, their queries anywhere from their lowest possible KV
         length `lb` (per row; None: the planned ones) to their planned one, and the rest prefill rows (module
         docstring)."""
+        if self.graph_only:
+            raise RuntimeError("attn512: an instance for decode graphs only plans no eager step")
         nq, kv_len = rows[:, 2].astype(np.int64), rows[:, 3].astype(np.int64)
         if self.split_keys:
             low = kv_len if lb is None else np.asarray(lb, np.int64)

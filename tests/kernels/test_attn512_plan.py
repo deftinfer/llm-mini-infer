@@ -289,3 +289,181 @@ def test_an_attn512_plan_stages_within_its_bound(budget, monkeypatch) -> None:
             used, stage = _counting_stage()
             a.plan(SimpleNamespace(), parity=0, rows=step, stage=stage, fixed_rows=fixed)
             assert used[0] <= bound, (pkeys, step[-1].tolist(), fixed, used[0], bound)
+
+
+def _recording_stage() -> tuple[list[np.ndarray], object]:
+    """A plan's `stage` that records every array it is given."""
+    import torch
+
+    seen: list[np.ndarray] = []
+
+    def stage(a):
+        a = np.ascontiguousarray(a, dtype=np.int32).reshape(-1)
+        seen.append(a.copy())
+        return torch.from_numpy(a.copy())
+
+    return seen, stage
+
+
+def _graph_rows(bucket: int, qo: int, kv0: int) -> np.ndarray:
+    """A decode bucket's row table: slot, first token, queries and KV length after, the lengths all different."""
+    rows = np.zeros((bucket, 4), np.int32)
+    rows[:, 0] = np.arange(bucket)
+    rows[:, 1] = np.arange(bucket) * qo
+    rows[:, 2] = qo
+    rows[:, 3] = kv0 + 1013 * np.arange(bucket)
+    return rows
+
+
+def _same_graph_plan(make, bucket: int, qo: int, real_counts, lows, attr: str = "full_plan") -> None:
+    """`plan_graph` of a graph-only instance and an ordinary one: the same arrays staged and the same plan."""
+    import torch
+
+    ordinary, graph_only = make(False), make(True)
+    for real, low in zip(real_counts, lows):
+        rows = _graph_rows(bucket, qo, 9000)
+        kwargs = {}
+        if real is not None:
+            kwargs = {"real": real, "lb": None if low is None else rows[:, 3] - low}
+        got = []
+        for inst in (ordinary, graph_only):
+            meta, (seen, stage) = SimpleNamespace(), _recording_stage()
+            inst.plan_graph(meta, bucket=bucket, rows=rows, stage=stage, **kwargs)
+            got.append((getattr(meta, attr), seen))
+        (plan_a, seen_a), (plan_b, seen_b) = got
+        assert len(seen_a) == len(seen_b)
+        assert all(np.array_equal(x, y) for x, y in zip(seen_a, seen_b)), (bucket, real, low)
+        assert len(plan_a) == len(plan_b)
+        for x, y in zip(plan_a, plan_b):
+            if isinstance(x, torch.Tensor):
+                assert torch.equal(x, y), (bucket, real, low)
+            else:
+                assert x == y, (bucket, real, low)
+
+
+@pytest.mark.parametrize("qo", [2, 6])
+@pytest.mark.parametrize("split_keys", [am.SPLIT_KEYS, 0])
+def test_a_graph_only_attn512_holds_no_eager_tables_and_plans_the_same_graphs(qo, split_keys, monkeypatch) -> None:
+    """Gemma 4's full layers (32 query, 4 KV heads; 64 rows of `qo` queries), fixed or wave split: an instance for
+    decode graphs only holds no eager tables (the ordinary one's follow `max_tokens`), plans no eager step, and plans
+    each bucket's graph as the ordinary one does: every array staged and every table of `full_plan`, with all rows
+    real, with fewer, and (fixed split) with lowest possible lengths below the planned ones."""
+    import torch
+
+    from llm_mini_infer.kernels import build
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda d: SimpleNamespace(multi_processor_count=SMS))
+    monkeypatch.setattr(build, "load", lambda: None)
+    rot = SimpleNamespace(cos={"full_attention": None}, sin={"full_attention": None})
+
+    def make(graph_only: bool) -> am.Attn512:
+        return am.Attn512(None, rot, G * HKV, HKV, 128, torch.device("cpu"), max_tokens=32768, max_rows=64,
+                          qo_per_row=qo, split_keys=split_keys, max_kv=262_144 + qo, graph_only=graph_only)
+
+    ordinary, graph_only = make(False), make(True)
+    for name in ("rows", "items", "orders", "groups"):
+        assert len(getattr(ordinary, name)) == 2 and getattr(graph_only, name) == []
+    assert ordinary.items[0].shape[0] >= 32768 // 2 and graph_only.graph_only
+    with pytest.raises(RuntimeError, match="decode graphs only"):
+        graph_only.plan(SimpleNamespace(), parity=0, rows=_graph_rows(2, qo, 5000), stage=_recording_stage()[1])
+    for bucket in (1, 8, 64):
+        reals = [None, bucket, max(1, bucket // 2), 1]
+        lows = [None, None, None, 3000] if split_keys else [None] * 4
+        if split_keys:
+            reals, lows = [*reals, bucket], [*lows, 4000]
+        _same_graph_plan(make, bucket, qo, reals, lows)
+
+
+@pytest.mark.parametrize("qo", [2, 6])
+def test_a_graph_only_window_attention_holds_no_eager_tables_and_plans_the_same_graphs(qo) -> None:
+    """Gemma 4's sliding layers (32 query, 16 KV heads, head dim 256), the same as for `Attn512`: no eager tables, no
+    eager plan, and each bucket's graph planned as the ordinary instance does."""
+    import torch
+
+    from llm_mini_infer.kernels import attn_window as aw
+
+    def make(graph_only: bool) -> aw.WindowAttention:
+        return aw.WindowAttention(None, 32, 16, 256, torch.device("cpu"), 1024, max_tokens=32768, max_rows=64,
+                                  qo_per_row=qo, graph_only=graph_only)
+
+    ordinary, graph_only = make(False), make(True)
+    for name in ("rows", "items", "groups", "p_items", "kend"):
+        assert len(getattr(ordinary, name)) == 2 and getattr(graph_only, name) == []
+    assert ordinary.kend[0].shape[0] == 32768
+    with pytest.raises(RuntimeError, match="decode graphs only"):
+        graph_only.plan(SimpleNamespace(), parity=0, rows=_graph_rows(2, qo, 5000), stage=_recording_stage()[1])
+    for bucket in (1, 8, 64):
+        _same_graph_plan(make, bucket, qo, [None, None], [None, None], "window_plan")
+
+
+def _window_steps(budget: int, rows: int, qo: int) -> list[tuple[np.ndarray, int]]:
+    """Sliding-layer steps: all decode rows; decode rows and one prefill chunk filling the budget; many small
+    prefills; one-token prefills."""
+    steps = []
+    if rows * qo <= budget:
+        steps.append((np.array([[i, i * qo, qo, 50_000] for i in range(rows)], np.int32), rows))
+    n_dec = rows - 1
+    chunk = budget - n_dec * qo
+    if chunk > 0:
+        dec = [[i, i * qo, qo, 50_000] for i in range(n_dec)]
+        steps.append((np.array([*dec, [n_dec, n_dec * qo, chunk, chunk + 7]], np.int32), n_dec))
+    per = budget // rows
+    steps.append((np.array([[i, i * per, per, per + 3] for i in range(rows)], np.int32), 0))
+    steps.append((np.array([[i, i, 1, 9] for i in range(rows)], np.int32), 0))
+    return steps
+
+
+@pytest.mark.parametrize("window", [512, 1024])
+@pytest.mark.parametrize("budget", [379, 2048, 8192])
+@pytest.mark.parametrize("qo", [1, 6])
+def test_a_window_attention_plan_stages_within_its_bound(window, budget, qo) -> None:
+    """Gemma 4's sliding layers (32 query heads over 16 KV heads, head dim 256) at the fixed split: decode rows, decode
+    rows with a prefill chunk filling the budget, many small prefills and one-token prefills, with and without image
+    spans, stage no more int32 than `WindowAttention.staging_bound`, which sizes the runner's page-locked staging."""
+    import torch
+
+    from llm_mini_infer.kernels import attn_window as aw
+
+    rows = min(64, budget // qo)
+    a = aw.WindowAttention(None, 32, 16, 256, torch.device("cpu"), window, max_tokens=budget, max_rows=rows,
+                           qo_per_row=qo)
+    bound = aw.WindowAttention.staging_bound(rows, budget, 2, 16, qo, window, aw.SPLIT_KEYS)
+    for step, fixed in _window_steps(budget, rows, qo):
+        for spans in (False, True):
+            used, stage = _counting_stage()
+            span_end = np.zeros(int(step[:, 2].sum()), np.int32) if spans else None
+            a.plan(SimpleNamespace(), parity=0, rows=step, stage=stage, fixed_rows=fixed, span_end=span_end)
+            assert used[0] <= bound, (window, budget, qo, fixed, spans, used[0], bound)
+
+
+@pytest.mark.parametrize("budget", [2048, 8192])
+def test_the_gemma_runners_staging_covers_a_steps_attention_plans(budget, monkeypatch) -> None:
+    """The int32 `attention_staging` sizes the Gemma runner's staging by (Gemma 4 31B: 32 heads over 4 full and 16
+    sliding KV heads, 1 + 5 queries, 64 slots, a context of 262,144, MTP) is at least what a step stages: the target's
+    full and sliding plans on the same rows and the drafter's full plan on one query a sample row; without our sliding
+    kernel it is smaller by exactly that kernel's bound."""
+    import torch
+
+    from llm_mini_infer.kernels import attn_window as aw
+    from llm_mini_infer.kernels import build
+    from llm_mini_infer.runner.cuda.gemma import attention_staging
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda d: SimpleNamespace(multi_processor_count=SMS))
+    monkeypatch.setattr(build, "load", lambda: None)
+    rot = SimpleNamespace(cos={"full_attention": None}, sin={"full_attention": None})
+    cpu, slots, L, ctx, window = torch.device("cpu"), 64, 6, 262_144, 1024
+    full = am.Attn512(None, rot, 32, 4, 128, cpu, max_tokens=budget, max_rows=slots, qo_per_row=L,
+                      split_keys=am.SPLIT_KEYS, max_kv=ctx + L)
+    sliding = aw.WindowAttention(None, 32, 16, 256, cpu, window, max_tokens=budget, max_rows=slots, qo_per_row=L)
+    draft = am.Attn512(None, rot, 32, 4, 128, cpu, max_tokens=64, max_rows=slots, qo_per_row=1, share=full,
+                       max_kv=ctx + L)
+    total = attention_staging(slots, budget, 32, 4, 16, L, window, aw.SPLIT_KEYS, 0, True)
+    for step, fixed in _steps(budget, slots, L, ctx):
+        used, stage = _counting_stage()
+        full.plan(SimpleNamespace(), parity=0, rows=step, stage=stage, fixed_rows=fixed)
+        sliding.plan(SimpleNamespace(), parity=0, rows=step, stage=stage, fixed_rows=fixed)
+        one = np.array([[i, i, 1, ctx] for i in range(slots)], np.int32)
+        draft.plan(SimpleNamespace(), parity=0, rows=one, stage=stage, fixed_rows=slots)
+        assert used[0] <= total, (step[-1].tolist(), fixed, used[0], total)
+    assert total - attention_staging(slots, budget, 32, 4, 16, L, window, 0, 0, True) == \
+        aw.WindowAttention.staging_bound(slots, budget, 2, 16, L, window, aw.SPLIT_KEYS)
