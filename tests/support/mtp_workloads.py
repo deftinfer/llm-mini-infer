@@ -72,12 +72,14 @@ def mtp_workloads(draw):
 
 def with_counts(draw, w: dict) -> dict:
     """A workload with draft counts per step (`sched.draft_counts`): the policy over every count below k, or a schedule
-    of counts cycled over the plans with decode rows (lowering and raising, `Scheduler.held`)."""
+    of counts cycled over the plans with decode rows (lowering and raising, `Scheduler.held`); plans with explicit
+    rows drafting the count too, or k (`Capabilities.mixed_draft_counts`)."""
     k = w["mtp_k"]
     if k > 1 and draw(st.booleans()):
         w["adaptive"] = True
     else:
         w["count_schedule"] = draw(st.lists(st.integers(1, k), min_size=1, max_size=6))
+    w["mixed_draft_counts"] = draw(st.booleans())
     return w
 
 
@@ -102,5 +104,7 @@ def run_mtp_workload(w: dict) -> None:
         event("MTP: steps below k")
     if h.sched.count_raises:
         event("MTP: a raise (k drafted for a higher count)")
+    if h.runner.counts["mixed_counts"]:
+        event("MTP: a plan with explicit rows drafting a count below k")
     if any(len(s.stop_ids) > STOP_W for s in w["specs"]):
         event("more stop tokens than the runner knows")

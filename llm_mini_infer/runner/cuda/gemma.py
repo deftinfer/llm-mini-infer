@@ -370,6 +370,9 @@ class GemmaRunner(Runner):
             raise RuntimeError("Gemma 4's full attention on CUDA is our attn512 kernel: it needs "
                                "dev.runner.cuda.fused_ops (or dev.runner.cuda.attention torch)")
         self.use_graphs = graphs and kernels and self.attn_kind == "flashinfer"
+        # A plan with explicit rows drafts a count below k too (`Capabilities.mixed_draft_counts`): eagerly, or on the
+        # token buckets' sampling graphs, captured at each count when every step is split (the fused ones draft k)
+        self.mixed_counts = bool(self.counts) and (not self.use_graphs or (grammar and always_split))
         self._sync = sync_checks.make(sync_check, cuda=self.cuda, check=check, reference=(
             "the torch references (dev.runner.cuda.fused_ops off)" if not kernels else
             "torch attention" if self.attn_kind != "flashinfer" else "the torch FP8 GEMM" if fp8_gemm == "torch" else
@@ -483,7 +486,8 @@ class GemmaRunner(Runner):
                 precise_step_ms=self.stats.get("precise_step_ms", 0.0), forward_end=self.grammar and self.cuda,
                 sample_step_ms=self.stats.get("sample_step_ms", 0.0),
                 launch_step_ms=self.stats.get("launch_step_ms", 0.0), batch_invariant=self.inv,
-                logprobs=self.logprobs, penalties=self.penalties, draft_counts=self.counts)
+                logprobs=self.logprobs, penalties=self.penalties, draft_counts=self.counts,
+                mixed_draft_counts=self.mixed_counts)
         return self._caps
 
     def attention_counters(self) -> AttentionCounters:
@@ -935,10 +939,11 @@ class GemmaRunner(Runner):
 
     def _synthetic(self, b: PlanBuilder, step: int, rows: list[tuple[int, int]], *, pages_from: int,
                    free: list[int] = (), params: Any = None, room: int = 0,
-                   precise: bool | list[bool] = False, terms: list[dict | None] = ()) -> StepPlan:
+                   precise: bool | list[bool] = False, terms: list[dict | None] = (), draft_n: int = 0) -> StepPlan:
         """A plan admitting (slot, prompt length) rows as complete prompts (SAMPLE), each with full and window pages
         for two decode steps after it plus `room` positions (`_page_layout`). `precise`: the rows are PRECISE (one flag
-        per row, or one for all); `terms`: a row's penalties and logit bias (`warm_terms`)."""
+        per row, or one for all); `terms`: a row's penalties and logit bias (`warm_terms`); `draft_n`: the drafts its
+        SAMPLE rows make (k by default)."""
         b.begin()
         for s in free:
             b.add_free(s)
@@ -951,6 +956,8 @@ class GemmaRunner(Runner):
             b.add_wpages(slot, 0, wp)
             pre = precise[i] if isinstance(precise, list) else precise
             b.add_explicit_row(slot, self._synthetic_tokens(slot, n), 0, STATE_ZERO | SAMPLE | (PRECISE if pre else 0))
+        if 0 < draft_n < self.k:
+            b.draft_n = draft_n
         return b.finish(step)
 
     def _resume_plan(self, b: PlanBuilder, step: int, *, slot: int, seq_len: int, src: tuple[list[int], list[int]],
@@ -1032,8 +1039,10 @@ class GemmaRunner(Runner):
                 if sum(n for _, n in rows) < t or sum(self._pages_of(n + 4) for _, n in rows) + 1 >= pc.num_pages:
                     continue  # unreachable, or no room
                 for name in graph_names("break", **naming):
-                    self._capture_one((name, t, self.k, self.k),
-                                      lambda rows=rows: self._synthetic(b, 1, rows, pages_from=1))
+                    smp = parse_graph_name(name)[1] == "smp"  # a split step's sampling: one for every count drafted
+                    for d in (self.k, *sorted(self.counts, reverse=True)) if smp and self.mixed_counts else (self.k,):
+                        self._capture_one((name, t, self.k, d),
+                                          lambda rows=rows, d=d: self._synthetic(b, 1, rows, pages_from=1, draft_n=d))
             for v in (self.k, *sorted(self.counts, reverse=True)):  # each count's decode graphs (`_key`)
                 for n in sorted(self._dbuckets(v), reverse=True):
                     for name in graph_names("decode", **naming):
@@ -1215,10 +1224,10 @@ class GemmaRunner(Runner):
 
     def _key(self, name: str, size: int, lay: _Layout, part: str = "all") -> tuple[str, int, int, int]:
         """A step's graph (`_graphs`): a decode graph at its (v, d), a split step's forward at d = k, a break graph at
-        (k, k)."""
+        (k, d) (any v: `mtp_verify`; a d below k only on the split ones, `mixed_counts`)."""
         if name.startswith("decode"):
             return name, size, lay.v, self.k if part == "fwd" else lay.dn
-        return name, size, self.k, self.k
+        return name, size, self.k, self.k if part == "fwd" else lay.dn
 
     def mask_buffer(self, h: _Handle) -> np.ndarray:
         if not self.grammar:
@@ -1325,7 +1334,7 @@ class GemmaRunner(Runner):
             if have("decode", b, lay.v, lay.dn):
                 return "decode", b
         t = _bucket(self.token_buckets, lay.T)
-        if lay.dn == self.k and have("break", t, self.k, self.k):  # any v (`mtp_verify`), k drafts
+        if have("break", t, self.k, lay.dn):  # any v (`mtp_verify`); d below k on the split graphs (`mixed_counts`)
             return "break", t
         return "eager", lay.T
 
@@ -1719,11 +1728,11 @@ class GemmaRunner(Runner):
         seq = m.seq_len[slots]
         slack = m.slack[slots]
         # MTP: the drafts the device rows verify (v, one count for all) and those the SAMPLE rows make (d), each k or
-        # one of `draft_counts` (`sched.plan`); a plan with explicit rows drafts k (its graphs are the token buckets')
+        # one of `draft_counts` (`sched.plan`); a plan with explicit rows drafts k unless `mixed_counts`
         lay.v = lay.dn = k
         if k:
             lay.dn = d = plan.draft_n or k
-            if d != k and (d not in self.counts or not dev.all()):
+            if d != k and (d not in self.counts or not (dev.all() or self.mixed_counts)):
                 raise PlanError(f"step {step}: draft_n {d}: one of {list(self.counts)}, on a plan of device rows only")
         if dev.any():
             v = int(plan.sched_n_draft[dev][0]) if k else 0

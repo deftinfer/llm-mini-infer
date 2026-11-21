@@ -394,14 +394,16 @@ def test_fast_checks_match_the_reference(suite: str, data: st.DataObject) -> Non
     check_alike(suite, ex, data.draw(st.integers(0, 1 << 30), label="faults"))
 
 
-def _decoding(window: int = 0, mtp_k: int = 0, n: int = 1, schedule: tuple[int, ...] = ()) -> None:
+def _decoding(window: int = 0, mtp_k: int = 0, n: int = 1, schedule: tuple[int, ...] = (), mixed: bool = True) -> None:
     """`n` requests decoding after prompts of 40 (pages of 4; `window`: a sliding-window model, window pages of 4 and
-    full pages of 20, `mtp_k` drafts by a drafter without KV, `schedule` its counts per plan)."""
+    full pages of 20, `mtp_k` drafts by a drafter without KV, `schedule` its counts per plan, `mixed`: plans with
+    explicit rows draft the count too)."""
     specs = [harness.Spec(rid=i, prompt_len=40, max_tokens=24, seed=5 + i, ignore_eos=True) for i in range(n)]
     if window:
         h = MODULES["window_workloads"].harness(specs, window=window, max_tokens=64, mtp_k=mtp_k, draft_kv=False)
     else:
-        h = harness.Harness(specs=specs, max_tokens=64, mtp_k=mtp_k, count_schedule=schedule)
+        h = harness.Harness(specs=specs, max_tokens=64, mtp_k=mtp_k, count_schedule=schedule,
+                            mixed_draft_counts=mixed)
     h.run()
     h.check()
 
@@ -431,6 +433,7 @@ def _resumed(hybrid: bool) -> None:
 
 SCENARIOS = {"one": _decoding, "mtp": lambda: _decoding(mtp_k=2), "two": lambda: _decoding(n=2),
              "counts": lambda: _decoding(mtp_k=3, schedule=(1, 3, 2)),
+             "counts_k": lambda: _decoding(mtp_k=3, schedule=(1, 3, 2), mixed=False),
              "counts_two": lambda: _decoding(mtp_k=3, n=2, schedule=(1, 3, 2)),
              "window": lambda: _decoding(16), "window_mtp": lambda: _decoding(16, 2), "precise": _chunked,
              "window_precise": lambda: _chunked(16), "hit": lambda: _resumed(False),
@@ -480,7 +483,7 @@ WRONG = r"AssertionError: request \d+: tokens differ from the prediction"
     # the draft counts (`_check_counts`)
     ("draft_n", "one", 3, 3, PLAN + "draft_n without MTP"),
     ("draft_n", "counts", 3, 3, PLAN + r"draft_n 4: not a count this runner takes \(\[1, 2, 3\]\)"),
-    ("draft_n", "counts", 0, 3, PLAN + r"draft_n 1 on a plan with explicit rows \(they draft k\)"),
+    ("draft_n", "counts_k", 0, 3, PLAN + r"draft_n 1 on a plan with explicit rows \(they draft k\)"),
     ("held", "counts", 3, 3, PLAN + r"device-input rows verify 3 drafts; their slots hold \[[12]\]"),
     ("count", "counts_two", 3, 3, PLAN + r"device-input rows verify \[\d, \d\] drafts: one count of \[1, 2, 3\]"),
     ("next_tok", "mtp", 3, 3, PLAN + "sched_next_tok must be set exactly on non-final explicit rows"),

@@ -8,8 +8,11 @@ step's memory floor C grows with the step's tokens, so the count that delivers t
 the rows grow and as acceptance falls; a step's prefill tokens cost the same at every count, so the decode part's
 time is the one to compare. When the step's token budget cannot hold every row at a count, that count runs the rows
 it holds (R_c), and its rate is theirs. `DraftCounts` keeps:
-- the survival: an EMA over verify steps of each position's share, updated only where the step verified that
-  position (a step at c says nothing of the drafts past c);
+- the survival: per position, the verify rows that held it and those that accepted it, both decayed at every verify
+  step, over an optimistic prior (`PRIOR_ROWS` rows accepting every draft) and never rising with depth. A step at c
+  says nothing of the drafts past c, so their evidence ages while the count runs lower and their estimate drifts back
+  to the prior, until a step verifies them again: a run of rejections cannot leave a position's estimate low for good
+  (at one decode row a step's share is 0 or 1, and acceptance comes in runs);
 - the time: per decode row bucket (`row_bucket`), and per (v, d) a step ran at, an EMA of the device time of the steps
   whose rows were all decode rows (`observe_cost`; other steps cost what their prefill tokens cost);
 - per bucket (of the rows at the narrowest count) the count it runs (k at first) and its steps.
@@ -27,7 +30,8 @@ from __future__ import annotations
 
 import numpy as np
 
-SURVIVAL_ALPHA = 0.05  # the survival EMA's weight of one verify step
+SURVIVAL_ALPHA = 0.02  # the survival counts' decay at each verify step
+PRIOR_ROWS = 2.0  # the survival's prior: as many rows accepting every draft (optimistic, as k runs first)
 COST_ALPHA = 0.1  # the time EMA's weight of one step
 HYSTERESIS = 0.03  # a switch must gain this share of tokens per device-ms
 EXPLORE_EVERY = 8  # a bucket's unmeasured count runs one step in every this many of the bucket's steps
@@ -54,6 +58,8 @@ class DraftCounts:
         self.k = k
         self.counts = tuple(sorted({int(c) for c in counts if 1 <= int(c) <= k} | {k}))
         self.surv = np.ones(k, np.float64)  # s_1 .. s_k (optimistic until measured: k runs first)
+        self.held_rows = np.zeros(k, np.float64)  # per position: the verify rows that held it, decayed
+        self.accepted_rows = np.zeros(k, np.float64)  # ... and those that accepted it
         self.cost: dict[tuple[int, int, int], list[float]] = {}  # (bucket, v, d) -> [device ms, steps]
         self.steps: dict[int, int] = {}  # bucket -> decode steps chosen
         self.current: dict[int, int] = {}  # bucket -> the count it runs
@@ -122,11 +128,16 @@ class DraftCounts:
         return None
 
     def observe_accept(self, v: int, accepted: np.ndarray) -> None:
-        """A verify step of v drafts a row: each row's accepted drafts (`accepted`, ints)."""
+        """A verify step of v drafts a row: each row's accepted drafts (`accepted`, ints). Every position's counts
+        decay; the first v gain this step's rows (module docstring)."""
         if v <= 0 or not len(accepted):
             return
-        share = (np.asarray(accepted, np.int64)[:, None] >= np.arange(1, v + 1)[None, :]).mean(axis=0)
-        self.surv[:v] += SURVIVAL_ALPHA * (share - self.surv[:v])
+        a = np.asarray(accepted, np.int64)
+        self.held_rows *= 1.0 - SURVIVAL_ALPHA
+        self.accepted_rows *= 1.0 - SURVIVAL_ALPHA
+        self.held_rows[:v] += len(a)
+        self.accepted_rows[:v] += (a[:, None] >= np.arange(1, v + 1)[None, :]).sum(axis=0)
+        self.surv = np.minimum.accumulate((self.accepted_rows + PRIOR_ROWS) / (self.held_rows + PRIOR_ROWS))
 
     def observe_cost(self, rows: int, v: int, d: int, busy_ns: int) -> None:
         """The device time of a step whose `rows` rows were all decode rows, run at (v, d)."""

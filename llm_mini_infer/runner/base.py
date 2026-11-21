@@ -30,8 +30,9 @@ Contract (architecture.md, "The step plan"; the plan's sections, effects and lif
   accepted` tokens (the accepted drafts, then the bonus token, which becomes pending) and advances `seq_len` by as
   much. Drafts are accepted while they equal the target's samples (the sampler's noise of their position), so the
   tokens are exactly the target's sampled sequence; acceptance also stops at the slot's commit limits (ADMIT). Every
-  SAMPLE row drafts k tokens for the next step, or the plan's `draft_n` (one of `draft_counts`), and returns them
-  (`StepResult.drafts`, −1 past them): the engine computes the next step's masks along them. While device-input rows of
+  SAMPLE row drafts k tokens for the next step, or the plan's `draft_n` (one of `draft_counts`; on a plan with explicit
+  rows only with `mixed_draft_counts`), and returns them (`StepResult.drafts`, −1 past them): the engine computes the
+  next step's masks along them. While device-input rows of
   a slot are in flight, the host knows its `seq_len` only as a range: each advances it by 1 to 1 + v (at most 1 + k).
 - **Results** are per SCHED row, in plan order (`StepResult`). `wait` must not block on anything but the device
   work of that step.
@@ -98,6 +99,8 @@ class Capabilities(msgspec.Struct, frozen=True, kw_only=True):
     mtp_depth: int = 0  # k; 0 = no MTP
     # MTP: the counts below k a plan may verify and draft (`sched.plan`: `sched_n_draft`, `draft_n`); empty: k alone
     draft_counts: tuple[int, ...] = ()
+    # ... and a plan with explicit rows may draft one of them too (False: it drafts k, its graphs the token buckets')
+    mixed_draft_counts: bool = False
     # The MTP drafter writes KV of its own at the target's positions (Qwen's MTP layer; `sched.plan`'s module docstring,
     # "MTP drafting"). False: it reads the target's KV and writes none (Gemma 4's assistant, cross-model KV sharing)
     draft_kv: bool = True

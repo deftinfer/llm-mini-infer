@@ -308,7 +308,8 @@ class FakeRunner(FakeChecks, Runner):
                  report_unsampled: bool = False, mask_empty_at: Mapping[int, Iterable[int]] | None = None,
                  nonfinite_once: Iterable[int] = (), batch_invariant: bool = False,
                  exact_cuts: Mapping[int, Iterable[int]] | None = None, full_checks: bool = False,
-                 logprobs: bool = True, penalties: bool = True, draft_counts: Iterable[int] | None = None):
+                 logprobs: bool = True, penalties: bool = True, draft_counts: Iterable[int] | None = None,
+                 mixed_draft_counts: bool = True):
         self.vocab = vocab_size
         self.logprobs = logprobs  # takes LOGPROBS rows (module docstring)
         self.penalties = penalties  # takes penalised and biased admissions, and ignores their terms (module docstring)
@@ -323,6 +324,8 @@ class FakeRunner(FakeChecks, Runner):
         # MTP: the counts below k a plan may verify and draft (`Capabilities.draft_counts`; default every one)
         self.draft_counts = tuple(sorted({int(c) for c in (range(1, mtp_k) if draft_counts is None else draft_counts)
                                           if 1 <= int(c) < mtp_k}))
+        # ... and on plans with explicit rows too (`Capabilities.mixed_draft_counts`; False: those draft k)
+        self.mixed_draft_counts = bool(mixed_draft_counts and self.draft_counts)
         self.accept_p = accept_p
         self.grid = checkpoint_grid  # tests use a small grid to checkpoint short prompts
         self.has_state = state_slot_bytes > 0  # attention-only models resume from KV alone
@@ -337,7 +340,8 @@ class FakeRunner(FakeChecks, Runner):
                                   bidirectional_images=bidirectional_images, draft_kv=draft_kv,
                                   precise_rows=precise_rows, forward_end=sample_ms > 0,
                                   sample_step_ms=float(sample_ms), batch_invariant=batch_invariant,
-                                  logprobs=logprobs, penalties=penalties, draft_counts=self.draft_counts)
+                                  logprobs=logprobs, penalties=penalties, draft_counts=self.draft_counts,
+                                  mixed_draft_counts=self.mixed_draft_counts)
         # Batch invariance on a GDN model (module docstring, Validation): every prefill cut a whole number of grids from
         # where the prompt's computation started, but at a SAMPLE row, a PRECISE row or one of `exact_cuts` (a
         # request's hints and image cuts, by seed; checked only when given)
@@ -363,7 +367,7 @@ class FakeRunner(FakeChecks, Runner):
         self.steps = 0
         self.configured = False
         self.counts = {"kv_copy": 0, "state_copy": 0, "ckpt": 0, "resumed": 0, "folds": 0, "drafts": 0, "encoded": 0,
-                       "accepted": 0, "masked": 0, "masks": 0, "kind_switch": 0}
+                       "accepted": 0, "masked": 0, "masks": 0, "kind_switch": 0, "mixed_counts": 0}
 
     def capabilities(self) -> Capabilities:
         return self._caps
@@ -761,6 +765,7 @@ class FakeRunner(FakeChecks, Runner):
         # Masks: one per sample a MASKED row draws (1 + v for an MTP decode row), in plan order (runner.base).
         h.v = int(plan.sched_n_draft[dev][0]) if self.k and dev.any() else self.k  # drafts verified (sched.plan)
         h.d = plan.draft_n or self.k  # drafts made
+        self.counts["mixed_counts"] += bool(plan.draft_n and not dev.all())  # with explicit rows (mixed_draft_counts)
         h.masked = (plan.sched_flags & MASKED) != 0
         h.lpf = (plan.sched_flags & LOGPROBS) != 0
         if h.masked.any():

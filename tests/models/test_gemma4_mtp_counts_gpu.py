@@ -72,6 +72,26 @@ def test_a_tight_budget_runs_a_lower_counts_extra_rows_in_graphs(pair, fixed, sc
     counters(graphs.sched, K)
 
 
+def test_split_token_bucket_graphs_draft_the_count_on_plans_with_prefill_rows(pair, fixed) -> None:
+    """With every step split (`always_split`, grammar masks on), the token buckets' sampling graphs are captured at each
+    count: a plan with prefill rows drafts the count (`Capabilities.mixed_draft_counts`) and replays them, and its
+    drafts are the count's, −1 past it; without the split (the fused graphs) the runner does not offer it. The tokens
+    are the eager ones and a fixed k's, up to a near tie."""
+    out, ref, n = fixed
+    kw = dict(draft_counts=COUNTS, count_schedule=(1, 2), grammar=True, always_split=True)
+    graphs = run_prompts(gpu_run(pair, K, **kw).check_drafts())
+    fused = gpu_run(pair, K, draft_counts=COUNTS)
+    assert graphs.r.capabilities().mixed_draft_counts and not fused.r.capabilities().mixed_draft_counts
+    fused.r.shutdown()
+    mixed = [m for m, n_dev, rows, dn in graphs.steps if n_dev < rows and dn < K]
+    assert mixed and set(mixed) == {"break"}, graphs.steps
+    assert any(d < K for d in graphs.mixed_drafts), graphs.mixed_drafts
+    eager = run_prompts(gpu_run(pair, K, graphs=False, **kw))
+    assert agree(graphs.out, eager.out, reference(pair[0], eager.out)) > 0.8 * n
+    assert agree(graphs.out, out, ref) > 0.8 * n
+    counters(graphs.sched, K)
+
+
 def test_the_policy_in_graphs_gives_a_fixed_ks_tokens(pair) -> None:
     r = run_prompts(gpu_run(pair, K, draft_counts=COUNTS, adaptive=True), n=60)
     want = run_prompts(gpu_run(pair, K, draft_counts=COUNTS), n=60)

@@ -677,7 +677,8 @@ class Scheduler:
                  precise_cost: float = 1.0, refine_chunk_tokens: int = 0, mtp_k_max: int = 0,
                  forced_prefix: bool = False, eos_free_finish: bool = False, batch_invariant: bool = False,
                  logprobs: bool = False, penalties_vocab: int = 0, compile_timeout_s: float = COMPILE_TIMEOUT_S,
-                 draft_counts: tuple[int, ...] = (), count_schedule: tuple[int, ...] = ()):
+                 draft_counts: tuple[int, ...] = (), count_schedule: tuple[int, ...] = (),
+                 mixed_draft_counts: bool = False):
         self.max_num_seqs = max_num_seqs
         self.max_tokens = max_num_batched_tokens
         self.max_model_len = max_model_len
@@ -695,6 +696,9 @@ class Scheduler:
         if any(not 1 <= c <= mtp_k for c in self.count_schedule):
             raise ValueError(f"count_schedule {list(count_schedule)}: counts between 1 and k ({mtp_k})")
         self._counts = self.count_policy.counts if self.count_policy is not None else self.count_schedule or (mtp_k,)
+        # a plan with explicit rows drafts its count too (`Capabilities.mixed_draft_counts`), else k: under continuous
+        # admission about half the steps carry prefill rows, and drafting k on them wastes the passes past the count
+        self.mixed_draft_counts = mixed_draft_counts
         self._schedule_i = 0
         self.count_raises = 0  # plans whose count exceeded what their rows held: they verified that and drafted k
         # The MTP drafter writes KV of its own (Qwen's MTP layer: `Capabilities.draft_kv`): a hit on a page boundary
@@ -1298,7 +1302,7 @@ class Scheduler:
         self.pending_wclear.clear()
         if self._plan_precise:
             self.precise_steps += 1
-        if b.n_sched > b.n_device:
+        if b.n_sched > b.n_device and not self.mixed_draft_counts:
             d = self.k  # explicit rows: a step on the runners' token-bucket graphs, which draft k (`sched.plan`)
         if self.k:
             b.draft_n = d if d < self.k else 0

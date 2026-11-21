@@ -14,6 +14,7 @@ from llm_mini_infer.sched.draft_counts import (
     EXPLORE_EVERY,
     HYSTERESIS,
     MIN_STEPS,
+    PRIOR_ROWS,
     REFRESH_EVERY,
     DraftCounts,
     row_bucket,
@@ -169,15 +170,60 @@ def test_the_counts_compare_the_rows_each_fits_in_a_tight_budget() -> None:
     assert chosen[-100:].count(2) > 90  # 8 rows at 2: the most tokens per device-ms of the four (`cost_ms`)
 
 
-def test_survival_moves_only_where_a_step_verified() -> None:
+def test_survival_gains_evidence_only_where_a_step_verified() -> None:
+    """A step of v drafts adds its rows to the first v positions alone; a position past them keeps no evidence and is
+    capped by the last one verified (a survival never rises with depth)."""
     p = DraftCounts((1, 2), K)
-    before = p.surv.copy()
     p.observe_accept(2, np.array([0, 0, 1, 2]))
-    assert (p.surv[2:] == before[2:]).all()  # positions 3 to 5: not verified
-    assert p.surv[0] < 1.0 and p.surv[1] < 1.0 and p.surv[1] < p.surv[0]
+    assert (p.held_rows[:2] == 4).all() and (p.held_rows[2:] == 0).all()
+    assert p.surv[0] == (2 + PRIOR_ROWS) / (4 + PRIOR_ROWS) and p.surv[1] == (1 + PRIOR_ROWS) / (4 + PRIOR_ROWS)
+    assert (p.surv[2:] == p.surv[1]).all()  # positions 3 to 5: their prior, capped
+    before = p.surv.copy()
     p.observe_accept(0, np.array([]))  # nothing verified: nothing moves
+    assert (p.surv == before).all()
     p.observe_cost(4, 2, 2, 0)  # no device time: nothing recorded
     assert not p.cost
+
+
+def test_a_positions_evidence_ages_while_the_count_runs_below_it() -> None:
+    """Evidence decays at every verify step: a position measured low at k and then no longer verified drifts back
+    towards the optimistic prior, while the positions still verified keep their measured share."""
+    p = DraftCounts((1, 2, 3), K)
+    for _ in range(100):  # k: 64 rows, half accept one draft, none two
+        p.observe_accept(K, np.r_[np.zeros(32, np.int64), np.ones(32, np.int64)])
+    low = p.surv.copy()
+    assert abs(low[0] - 0.5) < 0.02 and (low[1:] < 0.02).all()
+    for _ in range(400):  # count 1 from here on: positions 2 to 5 are not verified
+        p.observe_accept(1, np.r_[np.zeros(32, np.int64), np.ones(32, np.int64)])
+    assert abs(p.surv[0] - 0.5) < 0.02 and (p.surv[1:] > 0.4).all()  # back to the prior, capped by s_1
+
+
+def test_a_run_of_rejections_at_one_row_does_not_leave_the_count_low() -> None:
+    """One decode row, acceptance in runs: 60 steps that accept the first draft on 4 of 10 steps and nothing after it,
+    then 40 that accept every draft. k gives the most tokens per device-ms, and the policy runs it. Before, a run of
+    rejections at k drove the estimate past the first draft low, count 1 won, and positions 2 to 5 were then verified
+    only at the probes: their estimate stayed low (here 64% of k's tokens per ms; chat at one request in flight ran
+    count 1 on 78% of its steps, 6% under k = 5)."""
+
+    def run(fixed: int = 0) -> tuple[float, list[int]]:
+        p = DraftCounts((1, 2, 3), K)
+        held, toks, ms, chosen = K, 0.0, 0.0, []
+        for i in range(6000):
+            c = fixed or p.choose(1)
+            v, d = (c, c) if c <= held else (held, K)
+            if c > held and not fixed:
+                p.raised()
+            a = (min(v, 1) if (i * 7) % 10 < 4 else 0) if i % 100 < 60 else v
+            t = 25.0 + 0.3 * v + 0.9 * d
+            p.observe_accept(v, np.array([a]))
+            p.observe_cost(1, v, d, int(t * 1e6))
+            held = d
+            toks, ms = toks + 1 + a, ms + t
+            chosen.append(c)
+        return toks / ms, chosen
+
+    rate, chosen = run()
+    assert rate > 0.98 * run(K)[0] and chosen[2000:].count(K) > 0.9 * 4000, (rate, run(K)[0])
 
 
 def test_the_choice_is_a_function_of_its_inputs() -> None:

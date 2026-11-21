@@ -107,6 +107,8 @@ def run_window_mtp_workload(w: dict, bidirectional: bool = False) -> Harness:
         event("MTP: steps below k")
     if s.count_raises:
         event("MTP: a raise (k drafted for a higher count)")
+    if h.runner.counts["mixed_counts"]:
+        event("MTP: a plan with explicit rows drafting a count below k")
     if s.prefix_hits:
         event("prefix hit")
     for src in ("decode", "finish", "branch"):

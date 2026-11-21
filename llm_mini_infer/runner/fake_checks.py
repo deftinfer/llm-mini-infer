@@ -259,7 +259,8 @@ class FakeChecks:
 
     def _check_counts(self, plan: StepPlan, slots: np.ndarray, dev: np.ndarray) -> tuple[int, int]:
         """(v, d): the drafts the plan's device rows verify (one count) and those its SAMPLE rows make (`sched.plan`),
-        each k or one of `draft_counts`; v never more than a row's slot holds (its last SAMPLE row's d)."""
+        each k or one of `draft_counts` (on a plan with explicit rows, d below k only with `mixed_draft_counts`); v
+        never more than a row's slot holds (its last SAMPLE row's d)."""
         k, counts = self.k, (self.k, *self.draft_counts)
         d = plan.draft_n or k
         if not k:
@@ -268,7 +269,7 @@ class FakeChecks:
             return 0, 0
         if d not in counts:
             self._fail(plan, f"draft_n {d}: not a count this runner takes ({sorted(counts)})")
-        if plan.draft_n and (plan.sched_tok_off >= 0).any():
+        if plan.draft_n and not self.mixed_draft_counts and (plan.sched_tok_off >= 0).any():
             self._fail(plan, f"draft_n {d} on a plan with explicit rows (they draft k)")
         if not dev.any():
             return k, d

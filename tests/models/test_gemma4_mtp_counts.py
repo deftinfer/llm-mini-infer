@@ -158,6 +158,26 @@ def test_the_policy_gives_fixed_ks_outputs(pair) -> None:
     counters(r.sched, K)
 
 
+def test_plans_with_prefill_rows_draft_the_count(pair) -> None:
+    """Prompts longer together than the budget: a request's last chunk shares a plan with the others' decode rows. That
+    plan drafts its count for every SAMPLE row, the new request's too (the runner takes a count on plans with explicit
+    rows: `Capabilities.mixed_draft_counts`), or k when the scheduler is told the runner cannot; the outputs are MTP
+    off's either way."""
+    reqs = greedy(max_tokens=24)
+    ref = run(pair, 0, reqs).out
+    for mixed in (True, False):
+        r = Run(pair, K, draft_counts=COUNTS, count_schedule=(1, 2)).check_drafts()
+        assert r.r.capabilities().mixed_draft_counts
+        r.sched.mixed_draft_counts = mixed
+        for q in reqs:
+            r.add(**q)
+        r.run()
+        assert r.out == ref, mixed
+        exercised(r, (1, 2))
+        below = sum(n for d, n in r.mixed_drafts.items() if d < K)
+        assert (below > 0) == mixed and r.mixed_drafts, (mixed, r.mixed_drafts)
+
+
 def test_a_tight_budget_lowers_the_count_for_more_rows(pair) -> None:
     """A budget of 20 tokens holds 3 decode rows at k (3 × 6) and all 4 below it: the count is decided on every row
     before the cut, at the width it runs, so steps below k carry all 4 rows and none exceeds the budget; the outputs

@@ -648,7 +648,7 @@ def engine_main(cfg: Config, ready: Connection, ipc_path: str, heartbeat: Any = 
                           penalties_vocab=caps.vocab_size if caps.penalties else 0,
                           compile_timeout_s=cfg.dev.structured_output.compile_timeout_s,
                           draft_counts=tuple(dsp.adaptive_counts or ()) if dsp.adaptive else (),
-                          count_schedule=tuple(dsp.count_schedule or ()))
+                          count_schedule=tuple(dsp.count_schedule or ()), mixed_draft_counts=caps.mixed_draft_counts)
         if grammars is not None:  # the scheduler refuses the EOS-free finish where it cannot keep its outputs
             so = cfg.dev.structured_output
             log.info("structured output: the forced prefix %s, the EOS-free finish %s (dev.structured_output."

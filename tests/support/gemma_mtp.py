@@ -45,7 +45,8 @@ class Run:
                                decode_checkpoint_interval=interval, window=window, window_page_size=wps,
                                draft_kv=caps.draft_kv, grammars=grammars, forced_prefix=forced_prefix,
                                batch_invariant=caps.batch_invariant, count_schedule=count_schedule,
-                               draft_counts=caps.draft_counts if adaptive else (), **mm)
+                               draft_counts=caps.draft_counts if adaptive else (),
+                               mixed_draft_counts=caps.mixed_draft_counts, **mm)
         self.core = EngineCore(self.sched, self.r)
         self.out: dict[int, list[int]] = {}
         self.finish: dict[int, int] = {}
@@ -65,9 +66,11 @@ class Run:
 
     def check_drafts(self) -> Run:
         """Check every step's drafts against its plan's count (`StepPlan.draft_n`): each SAMPLE row's d drafts (k on a
-        plan with explicit rows, and on a raise), −1 past them; `drafts_checked` counts the rows checked at each d."""
+        raise, and on a plan with explicit rows unless `Capabilities.mixed_draft_counts`), −1 past them;
+        `drafts_checked` counts the rows checked at each d, `mixed_drafts` the plans with explicit rows at each d."""
         process, k = self.sched.process, self.k
         self.drafts_checked: dict[int, int] = {}
+        self.mixed_drafts: dict[int, int] = {}
 
         def checked(inf, tokens, n_out, gpu_busy_ns, status=None, drafts=None, *a, **kw):
             if k and drafts is not None:
@@ -77,6 +80,8 @@ class Run:
                 dr, d = np.asarray(drafts)[rows], self.sched._d(inf)
                 assert (dr[:, :d] >= 0).all() and (dr[:, d:] == -1).all(), (inf.step_id, d, dr.tolist())
                 self.drafts_checked[d] = self.drafts_checked.get(d, 0) + int(rows.sum())
+                if not inf.device.all():
+                    self.mixed_drafts[d] = self.mixed_drafts.get(d, 0) + 1
             return process(inf, tokens, n_out, gpu_busy_ns, status, drafts, *a, **kw)
 
         self.sched.process = checked
