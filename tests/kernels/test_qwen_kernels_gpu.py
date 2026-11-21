@@ -37,12 +37,13 @@ pytestmark = pytest.mark.gpu(reason="needs a CUDA GPU and the kernel library")
 H, HKV, D, PS = 24, 4, 256, 16  # Qwen3.8 27B's full layers: a GQA group of 6
 
 
-def _full(max_rows: int = 24, qo: int = 4, split_keys: int = 256, max_kv: int = 4096, pool=None, **split):
+def _full(max_rows: int = 24, qo: int = 4, split_keys: int = 256, max_kv: int = 4096, pool=None,
+          max_tokens: int = 4096, **split):
     from llm_mini_infer.kernels.attn_window import FullAttention
 
-    return FullAttention(SimpleNamespace(kv=pool[None], page_size=PS), H, HKV, D, torch.device(DEV), max_tokens=4096,
-                         max_rows=max_rows, max_kv=max_kv, scale=D ** -0.5, qo_per_row=qo, split_keys=split_keys,
-                         **split)
+    return FullAttention(SimpleNamespace(kv=pool[None], page_size=PS), H, HKV, D, torch.device(DEV),
+                         max_tokens=max_tokens, max_rows=max_rows, max_kv=max_kv, scale=D ** -0.5, qo_per_row=qo,
+                         split_keys=split_keys, **split)
 
 
 @pytest.mark.parametrize("split_keys", [96, 128, 256])  # 32 splits hold the longest row, 3,001 keys
@@ -267,6 +268,90 @@ def test_full_attention_prefill_below_the_threshold_is_unsplit() -> None:
         assert torch.equal(got, big), p0
         ref = _window_ref(pool, table, 1, _scaled(q[:low + 40]), p0, 1 << 30, PS)
         assert (got[:low + 40].float() - ref).abs().max().item() < 2e-2, p0
+
+
+def test_full_attention_at_the_default_split_sizes() -> None:
+    """At the module's sizes (decode `SPLIT_KEYS` 256; a prefill query whole up to `PREFILL_FROM` 8,192 keys, then in
+    splits of `FULL_PREFILL_KEYS` 2,048), where the other tests scale them down: a verify row's queries across the
+    decode size boundaries at 8,192 and 16,384 keys give each position's bits alone, with its window shifted, beside
+    other rows, planned for an upper bound and in a decode bucket's tables; a prefill row from below 8,192 keys to past
+    16,384 (whole, then 5 to 9 splits of 2,048) gives each query's bits as one row and as other chunks, alone and beside
+    decode rows, and the unsplit kernel's bits up to 8,192 keys but not past them; each within BF16 rounding of the
+    fp32 reference at sampled positions."""
+    from llm_mini_infer.kernels.attn512 import PREFILL_FROM, query_splits, split_size
+    from llm_mini_infer.kernels.attn_window import FULL_PREFILL_KEYS, SPLIT_KEYS
+
+    qo = 4
+    lens = [16_600, 9_000, 17_000, 3_000]  # slot 1 the subject's
+    pool, table = _window_setup(lens, HKV, D, PS, seed=41)
+    torch.manual_seed(42)
+    qsub = (torch.randn(lens[0], H, D, device=DEV) * 0.5).to(BF)
+    kw = dict(max_rows=8, qo=qo, split_keys=SPLIT_KEYS, max_kv=max(lens) + qo, pool=pool, max_tokens=8_704,
+              prefill_keys=FULL_PREFILL_KEYS)
+    a = _full(prefill_from=PREFILL_FROM, **kw)
+
+    def go(attn, spec, decode: int | None = None, bucket: int = 0, gap: int = 0) -> dict[int, torch.Tensor]:
+        rows, qs, true, at, where = [], [], [], 0, {}
+        for slot, p0, n, extra in spec:
+            rows.append((slot, at, n, p0 + n + extra))
+            true.append(p0 + n)
+            qs.append(qsub[p0:p0 + n] if slot == 1 else (torch.randn(n, H, D, device=DEV) * 0.5).to(BF))
+            if slot == 1:
+                where.update({p0 + i: at + i for i in range(n)})
+            at += n
+        real = len(rows) if decode is None else decode
+        lb = np.maximum(np.asarray(true) - gap, [r[2] for r in rows])
+        for _ in range(bucket - len(rows)):  # padding rows: slot 0's null page, 1 + k keys
+            rows.append((0, at, qo, qo))
+            true.append(qo)
+            qs.append(torch.zeros(qo, H, D, dtype=BF, device=DEV))
+            at += qo
+        out, _ = _step(attn, table, rows, torch.cat(qs), decode=real, bucket=bucket, true=true,
+                       lb=lb if gap else None)
+        return {p: out[i] for p, i in where.items()}
+
+    def ref_close(got: torch.Tensor, p: int) -> None:
+        want = _window_ref(pool, table, 1, _scaled(qsub[p:p + 1]), p, 1 << 30, PS)[0]
+        assert (got.float() - want).abs().max().item() < 2e-2, p
+
+    others = [(s, lens[s - 1] - qo, qo, 0) for s in range(2, 5)]
+    seen: set[int] = set()
+    for p in (8_190, 8_193, 16_382, 16_386):  # a window over each decode boundary
+        def at(j: int, extra: int = 0, p: int = p) -> tuple[int, int, int, int]:
+            return (1, p - j, qo, extra)
+
+        base = go(a, [at(0)])
+        for got in (go(a, [at(3)]), go(a, [at(2, 5)], gap=3), go(a, [*others, at(1)]),
+                    go(a, [at(1, 4), *others[:2]], bucket=8, gap=2), go(a, [at(2), (2, 600, 40, 0)], decode=1)):
+            assert torch.equal(base[p], got[p]), p
+        seen |= set(base)
+        ref_close(base[p], p)
+    assert {int(split_size(q, SPLIT_KEYS)) for q in seen} == {256, 512, 1024}  # both decode boundaries crossed
+
+    p0, end = 8_000, lens[0]
+    dec = [(2, lens[1] - qo, qo, 0), (3, lens[2] - qo, qo, 2)]  # the second planned above its true length
+
+    def prompt(attn, chunks: list[int], beside: bool) -> torch.Tensor:
+        outs, at_ = {}, p0
+        for n in chunks:
+            spec = [*dec, (1, at_, n, 0)] if beside else [(1, at_, n, 0)]
+            outs.update(go(attn, spec, decode=len(dec) if beside else 0, gap=2 if beside else 0))
+            at_ += n
+        assert sorted(outs) == list(range(p0, end))
+        return torch.stack([outs[p] for p in range(p0, end)])
+
+    splits = {int(query_splits(p, FULL_PREFILL_KEYS, PREFILL_FROM)) for p in range(p0, end)}
+    assert p0 + 1 <= PREFILL_FROM < end and splits == {1, 5, 6, 7, 8, 9}  # whole, then 5 to 9 splits
+    base = prompt(a, [end - p0], beside=False)
+    for chunks in ([end - p0], [192, 4_000, 4_408], [100, 4_096, 4_096, 308], [1, 383, 4_096, 4_120]):
+        for beside in (False, True):
+            assert torch.equal(prompt(a, chunks, beside), base), (chunks, beside)
+    whole = prompt(_full(prefill_from=1 << 20, **kw), [end - p0], beside=False)
+    cut = PREFILL_FROM - p0  # the first position with more than 8,192 keys
+    assert torch.equal(base[:cut], whole[:cut])
+    assert not torch.equal(base[cut:], whole[cut:])
+    for p in (p0, PREFILL_FROM - 1, PREFILL_FROM, 10_239, 10_240, end - 1):
+        ref_close(base[p - p0], p)
 
 
 @pytest.mark.parametrize(("n", "k"), [(96, 5120), (8, 128)])  # Qwen3.8 27B's in_proj_ba, a tiny model's

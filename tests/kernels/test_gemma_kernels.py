@@ -621,16 +621,16 @@ def _split_case(lens: list[int], seed: int):
         o += n
     q = (torch.randn(lens[0], h, d, device=DEV) * 0.06).to(BF)
     kw = (torch.randn(d, device=DEV) * 0.3 + 1).to(BF)
-    cos, sin = _rope_tables(d, 64, 8192)
+    cos, sin = _rope_tables(d, 64, max(8192, max(lens)))
     return SimpleNamespace(fkv=fkv, table=table, q=q, kw=kw, cos=cos, sin=sin, h=h, hkv=hkv, ps=ps, d=d)
 
 
 def _split_attn(case, *, max_rows: int, max_kv: int, qo: int = 6, split_keys: int = 16, prefill_from: int = 64,
-                prefill_keys: int = 32):
+                prefill_keys: int = 32, max_tokens: int = 4096):
     from llm_mini_infer.kernels.attn512 import Attn512
 
     return Attn512(_Pools(case.fkv[None], case.ps), _Rot(case.cos, case.sin), case.h, case.hkv, 64,
-                   torch.device(DEV), max_tokens=4096, max_rows=max_rows, qo_per_row=qo, split_keys=split_keys,
+                   torch.device(DEV), max_tokens=max_tokens, max_rows=max_rows, qo_per_row=qo, split_keys=split_keys,
                    max_kv=max_kv, prefill_from=prefill_from, prefill_keys=prefill_keys)
 
 
@@ -802,6 +802,75 @@ def test_attn512_prefill_below_the_threshold_is_unsplit() -> None:
                      case.sin, ps)
     for p in range(p0, end):
         assert (got[p].float() - want[p - p0].float()).abs().max().item() < 2e-2, p
+
+
+def test_attn512_at_the_default_split_sizes() -> None:
+    """The fixed split at the module's sizes (`SPLIT_KEYS` 256, `PREFILL_FROM` 8,192, `PREFILL_KEYS` 16,384), where
+    the other tests scale them down: a verify row's queries across the decode size boundaries at 8,192 and 16,384 keys
+    (256 keys a split to 512, 512 to 1,024) give each position's bits alone, with its window shifted, beside other
+    verify rows, planned for an upper bound and in a decode bucket's tables in a CUDA graph; a prefill row from below
+    8,192 keys to past 16,384 gives each query's bits as one row and as other chunks, alone and beside decode rows, and
+    the unsplit kernel's bits up to 16,384 keys (one split of 16,384 holds them: the threshold changes no bit below it)
+    but not past it (two splits); each within BF16 rounding of the fp32 reference at sampled positions."""
+    from llm_mini_infer.kernels.attn512 import PREFILL_FROM, PREFILL_KEYS, SPLIT_KEYS, query_splits, split_size
+
+    ps, qo = 16, 6
+    lens = [16_600, 9_000, 17_000, 3_000, 12_000]  # slot 1 the subject's
+    case = _split_case(lens, seed=61)
+    kw = dict(max_rows=16, max_kv=max(lens) + qo, max_tokens=8_704, split_keys=SPLIT_KEYS, prefill_keys=PREFILL_KEYS)
+    a = _split_attn(case, prefill_from=PREFILL_FROM, **kw)
+
+    def ref_close(got: torch.Tensor, p: int) -> None:
+        want = _full_ref([(1, p + 1)], case.fkv, case.table[[0, 1]], case.q[p:p + 1].contiguous(), case.kw,
+                         case.cos, case.sin, ps)[0]
+        assert (got.float() - want.float()).abs().max().item() < 2e-2, p
+
+    others = [(s, lens[s - 1] - qo, qo, 0) for s in range(2, 6)]  # companions' verify rows
+    seen: set[int] = set()
+    for end in (8_195, 16_387):  # windows of keys 8,190..8,195 and 16,382..16,387
+        def at(shift: int, extra: int = 0, end: int = end) -> tuple[int, int, int, int]:
+            return (1, end + shift - qo, qo, extra)
+
+        base, _ = _split_run(case, a, [at(0)])
+        configs = [([at(1)], {}), ([at(-2, 6)], {"gap": 3}), ([*others, at(-1)], {}),
+                   ([at(2, 4), *others[:2]], {"bucket": 8, "gap": 2, "graph": True}),
+                   ([at(0), (4, 1_000, 64, 0)], {"fixed": 1})]
+        for rows, kw_run in configs:
+            got, _ = _split_run(case, a, rows, **kw_run)
+            shared = [p for p in got if p in base]
+            assert shared, (end, rows)
+            for p in shared:
+                assert torch.equal(base[p], got[p]), (end, p, rows, kw_run)
+        seen |= set(base)
+        for p in (min(base), max(base)):
+            ref_close(base[p], p)
+    assert {int(split_size(p, SPLIT_KEYS)) for p in seen} == {256, 512, 1024}  # both decode boundaries crossed
+
+    p0, end = 8_000, lens[0]
+    dec = [(2, lens[1] - qo, qo, 0), (3, lens[2] - qo, qo, 2)]  # the second planned above its true length
+
+    def prompt(attn, chunks: list[int], beside: bool) -> torch.Tensor:
+        outs, at_ = {}, p0
+        for n in chunks:
+            rows = [*dec, (1, at_, n, 0)] if beside else [(1, at_, n, 0)]
+            got, _ = _split_run(case, attn, rows, fixed=len(dec) if beside else 0, gap=2 if beside else 0)
+            outs.update(got)
+            at_ += n
+        assert sorted(outs) == list(range(p0, end))
+        return torch.stack([outs[p] for p in range(p0, end)])
+
+    splits = {int(query_splits(p, PREFILL_KEYS, PREFILL_FROM)) for p in range(p0, end)}
+    assert p0 + 1 <= PREFILL_FROM < PREFILL_KEYS < end and splits == {1, 2}  # whole (and one split), then two
+    base = prompt(a, [end - p0], beside=False)
+    for chunks in ([end - p0], [192, 4_000, 4_408], [100, 4_096, 4_096, 308], [1, 383, 4_096, 4_120]):
+        for beside in (False, True):
+            assert torch.equal(prompt(a, chunks, beside), base), (chunks, beside)
+    whole = prompt(_split_attn(case, prefill_from=1 << 20, **kw), [end - p0], beside=False)
+    cut = PREFILL_KEYS - p0  # the first position with more than 16,384 keys
+    assert torch.equal(base[:cut], whole[:cut])
+    assert not torch.equal(base[cut:], whole[cut:])
+    for p in (p0, PREFILL_FROM - 1, PREFILL_FROM, PREFILL_KEYS - 1, PREFILL_KEYS, end - 1):
+        ref_close(base[p - p0], p)
 
 
 # -- the sliding window on our kernel (answer reproducibility: kernels/attn_window.py) --------------------------------
