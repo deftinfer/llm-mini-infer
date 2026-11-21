@@ -149,7 +149,7 @@ A deployment sets the rest with `--set`, the chart's `config`, or a file mounted
 
 ### The dev settings
 
-`dev.<group>.<key>` holds the settings of tests and benchmarks, which a deployment does not set. These switches turn a feature off, as a fallback: `dev.runner.cuda.graphs` (eager steps), `fused_ops` (torch ops), `pdl`, `batch_invariant` ([batch invariance](architecture.md#batch-invariance)), `always_split`, `sparse_head`, `dev.speculative.draft_universe`, `dev.structured_output.forced_prefix`, `eos_free_finish`, `dev.cache.decode_checkpoint_interval` (0) and `dev.cache.demote_superseded` (false). `llm_mini_infer/config.py` comments each, and [architecture.md](architecture.md) describes most. `always_split` and `pdl` keep the outputs the same; the other switches can change the GPU's rounding.
+`dev.<group>.<key>` holds the settings of tests and benchmarks, which a deployment does not set. These switches turn a feature off, as a fallback: `dev.runner.cuda.graphs` (eager steps), `fused_ops` (torch ops), `pdl`, `batch_invariant` ([batch invariance](architecture.md#batch-invariance)), `always_split`, `sparse_head`, `dev.speculative.draft_universe`, `dev.structured_output.forced_prefix`, `eos_free_finish`, `dev.cache.decode_checkpoint_interval` (0) and `dev.cache.demote_superseded` (false). `llm_mini_infer/config.py` comments each, and [architecture.md](architecture.md) describes most. `always_split` and `pdl` keep the outputs the same; the other switches can change the GPU's rounding. `dev.speculative.adaptive` turns one on, off by default: a draft count per step chosen from the load ([speculative decoding](architecture.md#speculative-decoding)), with `adaptive_counts` the counts below k it may run.
 
 ### Environment variables
 

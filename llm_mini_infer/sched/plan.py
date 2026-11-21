@@ -51,7 +51,8 @@ SCHED rows:
   plus its `n_draft` drafts (drafted by the runner in the slot's previous SAMPLE step), which the host never supplies;
 - `sched_pos0`: position of the first query token, equal to the device `seq_len`; −1 for device input;
 - `sched_next_tok` (MTP): the token after an explicit row's chunk, −1 on final chunks and device rows;
-- `sched_n_draft`: MTP drafts to verify: k on every device-input row under MTP (a uniform `1 + k` query), else 0;
+- `sched_n_draft`: MTP drafts to verify: the plan's count v (1 ≤ v ≤ k) on every device-input row under MTP (a
+  uniform `1 + v` query: k unless the scheduler chose fewer, `Capabilities.draft_counts`), else 0;
 - `sched_flags`: `SAMPLE` (sample after the last query token: the final prefill chunk, and every decode row);
   `STATE_ZERO` (start from zero recurrent and conv state: the first chunk of an uncached prompt); `MASKED` (a SAMPLE
   row whose samples a grammar constrains: below); `PRECISE` (below); `LOGPROBS` (below).
@@ -66,15 +67,17 @@ A step moves the device `seq_len` by `n_query` for explicit tokens and by `1 + a
 sampled (bonus) token becomes pending. Results come back per SCHED row, in plan order (never by slot): a slot can be
 freed and readmitted in the very next plan while the old request's result is still in flight.
 
-**MTP drafting.** Every SAMPLE row also drafts k tokens for the slot's next step. A drafter that writes KV of its own
-(`Capabilities.draft_kv`, Qwen's MTP layer) keeps it in the pages like every attention layer's; its entry at position i
-depends on the token at i + 1. An explicit row computes it at its own positions, at its last one from `sched_next_tok`
-(a final chunk uses its sampled token). The first row after an ADMIT with `seq_len > 0` also recomputes the drafter's
-KV at `pos0 − 1`, from the hidden vector its live state slot received with the checkpoint: the page holding
-`pos0 − 1` must be the slot's own, so an admission that hits the cache on a page boundary copies that page (KV_COPY).
-The drafter's chain writes KV at the k − 1 positions after the row's last committed position: decode rows write up to
-`2k − 1` positions past their first, which the page reservation covers (`reserve_positions`), and a SAMPLE explicit row
-k − 1 past its last token, which the final chunk's pages cover. Gemma 4's assistant writes no KV.
+**MTP drafting.** Every SAMPLE row also drafts tokens for the slot's next step: k, or `draft_n` when the scheduler chose
+fewer (0: k); a slot's next device row verifies at most that many, and the runner returns −1 for the drafts past them.
+A drafter that writes KV of its own (`Capabilities.draft_kv`, Qwen's MTP layer) keeps it in the pages like every
+attention layer's; its entry at position i depends on the token at i + 1. An explicit row computes it at its own
+positions, at its last one from `sched_next_tok` (a final chunk uses its sampled token). The first row after an ADMIT
+with `seq_len > 0` also recomputes the drafter's KV at `pos0 − 1`, from the hidden vector its live state slot received
+with the checkpoint: the page holding `pos0 − 1` must be the slot's own, so an admission that hits the cache on a page
+boundary copies that page (KV_COPY). The drafter's chain writes KV at the d − 1 positions after the row's last
+committed position (d its drafts): decode rows write up to `2k − 1` positions past their first, which the page
+reservation covers (`reserve_positions`, at k whatever the counts), and a SAMPLE explicit row d − 1 past its last token,
+which the final chunk's pages cover (sized for k). Gemma 4's assistant writes no KV.
 
 **Grammar masks** (`grammar`; architecture.md, "Structured output"). A `MASKED` row samples only the tokens its masks
 allow. The engine writes them between `launch_forward` and `launch_sample` (`runner.base`), one per sample the row
@@ -164,23 +167,70 @@ def reserve_positions(steps_in_flight: int, k: int) -> int:
 
 class StepPlan:
     __slots__ = (
-        "admit_bias_ids", "admit_bias_n", "admit_bias_val", "admit_flags", "admit_freq", "admit_max_len", "admit_min_p",
-        "admit_pres", "admit_prompt_bits", "admit_prompt_len", "admit_rep", "admit_rope_off", "admit_seed",
-        "admit_seq_len", "admit_slot", "admit_state_slot", "admit_stop", "admit_temperature", "admit_top_k",
+        "admit_bias_ids",
+        "admit_bias_n",
+        "admit_bias_val",
+        "admit_flags",
+        "admit_freq",
+        "admit_max_len",
+        "admit_min_p",
+        "admit_pres",
+        "admit_prompt_bits",
+        "admit_prompt_len",
+        "admit_rep",
+        "admit_rope_off",
+        "admit_seed",
+        "admit_seq_len",
+        "admit_slot",
+        "admit_state_slot",
+        "admit_stop",
+        "admit_temperature",
+        "admit_top_k",
         "admit_top_p",
-        "ckpt_dst", "ckpt_offset", "ckpt_sched",
-        "enc_grid", "enc_hw", "enc_key", "enc_pixels", "enc_row0", "enc_rows", "enc_tokens",
-        "fold_n", "fold_slot",
+        "ckpt_dst",
+        "ckpt_offset",
+        "ckpt_sched",
+        "draft_n",
+        "enc_grid",
+        "enc_hw",
+        "enc_key",
+        "enc_pixels",
+        "enc_row0",
+        "enc_rows",
+        "enc_tokens",
+        "fold_n",
+        "fold_slot",
         "free_slot",
-        "kv_copy_dst", "kv_copy_src",
-        "max_query_len", "n_query_tokens",
-        "page_id", "page_index", "page_slot",
-        "sched_flags", "sched_n_draft", "sched_n_query", "sched_next_emb", "sched_next_tok", "sched_pos0",
-        "sched_rope_prev", "sched_slot", "sched_tok_off",
-        "span_end", "span_sched", "span_start",
-        "state_copy_dst", "state_copy_src",
-        "step_id", "tok_emb", "tok_rope", "tokens",
-        "wkv_copy_dst", "wkv_copy_src", "wpage_id", "wpage_index", "wpage_slot",
+        "kv_copy_dst",
+        "kv_copy_src",
+        "max_query_len",
+        "n_query_tokens",
+        "page_id",
+        "page_index",
+        "page_slot",
+        "sched_flags",
+        "sched_n_draft",
+        "sched_n_query",
+        "sched_next_emb",
+        "sched_next_tok",
+        "sched_pos0",
+        "sched_rope_prev",
+        "sched_slot",
+        "sched_tok_off",
+        "span_end",
+        "span_sched",
+        "span_start",
+        "state_copy_dst",
+        "state_copy_src",
+        "step_id",
+        "tok_emb",
+        "tok_rope",
+        "tokens",
+        "wkv_copy_dst",
+        "wkv_copy_src",
+        "wpage_id",
+        "wpage_index",
+        "wpage_slot",
     )
 
     step_id: int
@@ -227,6 +277,7 @@ class StepPlan:
     tokens: np.ndarray
     n_query_tokens: int
     max_query_len: int
+    draft_n: int  # MTP: the drafts every SAMPLE row of the plan makes when fewer than k (0: k; the module docstring)
     # images (empty without)
     enc_key: np.ndarray
     enc_tokens: np.ndarray
@@ -376,6 +427,8 @@ class PlanBuilder:
         self.n_fold = self.n_free = self.n_admit = self.n_pages = self.n_sched = self.n_tokens = self.n_device = 0
         self.n_kv_copy = self.n_state_copy = self.n_ckpt = self.n_wpages = self.n_wkv_copy = self.n_spans = 0
         self.max_query_len = 0
+        self.v = mtp_k  # the drafts the plan's device rows verify
+        self.draft_n = 0  # the drafts its SAMPLE rows make when fewer than k (0: k)
         self.emb_on = self.rope_on = False
         self.enc: list[tuple[int, int, tuple[int, int, int], tuple[int, int], int, np.ndarray]] = []
 
@@ -385,6 +438,7 @@ class PlanBuilder:
         self.n_fold = self.n_free = self.n_admit = self.n_pages = self.n_sched = self.n_tokens = self.n_device = 0
         self.n_kv_copy = self.n_state_copy = self.n_ckpt = self.n_wpages = self.n_wkv_copy = self.n_spans = 0
         self.max_query_len = 0
+        self.v, self.draft_n = self.k, 0
         self.emb_on = self.rope_on = False  # the plan has image tokens / M-RoPE rows
         self.enc = []
         self.max_bias, self.any_pen = 0, False  # the widths of the ADMIT terms' arrays (`finish`)
@@ -520,10 +574,15 @@ class PlanBuilder:
         self.enc.append((key, tokens, grid, hw, pixels, rows))
 
     def add_device_rows(self, slots: np.ndarray, masked: np.ndarray | None = None,
-                        logprobs: np.ndarray | None = None) -> None:
-        """Decode rows with device input (`tok_off` = `pos0` = −1, `SAMPLE`; 1 + k query tokens, k drafts),
-        vectorized. `masked` and `logprobs` (bool per row): the rows that also get `MASKED`, `LOGPROBS`."""
-        b, i, n, k = self.b, self.n_sched, len(slots), self.k
+                        logprobs: np.ndarray | None = None, n_draft: int | None = None) -> None:
+        """Decode rows with device input (`tok_off` = `pos0` = −1, `SAMPLE`; 1 + v query tokens, v drafts), vectorized.
+        `masked` and `logprobs` (bool per row): the rows that also get `MASKED`, `LOGPROBS`. `n_draft`: v, the plan's
+        drafts to verify (one count for all its device rows; default k)."""
+        b, i, n = self.b, self.n_sched, len(slots)
+        k = (self.v if self.n_device else self.k) if n_draft is None else n_draft
+        if not (1 if self.k else 0) <= k <= self.k or (self.n_device and k != self.v):
+            raise ValueError(f"device rows verify {k} drafts; the plan's are {self.v} (1 to {self.k})")
+        self.v = k
         b.sched_slot[i:i + n] = slots
         b.sched_n_query[i:i + n] = 1 + k
         b.sched_n_draft[i:i + n] = k
@@ -655,7 +714,8 @@ class PlanBuilder:
         p.sched_flags = b.sched_flags[:ns]
         p.tokens = b.tokens[:self.n_tokens]
         p.max_query_len = self.max_query_len
-        p.n_query_tokens = self.n_tokens + self.n_device * (1 + self.k)
+        p.n_query_tokens = self.n_tokens + self.n_device * (1 + self.v)
+        p.draft_n = self.draft_n
         p.admit_rope_off = b.admit_rope_off[:na]
         nt = self.n_tokens
         p.tok_emb = b.tok_emb[:nt] if self.emb_on else _EMPTY32

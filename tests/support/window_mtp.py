@@ -70,6 +70,14 @@ def arena_mtp_workloads(draw):
 
 
 @st.composite
+def arena_mtp_count_workloads(draw):
+    """`arena_mtp_workloads` (Gemma 4's: a drafter without KV, one arena near its bound) with a draft count per step."""
+    from .mtp_workloads import with_counts
+
+    return with_counts(draw, draw(arena_mtp_workloads()))
+
+
+@st.composite
 def gemma_images_mtp_workloads(draw):
     """`window_workloads.gemma_image_workloads` (bidirectional spans, encoder budgets, hints inside spans) with MTP."""
     return with_mtp(draw, draw(gemma_image_workloads()), stops=False)
@@ -95,6 +103,12 @@ def run_window_mtp_workload(w: dict, bidirectional: bool = False) -> Harness:
                 assert r.finish == FinishReason.ERROR, "the NaN request was not failed"
     if h.runner.counts["accepted"]:
         event("drafts accepted")
+    if s.steps_by_count[1:s.k].sum():
+        event("MTP: steps below k")
+    if s.count_raises:
+        event("MTP: a raise (k drafted for a higher count)")
+    if h.runner.counts["mixed_counts"]:
+        event("MTP: a plan with explicit rows drafting a count below k")
     if s.prefix_hits:
         event("prefix hit")
     for src in ("decode", "finish", "branch"):

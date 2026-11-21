@@ -680,6 +680,11 @@ class EngineClient:
             sm.num_accepted_tokens.set_total(s.spec_accepted)
             for i, n in enumerate(s.spec_accepted_per_pos):
                 sm.num_accepted_tokens_per_pos.set_total(n, str(i))
+            for i, n in enumerate(s.spec_verified_per_pos):
+                sm.num_verified_per_pos.set_total(n, str(i))
+            for c, n in enumerate(s.spec_steps_by_count):
+                if c:
+                    sm.steps_by_count.set_total(n, str(c))
         if s.step_rows_counts:
             m.step_decode_rows.set_cumulative(s.step_rows_counts, s.step_rows_sum)
             m.step_encoder_images.set_cumulative(s.step_images_counts, s.step_images_sum)

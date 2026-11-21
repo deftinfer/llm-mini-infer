@@ -234,6 +234,7 @@ class _Mirror:
         self.top_p = np.ones(slots, np.float32)
         self.top_k = np.zeros(slots, np.int64)
         self.min_p = np.zeros(slots, np.float32)
+        self.held = np.zeros(slots, np.int64)  # MTP: the drafts the slot's last SAMPLE row made (`StepPlan.draft_n`)
         self.lp = np.zeros(slots, bool)  # admitted with ADMIT_LOGPROBS
         self.terms = np.zeros(slots, np.int32)  # penalties and the logit bias (`runner.cuda.penalties`)
         self.prompt_len = np.zeros(slots, np.int64)
@@ -249,11 +250,11 @@ _EMPTY = np.zeros(0, np.int64)
 
 
 class _Layout:
-    __slots__ = ("T", "c_row", "constrained", "d", "dplan", "dplan_uni", "dst", "emb", "full_rows", "g_first", "lp",
-                 "max_q", "n", "n_dec", "n_dev", "n_masks", "n_mtp", "n_precise", "n_sample", "n_stok", "o_twb",
+    __slots__ = ("T", "c_row", "constrained", "d", "dn", "dplan", "dplan_uni", "dst", "emb", "full_rows", "g_first",
+                 "lp", "max_q", "n", "n_dec", "n_dev", "n_masks", "n_mtp", "n_precise", "n_sample", "n_stok", "o_twb",
                  "order", "r_kind", "r_kv", "r_kv_lb", "r_nq", "r_pos0", "r_s0", "r_slot", "s_idx", "s_mask",
                  "s_plan_rows", "s_slot", "spans", "splan", "splan_sp", "starts", "tok_in", "tok_plan_row", "tok_pos",
-                 "w", "wlo")
+                 "v", "w", "wlo")
 
 
 class _Handle:
@@ -286,7 +287,7 @@ class GemmaRunner(Runner):
                  attn512_split_keys: int = 0, attn512_prefill: tuple[int, int] | None = None,
                  head_fixed_m: bool = False, encode_per_image: bool = False, window_split_keys: int = 0,
                  batch_invariant: bool = False, sync_check: str | None = None, memory_history: str | None = None,
-                 logprobs: bool = False, penalties: bool = False):
+                 logprobs: bool = False, penalties: bool = False, draft_counts: tuple[int, ...] = ()):
         """`mtp_k` > 0 drafts that many tokens per step with the MTP `assistant` (its checkpoint directory;
         `draft_vocab`, `draft_fp8`: its head, `runner.cuda.draft_head`). `sparse_head`, `sparse_head_rows`,
         `draft_universe`: the grammar-aware heads (`runner.cuda.heads`; with `grammar` only, the universe with MTP).
@@ -303,7 +304,8 @@ class GemmaRunner(Runner):
         together). `sync_check`: off, warn or error around the step's launches (`runner.cuda.sync_check`; None: its
         default). `memory_history`: a file for the snapshot of an eager tower call after startup (`memory_report`).
         `logprobs`: takes LOGPROBS rows, its head's logits kept for them (`runner.cuda.logprobs`). `penalties`: takes
-        admissions with penalties and a logit bias (`runner.cuda.penalties`)."""
+        admissions with penalties and a logit bias (`runner.cuda.penalties`). `draft_counts`: the counts below k a plan
+        may verify and draft (`Capabilities.draft_counts`; decode graphs and attention backends for each)."""
         if always_split and not grammar:
             raise ValueError("always-split graphs need the grammar masks' split (structured output)")
         self.device = torch.device(device)
@@ -329,6 +331,9 @@ class GemmaRunner(Runner):
             raise ValueError(f"Gemma 4's MTP drafts at most {MAX_GEMMA_MTP_K} tokens (speculative."
                              f"num_speculative_tokens = {mtp_k})")
         self.k, self.L = mtp_k, 1 + mtp_k
+        if any(not 1 <= int(c) < mtp_k for c in draft_counts):
+            raise ValueError(f"draft counts {sorted(draft_counts)}: each from 1 to k - 1 ({mtp_k - 1})")
+        self.counts = tuple(sorted({int(c) for c in draft_counts}))  # below k; k is always one
         self.draft_next = draft_query_next and mtp_k > 0
         self.grammar = grammar
         self.always_split = always_split
@@ -368,6 +373,9 @@ class GemmaRunner(Runner):
             raise RuntimeError("Gemma 4's full attention on CUDA is our attn512 kernel: it needs "
                                "dev.runner.cuda.fused_ops (or dev.runner.cuda.attention torch)")
         self.use_graphs = graphs and kernels and self.attn_kind == "flashinfer"
+        # A plan with explicit rows drafts a count below k too (`Capabilities.mixed_draft_counts`): eagerly, or on the
+        # token buckets' sampling graphs, captured at each count when every step is split (the fused ones draft k)
+        self.mixed_counts = bool(self.counts) and (not self.use_graphs or (grammar and always_split))
         self._sync = sync_checks.make(sync_check, cuda=self.cuda, check=check, reference=(
             "the torch references (dev.runner.cuda.fused_ops off)" if not kernels else
             "torch attention" if self.attn_kind != "flashinfer" else "the torch FP8 GEMM" if fp8_gemm == "torch" else
@@ -376,6 +384,10 @@ class GemmaRunner(Runner):
                               fp8_gemm=fp8_gemm, fp8_cold_prefill=fp8_cold_prefill, stats=self.stats)
         rows = min(max_num_seqs, max_num_batched_tokens // self.L)  # a decode step's tokens are within the budget
         self.decode_buckets = sorted(b for b in (decode_buckets or default_decode_buckets(rows)) if 0 < b <= rows)
+        self._buckets_v: dict[int, list[int]] = {}  # each count's below k: as many rows as its width leaves
+        for v in self.counts:
+            r = min(max_num_seqs, max_num_batched_tokens // (1 + v))
+            self._buckets_v[v] = sorted(b for b in (decode_buckets or default_decode_buckets(r)) if 0 < b <= r)
         self.token_buckets = sorted(b for b in (token_buckets or default_token_buckets(max_num_batched_tokens))
                                     if 0 < b <= max_num_batched_tokens)
         t1 = time.perf_counter()
@@ -441,7 +453,9 @@ class GemmaRunner(Runner):
         self._ready = False
         self._allocated = False
         self._pool: Any = None
-        self._graphs: dict[tuple[str, int], BreakableCapture] = {}
+        # keyed (name, size, v, d): the drafts a decode graph's rows verify and those its SAMPLE rows make (the forward
+        # graphs of split steps at d = k: theirs do not depend on it); the break graphs at (k, k)
+        self._graphs: dict[tuple[str, int, int, int], BreakableCapture] = {}
 
     # -- geometry and memory ---------------------------------------------------------------------------------
 
@@ -475,16 +489,19 @@ class GemmaRunner(Runner):
                 precise_step_ms=self.stats.get("precise_step_ms", 0.0), forward_end=self.grammar and self.cuda,
                 sample_step_ms=self.stats.get("sample_step_ms", 0.0),
                 launch_step_ms=self.stats.get("launch_step_ms", 0.0), batch_invariant=self.inv,
-                logprobs=self.logprobs, penalties=self.penalties)
+                logprobs=self.logprobs, penalties=self.penalties, draft_counts=self.counts,
+                mixed_draft_counts=self.mixed_counts)
         return self._caps
 
     def attention_counters(self) -> AttentionCounters:
         """FlashInfer's plan counters (`Runner.attention_counters`) over the sliding layers' instances: the target's
-        (`attn_w`), the drafter's (`attn_dw`, MTP) and the image spans' (`attn_wb`); none before `configure` or with
-        the torch references. The full layers' attn512 never plans again (an empty split merges harmlessly). With them,
-        the vision tower's plan waits (`vision_waits`)."""
+        (`attn_w`, and each draft count's: `_attn_v`), the drafter's (`attn_dw`, MTP) and the image spans' (`attn_wb`);
+        none before `configure` or with the torch references. The full layers' attn512 never plans again (an empty split
+        merges harmlessly). With them, the vision tower's plan waits (`vision_waits`)."""
         names = ("attn_w", "attn_dw", "attn_wb")
-        return vision_waits(sum_attention_counters(getattr(self, n, None) for n in names), getattr(self, "img", None))
+        widths = [aw for aw, _ in getattr(self, "_attn_v", {}).values()]
+        return vision_waits(sum_attention_counters([*(getattr(self, n, None) for n in names), *widths]),
+                            getattr(self, "img", None))
 
     def _measure_memory(self) -> tuple[int, int]:
         """(total, free for the KV arena): as the Qwen runner's (`runner.cuda.runner`)."""
@@ -710,12 +727,15 @@ class GemmaRunner(Runner):
         self.lp = LogprobsPass(smax, cfg.vocab_size, self.gs.rows if self.gs.sparse else 0, dev) \
             if self.logprobs else None
         workspace = None  # FlashInfer's float workspace, shared by its instances and the tower's attention
+        self._attn_v: dict[int, tuple[Any, Any]] = {}  # the attention backends of each count below k (`_attn`)
         if self.attn_kind == "flashinfer":
             from ...kernels.attn512 import Attn512
             from ...kernels.attn_window import WindowAttention
             from ...kernels.flashinfer import WORKSPACE_BYTES, FlashInferWindowAttention
 
-            max_rows = max(self.decode_buckets) if self.use_graphs else 0
+            # the most rows a decode graph has, at any width (the drafter's one query a row at every count)
+            max_rows = max(self.decode_buckets + [b for bs in self._buckets_v.values() for b in bs]) \
+                if self.use_graphs else 0
             # a decode row's window pages at most: the window before its first query (planned from the lowest
             # possible one under MTP, which may lie k below the true one), its 1 + k queries, a page boundary
             wpages = -(-(self.window + self.ps + 2 * self.L) // self.ps) + 1
@@ -740,6 +760,24 @@ class GemmaRunner(Runner):
                                        max_rows=pc.max_num_seqs, qo_per_row=L, split_keys=self.attn512_split_keys,
                                        max_kv=self.max_model_len + L, prefill_from=whole, prefill_keys=pkeys)
             self.stats.update(attn512_resident=self.attn_f.resident, attn512_split_keys=self.attn512_split_keys)
+            # The other counts' decode graphs (`draft_counts`): their rows' 1 + v queries, each width's own plans
+            # (a decode bucket's tables are static), the k-wide instances' split partials shared
+            for v in self.counts if self.use_graphs else ():  # eager and break steps plan on the k-wide ones
+                if self.window_split_keys:
+                    aw: Any = WindowAttention(self.pools, cfg.num_heads, cfg.sliding_kv_heads, cfg.sliding_head_dim,
+                                              dev, self.window, max_tokens=pc.max_num_batched_tokens,
+                                              max_rows=pc.max_num_seqs, qo_per_row=1 + v,
+                                              split_keys=self.window_split_keys, share=self.attn_w)
+                else:
+                    aw = FlashInferWindowAttention(self.pools, cfg.num_heads, cfg.sliding_kv_heads,
+                                                   cfg.sliding_head_dim, dt, dev, self.window,
+                                                   max_rows=max(self._dbuckets(v), default=0), max_pages=wpages,
+                                                   workspace=workspace, qo_per_row=1 + v, upper_bounds=True)
+                af = Attn512(self.pools, self.rotary, cfg.num_heads, cfg.full_kv_heads, cfg.full_rope_angles, dev,
+                             max_tokens=pc.max_num_batched_tokens, max_rows=pc.max_num_seqs, qo_per_row=1 + v,
+                             split_keys=self.attn512_split_keys, max_kv=self.max_model_len + L, share=self.attn_f,
+                             prefill_from=whole, prefill_keys=pkeys)
+                self._attn_v[v] = (aw, af)
             log.info("attn512: %d CTAs resident at once (%d an SM)", self.attn_f.resident,
                      self.attn_f.resident // self.attn_f.sms)
             if self.k:  # the drafter's: one query per sample row, over the target's last sliding and full layers
@@ -770,6 +808,9 @@ class GemmaRunner(Runner):
         if self.mm:  # the encoder pool and the tower's attention (its graphs: `_capture_all`)
             fi = self.attn_kind == "flashinfer"
             self.img.allocate(cfg.hidden_size, fi, workspace=workspace if fi else None)
+        self._attn_v[self.k] = (self.attn_w, self.attn_f)
+        for v in self.counts:
+            self._attn_v.setdefault(v, (self.attn_w, self.attn_f))  # the references plan per step: any width
         self._arange_pages = torch.arange(self.max_pages, device=dev)
         self._vocab_ids = torch.arange(cfg.vocab_size, device=dev)
         self._bctx = Gemma4Context(None, self.attn_w, self.attn_f, self.rotary, self.pools)
@@ -783,7 +824,7 @@ class GemmaRunner(Runner):
         self._pool = None
         for name in ("pools", "arena", "tables", "rotary", "_staging", "attn_w", "attn_f", "attn_wb", "attn_dw",
                      "attn_df", "_arange_pages", "_vocab_ids", "_last_end", "static", "_bctx", "_dbctx", "_t_kv",
-                     "_t_named", "_d_kv", "_d_named", "_t_wb", "_d_wb"):
+                     "_t_named", "_d_kv", "_d_named", "_t_wb", "_d_wb", "_attn_v"):
             self.__dict__.pop(name, None)
         self.lp = None
         self.gs.release()
@@ -913,10 +954,11 @@ class GemmaRunner(Runner):
 
     def _synthetic(self, b: PlanBuilder, step: int, rows: list[tuple[int, int]], *, pages_from: int,
                    free: list[int] = (), params: Any = None, room: int = 0,
-                   precise: bool | list[bool] = False, terms: list[dict | None] = ()) -> StepPlan:
+                   precise: bool | list[bool] = False, terms: list[dict | None] = (), draft_n: int = 0) -> StepPlan:
         """A plan admitting (slot, prompt length) rows as complete prompts (SAMPLE), each with full and window pages
         for two decode steps after it plus `room` positions (`_page_layout`). `precise`: the rows are PRECISE (one flag
-        per row, or one for all); `terms`: a row's penalties and logit bias (`warm_terms`)."""
+        per row, or one for all); `terms`: a row's penalties and logit bias (`warm_terms`); `draft_n`: the drafts its
+        SAMPLE rows make (k by default)."""
         b.begin()
         for s in free:
             b.add_free(s)
@@ -929,6 +971,8 @@ class GemmaRunner(Runner):
             b.add_wpages(slot, 0, wp)
             pre = precise[i] if isinstance(precise, list) else precise
             b.add_explicit_row(slot, self._synthetic_tokens(slot, n), 0, STATE_ZERO | SAMPLE | (PRECISE if pre else 0))
+        if 0 < draft_n < self.k:
+            b.draft_n = draft_n
         return b.finish(step)
 
     def _resume_plan(self, b: PlanBuilder, step: int, *, slot: int, seq_len: int, src: tuple[list[int], list[int]],
@@ -952,9 +996,12 @@ class GemmaRunner(Runner):
     def _synthetic_tokens(self, slot: int, n: int, start: int = 0) -> np.ndarray:
         return ((np.arange(start, start + n, dtype=np.int64) * 7919 + slot) % self.cfg.vocab_size).astype(np.int32)
 
-    def _decode_plan(self, b: PlanBuilder, step: int, slots: list[int], masked: bool = False) -> StepPlan:
+    def _decode_plan(self, b: PlanBuilder, step: int, slots: list[int], masked: bool = False, v: int | None = None,
+                     d: int | None = None) -> StepPlan:
         b.begin()
-        b.add_device_rows(np.asarray(slots, np.int32), np.ones(len(slots), bool) if masked else None)
+        b.add_device_rows(np.asarray(slots, np.int32), np.ones(len(slots), bool) if masked else None, n_draft=v)
+        if d is not None and d < self.k:
+            b.draft_n = d
         return b.finish(step)
 
     def _run(self, plans: list[Callable[[], StepPlan]], lead: bool = False,
@@ -1007,28 +1054,41 @@ class GemmaRunner(Runner):
                 if sum(n for _, n in rows) < t or sum(self._pages_of(n + 4) for _, n in rows) + 1 >= pc.num_pages:
                     continue  # unreachable, or no room
                 for name in graph_names("break", **naming):
-                    self._capture_one((name, t), lambda rows=rows: self._synthetic(b, 1, rows, pages_from=1))
-            for n in sorted(self.decode_buckets, reverse=True):
-                for name in graph_names("decode", **naming):
-                    self._capture_one((name, n), lambda n=n: self._decode_capture_plan(b, n))
+                    smp = parse_graph_name(name)[1] == "smp"  # a split step's sampling: one for every count drafted
+                    for d in (self.k, *sorted(self.counts, reverse=True)) if smp and self.mixed_counts else (self.k,):
+                        self._capture_one((name, t, self.k, d),
+                                          lambda rows=rows, d=d: self._synthetic(b, 1, rows, pages_from=1, draft_n=d))
+            for v in (self.k, *sorted(self.counts, reverse=True)):  # each count's decode graphs (`_key`)
+                for n in sorted(self._dbuckets(v), reverse=True):
+                    for name in graph_names("decode", **naming):
+                        fwd = name.endswith("_f")  # a split step's forward: one for every d
+                        for d in (self.k,) if fwd or v == self.k else (v, self.k):  # steady, or a raise (`sched.plan`)
+                            self._capture_one((name, n, v, d),
+                                              lambda n=n, v=v, d=d: self._decode_capture_plan(b, n, v, d))
             if self.mm:  # the vision tower, by bucket of patches
                 self.img.capture(self._pool)
         torch.cuda.synchronize()
         self._reset_tables()
-        self.stats["graphs"] = graph_summary(self._graphs, variants=self.gs.variants if self.grammar else [],
+        self.stats["graphs"] = graph_summary([key[:2] for key in self._graphs if key[2] == self.k],
+                                             variants=self.gs.variants if self.grammar else [],
                                              vision=self.img.graph_buckets() if self.mm else [])
+        if self.counts:
+            self.stats["graphs"]["counts"] = {v: sum(1 for key in self._graphs if key[2] == v)
+                                              for v in (self.k, *self.counts)}
 
-    def _capture_one(self, key: tuple[str, int], make: Callable[[], StepPlan]) -> None:
+    def _capture_one(self, key: tuple[str, int, int, int], make: Callable[[], StepPlan]) -> None:
         self._reset_tables()
         h = self.launch_forward(make(), _internal=True, _capture=key)
         self.wait(h)
 
-    def _decode_capture_plan(self, b: PlanBuilder, n: int) -> StepPlan:
+    def _decode_capture_plan(self, b: PlanBuilder, n: int, v: int | None = None, d: int | None = None) -> StepPlan:
         """Slots 1..n admitted and sampled at a short context, sharing arena pages from 1 on (their full pages, then
-        their window pages: contents do not matter for a capture); a decode plan of n rows."""
+        their window pages: contents do not matter for a capture); a decode plan of n rows verifying v drafts and
+        making d (default k)."""
         m, t = self.mirror, self.tables
         sl = np.arange(1, n + 1)
         m.admitted[sl] = m.sampled[sl] = True
+        m.held[sl] = self.k
         m.seq_len[sl] = 3
         span = 3 + 2 * self.L  # the context and two verify windows after it
         nfp = -(-span // self.fps)  # full pages 1 .. nfp, then window pages
@@ -1041,12 +1101,12 @@ class GemmaRunner(Runner):
         t.pending[1:n + 1] = 0
         if self.k:
             t.max_len[1:n + 1] = self.pc.max_model_len
-        return self._decode_plan(b, 1, sl.tolist())
+        return self._decode_plan(b, 1, sl.tolist(), v=v, d=d)
 
     # -- the step path -----------------------------------------------------------------------------------------
 
     def launch_forward(self, plan: StepPlan, _internal: bool = False,
-                       _capture: tuple[str, int] | None = None) -> _Handle:
+                       _capture: tuple[str, int, int, int] | None = None) -> _Handle:
         """The step's forward (`Runner.launch_forward`), under the sync check unless internal (warm-up, capture)."""
         if self._sync is None or _internal:
             return self._launch_forward(plan, _internal, _capture)
@@ -1055,7 +1115,7 @@ class GemmaRunner(Runner):
 
     @torch.inference_mode()
     def _launch_forward(self, plan: StepPlan, _internal: bool = False,
-                        _capture: tuple[str, int] | None = None) -> _Handle:
+                        _capture: tuple[str, int, int, int] | None = None) -> _Handle:
         if not (self._ready or _internal):
             raise RuntimeError("configure() first")
         if not self.k and plan.sched_n_draft.any():
@@ -1119,7 +1179,7 @@ class GemmaRunner(Runner):
             with plan_bracket(h, self.cuda and _capture is None):
                 meta = self._row_meta(lay, st, h.parity, kind, size)
             if _capture is not None:
-                self._capture(_capture[0], size, meta, lay)
+                self._capture(_capture, meta, lay)
             elif split:
                 ctx = self._part(kind, size, meta, lay, plan.step_id, "fwd")
                 h.split = (kind, size, meta, lay, ctx)
@@ -1129,7 +1189,7 @@ class GemmaRunner(Runner):
             elif kind == "eager":
                 self._eager(meta, lay, plan.step_id)
             else:
-                g = self._graphs[(kind, size)]
+                g = self._graphs[self._key(kind, size, lay)]
                 if kind == "break":
                     self._bctx.meta = meta
                     if self.k:
@@ -1174,8 +1234,15 @@ class GemmaRunner(Runner):
             self._bctx.meta = meta
             if self.k:
                 self._dbctx.meta = meta.drafter
-        self._graphs[(graph_name(kind, part, heads), size)].replay()
+        self._graphs[self._key(graph_name(kind, part, heads), size, lay, part)].replay()
         return None
+
+    def _key(self, name: str, size: int, lay: _Layout, part: str = "all") -> tuple[str, int, int, int]:
+        """A step's graph (`_graphs`): a decode graph at its (v, d), a split step's forward at d = k, a break graph at
+        (k, d) (any v: `mtp_verify`; a d below k only on the split ones, `mixed_counts`)."""
+        if name.startswith("decode"):
+            return name, size, lay.v, self.k if part == "fwd" else lay.dn
+        return name, size, self.k, self.k if part == "fwd" else lay.dn
 
     def mask_buffer(self, h: _Handle) -> np.ndarray:
         if not self.grammar:
@@ -1228,8 +1295,8 @@ class GemmaRunner(Runner):
         if h.n_sample:
             n, s = h.n_sample, self.static.s
             out = h.stage.ntok
-            toks = out[:s * L].reshape(s, L)[:n]
             nn = out[s * L:s * (L + 1)][:n] if k else np.ones(n, np.int64)
+            toks = np.where(np.arange(L)[None, :] < nn[:, None], out[:s * L].reshape(s, L)[:n], -1)  # −1 padding
             st = out[s * (L + 1):s * (L + 2)][:n]
             tokens[h.s_plan_rows] = toks
             n_out[h.s_plan_rows] = nn
@@ -1263,31 +1330,37 @@ class GemmaRunner(Runner):
     def forward_pending(self, h: _Handle) -> bool:
         return forward_running(h)
 
+    def _dbuckets(self, v: int) -> list[int]:
+        """The decode buckets of rows verifying v drafts: k's, or a count's own (more rows when the budget binds)."""
+        return self._buckets_v.get(v, self.decode_buckets)
+
     def _mode(self, lay: _Layout, split: bool = False) -> tuple[str, int]:
         if not self.use_graphs or self.logits_hook is not None or not self._graphs or \
                 self.fp8.precise_step(lay.n_precise):
             return "eager", lay.T
 
-        def have(kind: str, b: int | None) -> bool:
-            return b is not None and ((f"{kind}_f", b) in self._graphs and (f"{kind}_s", b) in self._graphs
-                                      if split else (kind, b) in self._graphs)
+        def have(kind: str, b: int | None, v: int, d: int) -> bool:
+            return b is not None and ((f"{kind}_f", b, v, self.k) in self._graphs and
+                                      (f"{kind}_s", b, v, d) in self._graphs if split else
+                                      (kind, b, v, d) in self._graphs)
 
         if lay.n_dev == lay.n and lay.n_sample == lay.n:
-            b = _bucket(self.decode_buckets, lay.n)
-            if have("decode", b):
+            b = _bucket(self._dbuckets(lay.v), lay.n)
+            if have("decode", b, lay.v, lay.dn):
                 return "decode", b
         t = _bucket(self.token_buckets, lay.T)
-        if have("break", t):
+        if have("break", t, self.k, lay.dn):  # any v (`mtp_verify`); d below k on the split graphs (`mixed_counts`)
             return "break", t
         return "eager", lay.T
 
     # -- the body ----------------------------------------------------------------------------------------------
 
-    def _sizes(self, kind: str, size: int, lay: _Layout | None) -> tuple[int, int, int, int]:
-        """(tokens, sample tokens, rows, sample rows) the body runs: the bucket's static sizes in graphs, the step's
-        own eagerly."""
+    def _sizes(self, kind: str, size: int, lay: _Layout | None, v: int | None = None) -> tuple[int, int, int, int]:
+        """(tokens, sample tokens, rows, sample rows) the body runs: the bucket's static sizes in graphs (decode rows
+        1 + v wide: the step's count, `lay.v`, or `v` at a capture), the step's own eagerly."""
         if kind == "decode":
-            return size * self.L, size * self.L, size, size
+            w = 1 + (v if v is not None else lay.v if lay is not None else self.k)
+            return size * w, size * w, size, size
         if kind == "break":
             rp = min(size, self.S)
             return size, min(size, self.S * self.L), rp, rp
@@ -1317,23 +1390,29 @@ class GemmaRunner(Runner):
         return pos
 
     def _body(self, ctx: Gemma4Context, t: int, st: int, rp: int, cr: int, mode: str, lay: _Layout | None = None,
-              hook: Any = None, part: str = "all", dctx: Gemma4Context | None = None, heads: Heads = NO_HEADS) -> None:
+              hook: Any = None, part: str = "all", dctx: Gemma4Context | None = None, heads: Heads = NO_HEADS,
+              v: int | None = None, d: int | None = None) -> None:
         """Inputs, the forward (outside decode graphs with each row's NaN flag, `_check_rows`), the softcapped logits of
         the sample tokens, sampling (MTP: verification, then the drafter, `_draft`) and the seq_len advance, for `t`
         tokens, `st` sample tokens, `rp` rows and `cr` sample rows (padding included); graph-safe. `part`: "fwd" ends at
         the sample tokens' hidden states (in `hid_out`), "smp" samples from them under the masks (split steps), on the
         heads `heads` names (the sparse target head, the universe draft head: `runner.cuda.heads`). `dctx`: the
-        drafter's context (MTP)."""
+        drafter's context (MTP). `v`, `d` (MTP; default the layout's, else k): the drafts its device rows verify (a
+        decode graph's rows are 1 + v wide; other steps take each row's width from `r_nq`) and those its sample rows
+        make."""
         s, tb, k = self.static, self.tables, self.k
+        v = v if v is not None else lay.v if lay is not None else k
+        d = d if d is not None else lay.dn if lay is not None else k
+        attn_w = self._attn_v[v][0] if k else self.attn_w  # a decode graph's sliding backend: its width's
         splan = (lay.splan_sp if heads[0] else lay.splan) if lay is not None else None
         pos = self._positions(ctx, t)
         r_slot = s.r_slot[:rp]
         if part != "smp":
             ids = self._ids(t)
             if k and mode == "decode":
-                self._fix_target(ctx.meta, rp, r_slot)
-            if mode == "decode" and hasattr(self.attn_w, "graph_window_indices"):
-                self.attn_w.graph_window_indices(rp, tb.wpage_table, r_slot)
+                self._fix_target(ctx.meta, rp, r_slot, attn_w)
+            if mode == "decode" and hasattr(attn_w, "graph_window_indices"):
+                attn_w.graph_window_indices(rp, tb.wpage_table, r_slot)
             embeds = None
             if self.mm and mode != "decode":  # image tokens take their encoder rows (unscaled, as HF's)
                 embeds = self.img.embeds(s.emb[:t], self.model.embed(ids))
@@ -1365,9 +1444,9 @@ class GemmaRunner(Runner):
         if st:
             self._sample(hidden, spos, s.s_slot[:st], s.y[:st], s.y_st[:st], None, splan, mask=mask, sparse=heads[0],
                          terms=True, window=(s.tok, sel))
-        a, _, _ = mtp_verify(s, tb, r_slot, rp, cr, st, k)
+        a, _, _ = mtp_verify(s, tb, r_slot, rp, cr, st, v if mode == "decode" else k)
         if cr:
-            self._draft(hidden, spos, a, st, cr, mode, lay, dctx, uni=heads[1])
+            self._draft(hidden, spos, a, st, cr, mode, lay, dctx, uni=heads[1], d=d)
 
     def _check_rows(self, full: torch.Tensor, rp: int) -> None:
         """Each row's NaN flag (`_Static.out_nf`): 1 when its last token's final hidden state in `full` (every token's)
@@ -1377,8 +1456,9 @@ class GemmaRunner(Runner):
         s.out_nf[:rp].copy_(~torch.isfinite(full.index_select(0, last)).all(-1))
 
     def _draft(self, hidden: torch.Tensor, spos: torch.Tensor, a: torch.Tensor, st: int, cr: int, mode: str,
-               lay: _Layout | None, dctx: Gemma4Context, uni: bool = False) -> None:
-        """The assistant's k drafts for every sample row (the module docstring), after the verification: from the
+               lay: _Layout | None, dctx: Gemma4Context, uni: bool = False, d: int | None = None) -> None:
+        """The assistant's d drafts (default k; −1 for the rest, `sched.plan`) for every sample row (the module
+        docstring), after the verification: from the
         target's hidden state at the row's last committed position p (sample token r_s0 + a: window index a of a verify
         row, a SAMPLE row's one) and the token after it (now pending); draft j fills p + 2 + j and is sampled with that
         position's noise (`_sample` keys qpos + 1). `uni`: the assistant scores the grammar's universe only
@@ -1401,16 +1481,21 @@ class GemmaRunner(Runner):
         dplan = (lay.dplan_uni if uni else lay.dplan) if lay is not None else None
         x, hb = self.assistant(self.model.embed(tok), h, dctx)
         self._sample(x, p + 1, c_slot, s.drafts[0, :cr], s.d_st[:cr], None, dplan, draft=True, uni=uni)
-        for j in range(1, k):
+        d = k if d is None else d
+        for j in range(1, d):
             x, hb = self.assistant(self.model.embed(s.drafts[j - 1, :cr]), hb, dctx)
             self._sample(x, p + 1 + j, c_slot, s.drafts[j, :cr], s.d_st[:cr], None, dplan, draft=True, uni=uni)
+        if d < k:  # the static buffer holds an earlier step's drafts there (another slot's): never verified
+            s.drafts[d:, :cr] = -1
         dr = s.drafts[:, :cr].t()
         tb.drafts.index_copy_(0, c_slot, dr)
         s.out_dr[:cr] = dr  # returned with the outputs (StepResult.drafts)
 
-    def _fix_target(self, meta: Gemma4Meta, rp: int, r_slot: torch.Tensor) -> None:
-        """The target's rows' true KV lengths (seq_len + n_query) into its attention plans (graph-safe: decode graphs;
-        `_row_meta` calls it eagerly for other steps whose lengths are uncertain)."""
+    def _fix_target(self, meta: Gemma4Meta, rp: int, r_slot: torch.Tensor, attn_w: Any = None) -> None:
+        """The target's rows' true KV lengths (seq_len + n_query) into its attention plans (graph-safe: decode graphs,
+        on their width's sliding backend `attn_w`; `_row_meta` calls it eagerly for other steps whose lengths are
+        uncertain)."""
+        attn_w = self.attn_w if attn_w is None else attn_w
         tb, s = self.tables, self.static
         self._t_kv[:rp] = tb.seq_len.index_select(0, r_slot) + s.r_nq[:rp]
         self._t_named[:rp] = self._t_kv[:rp] - self._t_wb[:rp]
@@ -1418,7 +1503,7 @@ class GemmaRunner(Runner):
             if self.window_split_keys:  # our sliding kernel's rows, as attn512's
                 meta.window_plan[0][:rp, 3].copy_(self._t_kv[:rp])
             else:
-                self.attn_w.fix_lengths(meta.sliding_plan, rp, self._t_named[:rp])
+                attn_w.fix_lengths(meta.sliding_plan, rp, self._t_named[:rp])
             meta.full_plan[0][:rp, 3].copy_(self._t_kv[:rp])
 
     def _drafter_ctx(self, meta: Gemma4Meta) -> Gemma4Context | None:
@@ -1480,12 +1565,13 @@ class GemmaRunner(Runner):
             self._body(ctx, t, st, rp, cr, "eager", lay, hook=hook, part=part, dctx=self._drafter_ctx(meta))
         return ctx
 
-    def _capture(self, name: str, size: int, meta: Gemma4Meta, lay: _Layout) -> None:
+    def _capture(self, key: tuple[str, int, int, int], meta: Gemma4Meta, lay: _Layout) -> None:
+        name, size, v, d = key
         kind, part, heads = parse_graph_name(name)
-        t, st, rp, cr = self._sizes(kind, size, None)
+        t, st, rp, cr = self._sizes(kind, size, None, v)
         dctx = None
         if kind == "decode":
-            ctx = Gemma4Context(meta, self.attn_w, self.attn_f, self.rotary, self.pools)
+            ctx = Gemma4Context(meta, *self._attn_v[v], self.rotary, self.pools)
             dctx = self._drafter_ctx(meta)
         else:
             ctx = self._bctx
@@ -1500,12 +1586,12 @@ class GemmaRunner(Runner):
             dctx.capture = ctx.capture
         try:
             with cap:
-                self._body(ctx, t, st, rp, cr, kind, part=part, dctx=dctx, heads=heads)
+                self._body(ctx, t, st, rp, cr, kind, part=part, dctx=dctx, heads=heads, v=v, d=d)
         finally:
             ctx.capture = None
             if dctx is not None:
                 dctx.capture = None
-        self._graphs[(name, size)] = cap
+        self._graphs[key] = cap
 
     # -- host-side staging -------------------------------------------------------------------------------------
 
@@ -1527,6 +1613,7 @@ class GemmaRunner(Runner):
             if (free < 1).any() or (free > s_max).any() or not m.admitted[free].all():
                 raise PlanError(f"step {plan.step_id}: FREE of a slot that is not admitted: {free.tolist()}")
             m.admitted[free] = m.sampled[free] = m.lp[free] = False
+            m.held[free] = 0
             m.seq_len[free] = m.slack[free] = 0
             m.terms[free] = 0
             fx.o_free = st.put(free)
@@ -1537,6 +1624,7 @@ class GemmaRunner(Runner):
             if (seq < 0).any() or (seq >= self.pc.max_model_len).any():
                 raise PlanError(f"step {plan.step_id}: ADMIT with seq_len {seq.tolist()}")
             m.admitted[adm], m.sampled[adm], m.seq_len[adm] = True, False, seq
+            m.held[adm] = 0
             m.slack[adm] = 0
             m.epoch[adm] += 1
             m.temperature[adm], m.top_p[adm] = plan.admit_temperature, plan.admit_top_p
@@ -1633,6 +1721,7 @@ class GemmaRunner(Runner):
         lay.constrained = False
         lay.s_plan_rows = np.zeros(0, np.int64)
         lay.n_precise = 0
+        lay.v = lay.dn = k
         if n == 0:
             lay.T = lay.n_dec = lay.n_dev = 0
             return lay
@@ -1653,13 +1742,28 @@ class GemmaRunner(Runner):
             raise PlanError(f"step {step}: {t_total} query tokens (budget {pc.max_num_batched_tokens})")
         seq = m.seq_len[slots]
         slack = m.slack[slots]
+        # MTP: the drafts the device rows verify (v, one count for all) and those the SAMPLE rows make (d), each k or
+        # one of `draft_counts` (`sched.plan`); a plan with explicit rows drafts k unless `mixed_counts`
+        lay.v = lay.dn = k
+        if k:
+            lay.dn = d = plan.draft_n or k
+            if d != k and (d not in self.counts or not (dev.all() or self.mixed_counts)):
+                raise PlanError(f"step {step}: draft_n {d}: one of {list(self.counts)}, on a plan of device rows only")
         if dev.any():
+            v = int(plan.sched_n_draft[dev][0]) if k else 0
+            if v != k and v not in self.counts:
+                raise PlanError(f"step {step}: device-input rows verify {v} drafts: k ({k}) or one of "
+                                f"{list(self.counts)}")
+            lay.v, L = v, 1 + v
             if (nq[dev] != L).any() or (plan.sched_pos0[dev] != -1).any() or zero[dev].any() or \
-                    (plan.sched_n_draft[dev] != k).any():
-                raise PlanError(f"step {step}: device-input rows need n_query {L}, n_draft {k}, pos0 -1 and no "
+                    (plan.sched_n_draft[dev] != v).any():
+                raise PlanError(f"step {step}: device-input rows need n_query {L}, n_draft {v}, pos0 -1 and no "
                                 "STATE_ZERO")
             if not m.sampled[slots[dev]].all():
                 raise PlanError(f"step {step}: device input before a SAMPLE step of the admission")
+            if k and (m.held[slots[dev]] < v).any():
+                raise PlanError(f"step {step}: device-input rows verify {v} drafts; their slots hold "
+                                f"{m.held[slots[dev]].tolist()}")
         ex = ~dev
         if ex.any():
             if (plan.sched_pos0[ex] != seq[ex]).any() or (slack[ex] != 0).any():
@@ -1741,7 +1845,8 @@ class GemmaRunner(Runner):
         lay.c_row, lay.n_sample = c_row, len(c_row)
         lay.s_plan_rows = order[c_row]
         if self.lp is not None:  # LOGPROBS rows: 1 + k samples each under MTP (`runner.cuda.logprobs`)
-            lay.lp = self.lp.layout(plan, sample_rows | dev, m.lp[slots], order, c_row, r_s0, lay.n_stok, L, st)
+            lay.lp = self.lp.layout(plan, sample_rows | dev, m.lp[slots], order, c_row, r_s0, lay.n_stok, self.L,
+                                    st)  # 1 + k columns a row (`runner.base`), a narrower row's last ones unused
         elif (flags & LOGPROBS).any():
             raise PlanError(f"step {step}: LOGPROBS rows, but this runner was built without logprobs")
         if not self.cuda:  # the reference's sampling plans, per logits width (the grammar heads': their rows)
@@ -1779,7 +1884,8 @@ class GemmaRunner(Runner):
         lay.tok_in = tok_in
         m.seq_len[slots] = np.where(dev, seq + 1, seq + nq)  # device rows: at least the pending token
         if k:
-            m.slack[slots[dev]] += k
+            m.slack[slots[dev]] += k  # at k whatever v: an upper bound, symmetric with `wait`
+            m.held[slots[sample_rows | dev]] = lay.dn
         m.sampled[slots[sample_rows | dev]] = True
         return lay
 
@@ -1824,8 +1930,9 @@ class GemmaRunner(Runner):
         if tp > t:
             for f in ("slot", "tok", "pos"):
                 a[o[f] + t:o[f] + tp] = 0
-            if kind == "decode" and self.k:  # padding rows: token 0 at positions 0 .. k of the null page (KV 1 + k)
-                a[o["pos"] + t:o["pos"] + tp] = np.tile(np.arange(self.L), (tp - t) // self.L)
+            if kind == "decode" and self.k:  # padding rows: token 0 at positions 0 .. v of the null page (KV 1 + v)
+                w = 1 + lay.v
+                a[o["pos"] + t:o["pos"] + tp] = np.tile(np.arange(w), (tp - t) // w)
         if self.mm:  # padding tokens: their token's embedding
             a[o["emb"]:o["emb"] + t] = lay.emb
             a[o["emb"] + t:o["emb"] + tp] = -1
@@ -1851,12 +1958,12 @@ class GemmaRunner(Runner):
         a[o["r_s0"]:o["r_s0"] + n] = lay.r_s0
         if rp > n:
             a[o["r_slot"] + n:o["r_slot"] + rp] = 0
-            if kind == "decode":  # padding rows: 1 + k tokens and samples each, on slot 0 (verified on it: nothing)
-                pr = np.arange(n, rp)
-                a[o["r_nq"] + n:o["r_nq"] + rp] = self.L
+            if kind == "decode":  # padding rows: 1 + v tokens and samples each, on slot 0 (verified on it: nothing)
+                pr, w = np.arange(n, rp), 1 + lay.v
+                a[o["r_nq"] + n:o["r_nq"] + rp] = w
                 a[o["r_kind"] + n:o["r_kind"] + rp] = _VERIFY if self.k else _SAMPLE
-                a[o["r_start"] + n:o["r_start"] + rp] = pr * self.L
-                a[o["r_s0"] + n:o["r_s0"] + rp] = pr * self.L
+                a[o["r_start"] + n:o["r_start"] + rp] = pr * w
+                a[o["r_s0"] + n:o["r_s0"] + rp] = pr * w
             else:
                 for f in ("r_nq", "r_kind", "r_start", "r_s0"):
                     a[o[f] + n:o[f] + rp] = 0
@@ -1979,16 +2086,18 @@ class GemmaRunner(Runner):
         return meta
 
     def _plan_decode_graph(self, meta: Gemma4Meta, lay: _Layout, st: _Staging, parity: int, rows: int) -> None:
-        """A decode bucket: real rows in the step's order, then padding rows of 1 + k tokens on the null page (KV
-        length 1 + k); under MTP each row planned for its upper bound (the body writes the true lengths in)."""
-        ps, n, L = self.ps, lay.n, self.L
+        """A decode bucket: real rows in the step's order, then padding rows of 1 + v tokens on the null page (KV
+        length 1 + v); under MTP each row planned for its upper bound (the body writes the true lengths in); on the
+        attention backends of the step's count (`_attn_v`)."""
+        ps, n, L = self.ps, lay.n, 1 + lay.v
+        attn_w, attn_f = self._attn_v[lay.v]
         full = np.zeros((rows, 4), np.int32)  # both kernels' rows
         full[:, 1] = np.arange(rows) * L
         full[:, 2] = L
         full[:, 3] = L
         full[:n] = lay.full_rows
         if self.window_split_keys:  # our sliding kernel (kernels.attn_window): its bucket's items are static
-            self.attn_w.plan_graph(meta, bucket=rows, rows=full, stage=st.put32)
+            attn_w.plan_graph(meta, bucket=rows, rows=full, stage=st.put32)
         else:
             kv_w = lay.w[4]
             kvw = np.full(rows, L, np.int64)
@@ -1997,11 +2106,11 @@ class GemmaRunner(Runner):
             lb[:n] = lay.r_kv_lb - lay.wlo * ps
             npg = (kvw + ps - 1) // ps
             indptr = np.concatenate([[0], np.cumsum(npg)])
-            self.attn_w.plan_graph(meta, rows=rows, parity=parity, qo_indptr=st.put32(np.arange(rows + 1) * L),
-                                   kv_indptr=st.put32(indptr), last_page_len=st.put32(kvw - (npg - 1) * ps),
-                                   kv_lens=st.put32(kvw), max_q=L, lb=lb if (lb < kvw).any() else None)
-            self.attn_w.g_first[:rows].copy_(st.i(lay.g_first, rows))
-        self.attn_f.plan_graph(meta, bucket=rows, rows=full, stage=st.put32, real=n, lb=lay.r_kv_lb)
+            attn_w.plan_graph(meta, rows=rows, parity=parity, qo_indptr=st.put32(np.arange(rows + 1) * L),
+                              kv_indptr=st.put32(indptr), last_page_len=st.put32(kvw - (npg - 1) * ps),
+                              kv_lens=st.put32(kvw), max_q=L, lb=lb if (lb < kvw).any() else None)
+            attn_w.g_first[:rows].copy_(st.i(lay.g_first, rows))
+        attn_f.plan_graph(meta, bucket=rows, rows=full, stage=st.put32, real=n, lb=lay.r_kv_lb)
 
     def _drafter_meta(self, lay: _Layout, st: _Staging, parity: int, kind: str, size: int) -> Gemma4Meta:
         """The drafter's rows (MTP): one query per sample row at its last committed position p, over the target's KV of

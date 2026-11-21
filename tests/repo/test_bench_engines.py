@@ -10,6 +10,7 @@ import platform
 import socket
 import stat
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -47,7 +48,8 @@ from pathlib import Path
 
 here = Path(__file__).resolve().parent
 args = sys.argv[1:]
-port = int(args[args.index("--port") + 1]) if "--port" in args else 8000
+port = int(args[args.index("--port") + 1]) if "--port" in args else next(
+    (int(a.split("=", 1)[1]) for a in args if a.startswith("server.port=")), 8000)  # vLLM's and SGLang's, or ours
 mode = (here / "mode").read_text().strip()
 if mode == "gdn":
     print("ValueError: batch_invariant mode is not supported for GDN_ATTN", flush=True)
@@ -84,7 +86,7 @@ class H(BaseHTTPRequestHandler):
             with lock:
                 page = ('# TYPE vllm:spec_decode_num_drafts_total counter\n'
                         f'vllm:spec_decode_num_drafts_total{{engine="0"}} {state["drafts"]}\n'
-                        f'vllm:generation_tokens_total{{engine="0"}} {state["tokens"]}\n')
+                        if mode != "nospec" else '') + f'vllm:generation_tokens_total{{engine="0"}} {state["tokens"]}\n'
             self.send(200, page, "text/plain")
         elif self.path == "/server_info":
             self.send(200, json.dumps({"config": {}}))
@@ -295,6 +297,17 @@ def test_other_start_failure_has_no_done(rig):
     assert m["status"] == "failed" and "boom" in m["status_line"] and "/opt" not in m["status_line"]
     assert not (rig.unit() / "done").exists()
     assert findings(rig, rig.unit() / "manifest.json") == []
+
+
+def test_a_server_without_verify_steps_fails_its_smoke_unless_its_arm_drafts_nothing(rig):
+    rig.mode("nospec")
+    assert rig.run() == 1
+    assert rig.manifest()["smoke"]["failures"] == ["/metrics exports no verify-step series"]
+    out = ["--out", str(rig.out), "--model", "gemma", "--family", "K", "--engines", "ours", "--engine-bin",
+           f"ours={rig.bin}", "--tokenizer", str(rig.tok), "--arm", "ours-k0", "--load", "scene-c1"]
+    assert drive.main(out) == 0  # k = 0: its smoke needs no verify step
+    m = rig.manifest("ours-k0", "K")
+    assert m["smoke"]["ok"] is True and m["smoke"]["verify_steps"] is None and m["k"] == 0
 
 
 @pytest.mark.parametrize(("mode", "failure"), [("spaces", "compact"), ("reasoning", "reasoning")])
@@ -537,6 +550,64 @@ def test_family_i_runs_both_modes_of_each_engine_at_c64(rig, capsys):
     assert "VLLM_USE_DEEP_GEMM" in out
 
 
+def test_family_k_runs_our_own_draft_counts_on_a1s_loads_and_the_mixed_load(rig, capsys):
+    rig.mp.undo()  # the real loads_for
+    assert drive.main(["--out", str(rig.out), "--model", "gemma", "--family", "K", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert [ln.split(":")[0] for ln in out.splitlines() if ln.startswith("K ")] == [
+        "K ours-k0", "K ours-k1", "K ours-k2", "K ours-k3", "K ours", "K ours-adaptive"]
+    assert "speculative.num_speculative_tokens=0" in out and "speculative.num_speculative_tokens=5" in out
+    assert out.count("dev.speculative.adaptive=true") == 1
+    assert out.count("load scene-c1: ") == 6 and out.count("load chat-c64: --workload chat") == 6
+    assert out.count("load mixed-c64-chat: --workload chat --input-tokens 1024 --max-tokens 256 --ignore-eos "
+                     "--concurrency 32 --first-index 3000000") == 6
+    assert out.count("load mixed-c64-scene: --workload scene --concurrency 32 --first-index 3000000") == 6
+    k = {a.name: a for a in arms.arms("qwen")["K"]}
+    assert sorted(k) == ["ours", "ours-k0", "ours-k1", "ours-k2"]
+    assert "OURS_OWN_K" in arms.k_source(k["ours-k1"]) and arms.k_source(k["ours"]) == arms.MODELS["qwen"].k_source
+
+
+def test_load_keeps_only_the_named_loads_and_refuses_an_unknown_one(rig, capsys):
+    rig.mp.undo()  # the real loads_for
+    base = ["--out", str(rig.out), "--model", "qwen", "--family", "K", "--dry-run", "--arm", "ours-k1"]
+    assert drive.main([*base, "--load", "chat-c64", "--load", "mixed-c64"]) == 0
+    loads = [ln.strip().split(":")[0] for ln in capsys.readouterr().out.splitlines() if ln.startswith("  load ")]
+    assert loads == ["load chat-c64", "load mixed-c64-chat", "load mixed-c64-scene"]
+    with pytest.raises(SystemExit):
+        drive.main([*base, "--load", "chat-c64", "--load", "chat-c99"])  # every name must be known
+    assert "--load chat-c99: not a load of this family" in capsys.readouterr().err
+    with pytest.raises(SystemExit):
+        drive.main([*base, "--load", "chat-c99"])
+    assert "--load chat-c99: not a load of this family" in capsys.readouterr().err
+    with pytest.raises(SystemExit):
+        drive.main(["--out", str(rig.out), "--model", "qwen", "--family", "smoke", "--dry-run", "--load", "x"])
+    assert "(have no loads)" in capsys.readouterr().err
+    gemma = ["--out", str(rig.out), "--model", "gemma", "--family", "C", "--dry-run", "--load", "scene-c64"]
+    assert drive.main(gemma) == 0  # a second pass has only `stability`: left out, not refused
+    out = capsys.readouterr().out
+    assert "-p2:" not in out and "C ours-nobi-p1:" in out and "load stability" not in out
+    with pytest.raises(SystemExit):
+        drive.main(["--out", str(rig.out), "--family", "control", "--label", "start", "--load", "x"])
+    assert "the control family has no loads" in capsys.readouterr().err
+
+
+def test_a_load_of_parts_runs_one_client_per_part_each_with_its_report(rig, monkeypatch):
+    each = ["--concurrency", "2", "--requests", "4", "--warmup-requests", "1", "--max-tokens", "8"]
+    spec = [drive.LoadSpec("mix", [], parts=(
+        ("chat", ["--workload", "chat", "--input-tokens", "32", "--ignore-eos", *each]),
+        ("scene", [*drive.SCENE, "--prompt-tokens", "64", *each])))]
+    monkeypatch.setattr(drive, "loads_for", lambda ctx, unit: spec)
+    assert rig.run(family="A1") == 0
+    u, m = rig.unit(family="A1"), rig.manifest(family="A1")
+    ld = m["loads"][0]
+    assert ld["file"] == ["mix-chat.json", "mix-scene.json"] and ld["ok"] is True and len(ld["exit"]) == 2
+    for part in ("chat", "scene"):
+        report = json.loads((u / f"mix-{part}.json").read_text())
+        assert report["meta"]["part"] == part and report["meta"]["unit"] == "vllm"
+        assert report["workload"]["name"] == part and report["loads"][0]["ok"] == 4
+    assert not (u / "mix.json").exists() and (u / "metrics-mix-after.txt").exists()
+
+
 def test_arms_config_cache_roots_and_the_family_i_variants(monkeypatch):
     ours = arms.Arm("ours", "gemma")
     monkeypatch.setenv("LLM_MINI_INFER_CONFIG", "/x/c.yaml")
@@ -554,6 +625,43 @@ def test_arms_config_cache_roots_and_the_family_i_variants(monkeypatch):
     assert cmd[cmd.index("--max-running-requests") + 1] == "48"
     assert cmd[cmd.index("--max-mamba-cache-size") + 1] == "240"
     assert any("--max-running-requests 48" in d for d in sg.deviations)
+
+
+def test_run_children_share_one_deadline_and_kill_only_what_outlives_it(tmp_path):
+    quick = [sys.executable, "-c", "raise SystemExit(3)"]
+    slow = [sys.executable, "-c", "import time; time.sleep(120)"]
+    t0 = time.monotonic()
+    out = drive.run_children([slow, quick, slow], dict(os.environ), tmp_path, tmp_path / "log", 8)
+    assert out == [(-9, True), (3, False), (-9, True)]
+    assert time.monotonic() - t0 < 14  # one deadline for all: a limit per child would take 16 s
+
+
+def test_an_interrupted_start_kills_every_group_already_running(tmp_path, monkeypatch):
+    pidfile = tmp_path / "pid"
+    first = ["/bin/sh", "-c", f"sleep 120 & echo $! > {pidfile}"]  # returns at once; the sleep stays in its group
+    real, procs = drive.subprocess.Popen, []
+
+    def popen(*a, **kw):
+        if procs:  # the second start: once the first has exited, leaving its sleep
+            procs[0].wait(timeout=10)
+            raise KeyboardInterrupt
+        procs.append(real(*a, **kw))
+        return procs[0]
+
+    monkeypatch.setattr(drive.subprocess, "Popen", popen)
+    with pytest.raises(KeyboardInterrupt):
+        drive.run_children([first, ["true"]], dict(os.environ), tmp_path, tmp_path / "log", 60)
+    pid = int(pidfile.read_text().strip())
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        os.kill(pid, 9)
+        pytest.fail("the exited leader's sleep outlived the interrupt")
 
 
 # -- the context and family L ------------------------------------------------------------------------------------------

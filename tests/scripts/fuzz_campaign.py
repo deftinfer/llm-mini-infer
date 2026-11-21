@@ -48,6 +48,8 @@ SUITES = {
     "structured_window": "tests/sched/test_forced_tokens.py::test_random_structured_window_workloads",
     "structured_hybrid": "tests/sched/test_forced_tokens.py::test_random_structured_hybrid_workloads",
     "logprobs": "tests/runner/test_logprobs.py::test_random_logprobs_workloads",
+    "mtp_counts": "tests/sched/test_mtp_sched.py::test_random_mtp_count_workloads",
+    "arena_mtp_counts": "tests/sched/test_window_mtp.py::test_random_arena_mtp_count_workloads",
 }
 _STATS = re.compile(r"(\d+) passing(?: examples?)?, (\d+) failing(?: examples?)?,(?: and)? (\d+) invalid")
 

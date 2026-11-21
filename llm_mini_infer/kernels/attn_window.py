@@ -91,10 +91,11 @@ class WindowAttention:
 
     def __init__(self, pools: Any, num_heads: int, num_kv_heads: int, head_dim: int, device: torch.device,
                  window: int, max_tokens: int, max_rows: int, scale: float = 1.0, qo_per_row: int = 1,
-                 split_keys: int = SPLIT_KEYS):
+                 split_keys: int = SPLIT_KEYS, share: WindowAttention | None = None):
         """`window`: keys a query sees, its own included; `max_rows`: decode rows a step holds at most;
         `qo_per_row`: a decode row's queries (1 + k under MTP); `split_keys`: a decode row's split (module
-        docstring)."""
+        docstring). `share`: an instance whose split partials this one uses when large enough (one step runs one
+        width's sliding backend, and each call merges its splits before the next call's split on the same stream)."""
         if head_dim != D or num_heads % num_kv_heads or ROWS % (num_heads // num_kv_heads):
             raise ValueError(f"attn_window: head dim {D} and query heads per KV head dividing {ROWS} (got head dim "
                              f"{head_dim}, {num_heads} heads over {num_kv_heads})")
@@ -113,8 +114,11 @@ class WindowAttention:
         # Split partials: every decode row's groups at `per_tile` splits (a step's decode rows come first, so do their
         # items)
         self.max_split_items = max(1, max_rows) * tiles(qo_per_row, self.group) * num_kv_heads * self.per_tile
-        self.o_part = torch.empty((self.max_split_items, ROWS, D), dtype=torch.float32, device=device)
-        self.ml_part = torch.empty((self.max_split_items, ROWS, 2), dtype=torch.float32, device=device)
+        if share is not None and share.o_part.shape[0] >= self.max_split_items:
+            self.o_part, self.ml_part = share.o_part, share.ml_part
+        else:
+            self.o_part = torch.empty((self.max_split_items, ROWS, D), dtype=torch.float32, device=device)
+            self.ml_part = torch.empty((self.max_split_items, ROWS, 2), dtype=torch.float32, device=device)
         # Tables, per parity (a step is planned while the previous one may be queued): the decode rows' items and
         # groups, the prefill rows' items, the span queries' key ends
         max_groups = max(1, max_rows) * tiles(qo_per_row, self.group) * num_kv_heads

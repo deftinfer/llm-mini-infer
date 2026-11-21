@@ -19,6 +19,7 @@ from ..support.fuzzing import fuzz_settings, saved_on_failure
 from ..support.harness import Harness, Spec
 from ..support.sched_cases import check_plans, output_of, shared, stem
 from ..support.window_mtp import (
+    arena_mtp_count_workloads,
     arena_mtp_workloads,
     gemma_images_mtp_workloads,
     harness,
@@ -136,6 +137,14 @@ def test_random_window_mtp_workloads(w) -> None:
 @given(arena_mtp_workloads())
 def test_random_arena_mtp_workloads(w) -> None:
     with saved_on_failure("arena_mtp", w):
+        run_window_mtp_workload(w)
+
+
+@fuzz_settings(300)
+@given(arena_mtp_count_workloads())
+def test_random_arena_mtp_count_workloads(w) -> None:
+    """Gemma 4's arena workloads with a draft count per step."""
+    with saved_on_failure("arena_mtp_counts", w):
         run_window_mtp_workload(w)
 
 

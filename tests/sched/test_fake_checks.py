@@ -12,7 +12,9 @@ MTP decode row, which checks its KV there), at a step the clean run shows it has
 another slot too or by none, full or window; a PRECISE row's precise marks dropped from a position it reads to the end
 of that page, full or window; a cached position of a resumed admission's prefix overwritten or never written (a
 workload with such rows gets one of these). The plan, before its forward: a field of a random SCHED row (n_draft, next
-token, a flag, pos0, n_query, tok_off, its slot, an input token) or a PAGES entry changed. Both modes must end alike
+token, a flag, pos0, n_query, tok_off, its slot, an input token) or a PAGES entry changed, or its draft counts (MTP:
+the plan's draft_n, every device row verifying k though a slot holds fewer, one row's count unlike the others'
+(`FakeChecks._check_counts`)). Both modes must end alike
 (passed, or the same exception with the same message, which names the step and the first bad position or entity) after
 the same outputs at every step, dtypes included.
 
@@ -57,7 +59,9 @@ STRATEGIES = {
     "window": ("window_workloads", "window_workloads"), "window_pressure": ("window_workloads", "window_pressure"),
     "arena_pressure": ("window_workloads", "arena_pressure"), "arena_hits": ("window_workloads", "arena_hits"),
     "gemma_images": ("window_workloads", "gemma_image_workloads"),
+    "mtp_counts": ("mtp_workloads", "mtp_count_workloads"),
     "window_mtp": ("window_mtp", "window_mtp_workloads"), "arena_mtp": ("window_mtp", "arena_mtp_workloads"),
+    "arena_mtp_counts": ("window_mtp", "arena_mtp_count_workloads"),
     "gemma_images_mtp": ("window_mtp", "gemma_images_mtp_workloads"),
     "precise": ("precise_cases", "precise_workloads"),
     "window_precise": ("precise_cases", "window_precise_workloads"), "nan": ("nan_cases", "nan_workloads"),
@@ -70,7 +74,8 @@ KINDS = ("kv", "poison", "unprecise", "remap", "reuse", "zero", "shared", "unsam
 WINDOW_KINDS = ("wkv", "wpoison", "wunprecise", "wremap", "wzero", "cross")
 ROW_KINDS = ("write", "nopage", "precise", "hit", "unwritten", "wwrite", "wnopage", "wprecise")
 FLAGS = {"MASKED": MASKED, "PRECISE": PRECISE, "STATE_ZERO": STATE_ZERO, "SAMPLE": SAMPLE}
-PLAN_KINDS = ("n_draft", "next_tok", *FLAGS, "pos0", "n_query", "tok_off", "twice", "slot", "token", "page", "wpage")
+PLAN_KINDS = ("n_draft", "next_tok", *FLAGS, "pos0", "n_query", "tok_off", "twice", "slot", "token", "page", "wpage",
+              "draft_n", "held", "count")
 
 
 def kinds_for(r: Probe) -> list[str]:
@@ -218,6 +223,21 @@ def mutate(plan: StepPlan, rng: random.Random, kind: str, r: FakeRunner) -> tupl
         j = rng.randrange(len(ids))
         ids[j] = rng.randrange(1 if kind == "page" else 0, r.pools.num_pages)  # 0: a window page released
         return p, f"{kind} entry {j} = {ids[j]}"
+    dev = np.flatnonzero(plan.sched_tok_off < 0)
+    if kind == "draft_n":  # a count the runner does not take, on a plan of device rows; any, on one with explicit rows
+        p.draft_n = r.k + 1 if len(dev) == len(plan.sched_slot) else 1
+        return p, f"draft_n {p.draft_n}"
+    if kind == "held":  # every device row verifies k, though a slot holds fewer
+        if not r.k or not len(dev) or (r.drafts_n[plan.sched_slot[dev]] >= r.k).all():
+            return plan, ""
+        field("sched_n_draft")[dev] = r.k
+        return p, "held"
+    if kind == "count":  # one device row's count unlike the others'
+        if not r.k or len(dev) < 2:
+            return plan, ""
+        a = field("sched_n_draft")
+        a[dev[0]] = 1 if a[dev[0]] != 1 else r.k
+        return p, f"count row {dev[0]}"
     n = len(plan.sched_slot)
     rows = [i for i in range(n) if plan.sched_tok_off[i] >= 0] if kind == "token" else list(range(n))
     if not rows or (kind == "twice" and n < 2):
@@ -374,14 +394,16 @@ def test_fast_checks_match_the_reference(suite: str, data: st.DataObject) -> Non
     check_alike(suite, ex, data.draw(st.integers(0, 1 << 30), label="faults"))
 
 
-def _decoding(window: int = 0, mtp_k: int = 0, n: int = 1) -> None:
+def _decoding(window: int = 0, mtp_k: int = 0, n: int = 1, schedule: tuple[int, ...] = (), mixed: bool = True) -> None:
     """`n` requests decoding after prompts of 40 (pages of 4; `window`: a sliding-window model, window pages of 4 and
-    full pages of 20, `mtp_k` drafts by a drafter without KV)."""
+    full pages of 20, `mtp_k` drafts by a drafter without KV, `schedule` its counts per plan, `mixed`: plans with
+    explicit rows draft the count too)."""
     specs = [harness.Spec(rid=i, prompt_len=40, max_tokens=24, seed=5 + i, ignore_eos=True) for i in range(n)]
     if window:
         h = MODULES["window_workloads"].harness(specs, window=window, max_tokens=64, mtp_k=mtp_k, draft_kv=False)
     else:
-        h = harness.Harness(specs=specs, max_tokens=64, mtp_k=mtp_k)
+        h = harness.Harness(specs=specs, max_tokens=64, mtp_k=mtp_k, count_schedule=schedule,
+                            mixed_draft_counts=mixed)
     h.run()
     h.check()
 
@@ -410,6 +432,9 @@ def _resumed(hybrid: bool) -> None:
 
 
 SCENARIOS = {"one": _decoding, "mtp": lambda: _decoding(mtp_k=2), "two": lambda: _decoding(n=2),
+             "counts": lambda: _decoding(mtp_k=3, schedule=(1, 3, 2)),
+             "counts_k": lambda: _decoding(mtp_k=3, schedule=(1, 3, 2), mixed=False),
+             "counts_two": lambda: _decoding(mtp_k=3, n=2, schedule=(1, 3, 2)),
              "window": lambda: _decoding(16), "window_mtp": lambda: _decoding(16, 2), "precise": _chunked,
              "window_precise": lambda: _chunked(16), "hit": lambda: _resumed(False),
              "hybrid_hit": lambda: _resumed(True)}
@@ -455,6 +480,12 @@ WRONG = r"AssertionError: request \d+: tokens differ from the prediction"
     ("seq", "one", 3, 0, PLAN + "device-input positions beyond the page table"),
     ("seq", "precise", 3, 3, PLAN + r"slot \d+: pos0 \d+ != device seq_len \d+"),
     ("n_draft", "one", 3, 3, PLAN + "n_draft must be 0 on device-input rows and 0 on explicit ones"),
+    # the draft counts (`_check_counts`)
+    ("draft_n", "one", 3, 3, PLAN + "draft_n without MTP"),
+    ("draft_n", "counts", 3, 3, PLAN + r"draft_n 4: not a count this runner takes \(\[1, 2, 3\]\)"),
+    ("draft_n", "counts_k", 0, 3, PLAN + r"draft_n 1 on a plan with explicit rows \(they draft k\)"),
+    ("held", "counts", 3, 3, PLAN + r"device-input rows verify 3 drafts; their slots hold \[[12]\]"),
+    ("count", "counts_two", 3, 3, PLAN + r"device-input rows verify \[\d, \d\] drafts: one count of \[1, 2, 3\]"),
     ("next_tok", "mtp", 3, 3, PLAN + "sched_next_tok must be set exactly on non-final explicit rows"),
     ("MASKED", "one", 3, 3, PLAN + "MASKED row of an admission without ADMIT_CONSTRAINED"),
     ("MASKED", "precise", 0, 3, PLAN + "MASKED on a row without SAMPLE"),

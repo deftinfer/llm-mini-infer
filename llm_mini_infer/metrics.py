@@ -526,6 +526,14 @@ class SpecMetrics:
         self.num_accepted_tokens = Counter("vllm:spec_decode_num_accepted_tokens", "Number of accepted tokens.", base)
         self.num_accepted_tokens_per_pos = Counter("vllm:spec_decode_num_accepted_tokens_per_pos",
                                                    "Accepted tokens per draft position.", base, labels=("position",))
+        self.num_verified_per_pos = Counter("llm_mini_infer:spec_decode_num_verified_per_pos",
+                                            "Verify steps of requests whose window held each draft position: every one "
+                                            "at a fixed k; with dev.speculative.adaptive the steps that verified that "
+                                            "many drafts or more (acceptance per position: the accepted tokens per "
+                                            "position over this).", base, labels=("position",))
+        self.steps_by_count = Counter("llm_mini_infer:spec_decode_steps_by_count",
+                                      "Engine steps with decode rows, by the drafts each row verified (k, or the count "
+                                      "dev.speculative.adaptive chose).", base, labels=("count",))
         self.tokens_per_verify_step = Histogram("llm_mini_infer:request_tokens_per_verify_step",
                                                 "Per request the engine finished with MTP verify steps (not one a stop "
                                                 "string ended in the frontend): the tokens they delivered over their "

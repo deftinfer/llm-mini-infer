@@ -30,7 +30,8 @@ serial device stream (`start = max(now, stream end)`, then `step_ms` plus `prefi
 it). Idle gaps on that timeline are reported in `StepResult`. With `sample_ms` > 0 every step is a forward, then a
 sampling part, whose boundary `forward_pending` reports.
 
-**MTP** (`mtp_k` k > 0). A device-input row verifies 1 + k tokens and returns n_out = 1 + a: the target's tokens are
+**MTP** (`mtp_k` k > 0). A device-input row verifies 1 + v tokens (v: the plan's count, k or one of `draft_counts`, at
+most what its slot's last SAMPLE row drafted) and returns n_out = 1 + a: the target's tokens are
 unchanged (`fake_token` at each position), and the number of accepted drafts a is drawn from (seed, first position),
 each draft accepted with probability `accept_p` while the previous ones were, then capped by the slot's commit limits: a
 stop token ADMIT carries or the token at `max_len − 1` ends the accepted run. The recurrent state commits lazily, as the
@@ -40,7 +41,8 @@ them, a `sched_next_tok` that is not the next chunk's first token, and drafter K
 slot names raise `PlanError`. **A drafter without KV** (`draft_kv=False`, Gemma 4's assistant) writes the verify window
 only, and its rollback is a truncation: a window or a hit that reads past a committed position fails the content checks.
 
-**Grammar masks and drafts.** Every MTP SAMPLE row returns k drafts (`StepResult.drafts`): the unmasked chain of what
+**Grammar masks and drafts.** Every MTP SAMPLE row returns d drafts (`StepResult.drafts`, d the plan's `draft_n` or k,
+−1 past them): the unmasked chain of what
 the target would sample, with the draft after the accepted count made wrong. A MASKED row samples under the masks the
 engine wrote (`masked_pick`), and an MTP row verifies its drafts against those masked samples. `fake_generate(...,
 matcher=)` predicts the outputs with a fresh grammar matcher (`tests/support/fake_grammar.py`), so a mask at the wrong
@@ -270,8 +272,26 @@ def model_geometry(model_dir: str | Path) -> dict[str, int]:
 
 
 class _Handle:
-    __slots__ = ("bad", "deadline", "end_ckpts", "fwd_dur", "fwd_end", "idle_before", "idle_inside", "lpf",
-                 "mask_off", "masked", "mtp", "n_masks", "plan", "result", "rows", "step_id")
+    __slots__ = (
+        "bad",
+        "d",
+        "deadline",
+        "end_ckpts",
+        "fwd_dur",
+        "fwd_end",
+        "idle_before",
+        "idle_inside",
+        "lpf",
+        "mask_off",
+        "masked",
+        "mtp",
+        "n_masks",
+        "plan",
+        "result",
+        "rows",
+        "step_id",
+        "v",
+    )
 
 
 class FakeRunner(FakeChecks, Runner):
@@ -288,7 +308,8 @@ class FakeRunner(FakeChecks, Runner):
                  report_unsampled: bool = False, mask_empty_at: Mapping[int, Iterable[int]] | None = None,
                  nonfinite_once: Iterable[int] = (), batch_invariant: bool = False,
                  exact_cuts: Mapping[int, Iterable[int]] | None = None, full_checks: bool = False,
-                 logprobs: bool = True, penalties: bool = True):
+                 logprobs: bool = True, penalties: bool = True, draft_counts: Iterable[int] | None = None,
+                 mixed_draft_counts: bool = True):
         self.vocab = vocab_size
         self.logprobs = logprobs  # takes LOGPROBS rows (module docstring)
         self.penalties = penalties  # takes penalised and biased admissions, and ignores their terms (module docstring)
@@ -300,6 +321,11 @@ class FakeRunner(FakeChecks, Runner):
         self.encoder_rows = encoder_rows
         self.encoder_budget = encoder_budget or encoder_rows
         self.k = mtp_k
+        # MTP: the counts below k a plan may verify and draft (`Capabilities.draft_counts`; default every one)
+        self.draft_counts = tuple(sorted({int(c) for c in (range(1, mtp_k) if draft_counts is None else draft_counts)
+                                          if 1 <= int(c) < mtp_k}))
+        # ... and on plans with explicit rows too (`Capabilities.mixed_draft_counts`; False: those draft k)
+        self.mixed_draft_counts = bool(mixed_draft_counts and self.draft_counts)
         self.accept_p = accept_p
         self.grid = checkpoint_grid  # tests use a small grid to checkpoint short prompts
         self.has_state = state_slot_bytes > 0  # attention-only models resume from KV alone
@@ -314,7 +340,8 @@ class FakeRunner(FakeChecks, Runner):
                                   bidirectional_images=bidirectional_images, draft_kv=draft_kv,
                                   precise_rows=precise_rows, forward_end=sample_ms > 0,
                                   sample_step_ms=float(sample_ms), batch_invariant=batch_invariant,
-                                  logprobs=logprobs, penalties=penalties)
+                                  logprobs=logprobs, penalties=penalties, draft_counts=self.draft_counts,
+                                  mixed_draft_counts=self.mixed_draft_counts)
         # Batch invariance on a GDN model (module docstring, Validation): every prefill cut a whole number of grids from
         # where the prompt's computation started, but at a SAMPLE row, a PRECISE row or one of `exact_cuts` (a
         # request's hints and image cuts, by seed; checked only when given)
@@ -340,7 +367,7 @@ class FakeRunner(FakeChecks, Runner):
         self.steps = 0
         self.configured = False
         self.counts = {"kv_copy": 0, "state_copy": 0, "ckpt": 0, "resumed": 0, "folds": 0, "drafts": 0, "encoded": 0,
-                       "accepted": 0, "masked": 0, "masks": 0, "kind_switch": 0}
+                       "accepted": 0, "masked": 0, "masks": 0, "kind_switch": 0, "mixed_counts": 0}
 
     def capabilities(self) -> Capabilities:
         return self._caps
@@ -389,6 +416,7 @@ class FakeRunner(FakeChecks, Runner):
         self.lp_slot = np.zeros(s, bool)  # ADMIT_LOGPROBS: the request asks for logprobs (LOGPROBS rows allowed)
         self.anchor = np.zeros(s, np.int64)  # prefill grid start (`aligned`): the hit, an exact cut, a PRECISE end
         self.drafts = np.zeros((s, max(1, self.k)), np.int64)  # MTP: the drafts each slot's next decode row verifies
+        self.drafts_n = np.zeros(s, np.int64)  # ... how many its last SAMPLE row made (0 since its ADMIT)
         self._masks = np.zeros((max(1, pools.max_num_seqs * (1 + self.k)), (self.vocab + 31) // 32), np.int32)
         self.next_img = np.full((s, 2), -1, np.int64)  # the previous chunk's look-ahead: (key, index), or (-1, -1)
         self.last_img = np.full((s, 2), -1, np.int64)  # (key, index) of the slot's last explicit token, (-1, -1): text
@@ -482,6 +510,7 @@ class FakeRunner(FakeChecks, Runner):
             self.admitted[slot] = self.sampled[slot] = False
             self.pending[slot] = -1
             self.fold_n[slot] = 0
+            self.drafts_n[slot] = 0
             self.rec_tok[slot] = []
         admitted_now: set[int] = set()
         for i, slot in enumerate(plan.admit_slot.tolist()):
@@ -509,6 +538,7 @@ class FakeRunner(FakeChecks, Runner):
             self.stop[slot] = frozenset(int(t) for t in plan.admit_stop[i].tolist() if t >= 0) if self.k else \
                 frozenset()
             self.fold_n[slot] = 0
+            self.drafts_n[slot] = 0
             self.rec_tok[slot] = []
             self.resumed[slot] = h > 0
             self.next_tok[slot] = -1
@@ -657,13 +687,13 @@ class FakeRunner(FakeChecks, Runner):
         return t
 
     def _mtp_decode(self, slot: int, read_bad: bool, masks: list[np.ndarray] | None,
-                    lp: list | None = None) -> tuple[list[int], int]:
+                    lp: list | None = None, v: int | None = None) -> tuple[list[int], int]:
         """One MTP decode row of `slot` from its live state (already folded to its seq_len S): the target's samples
         at S + 1 .. S + 1 + a and the row's status (NONFINITE: the bonus, the last, is non-finite; MASK_EMPTY: its
         mask allowed nothing). Drafts are accepted while they equal the (masked) samples, within the commit limits
-        and before a non-finite sample. `masks` (MASKED rows): 1 + k bool masks along [pending, drafts]. `lp`
-        (LOGPROBS rows): each sample's `fake_logprobs` appended."""
-        seed, S, k = int(self.seed[slot]), int(self.seq_len[slot]), self.k
+        and before a non-finite sample. `masks` (MASKED rows): 1 + v bool masks along [pending, drafts] (v: the drafts
+        the plan verifies, default k). `lp` (LOGPROBS rows): each sample's `fake_logprobs` appended."""
+        seed, S, k = int(self.seed[slot]), int(self.seq_len[slot]), self.k if v is None else v
         ss = int(self.state_slot[slot])
         if read_bad or self.fp_bad[ss]:
             return [0], NONFINITE  # NaNs everywhere: nothing accepted, the bonus is non-finite
@@ -693,10 +723,10 @@ class FakeRunner(FakeChecks, Runner):
             ctx = context_hash((t,), ctx)
         return out, 0
 
-    def _draft(self, slot: int, ctx: int) -> None:
-        """The k drafts of `slot`'s next decode row, after its pending token (at the device seq_len S; `ctx`: the
-        fingerprint through it): the unmasked chain of the target's samples, with the one after the accepted count drawn
-        from (seed, S) made wrong (module docstring)."""
+    def _draft(self, slot: int, ctx: int, d: int | None = None) -> None:
+        """The d drafts (default k) of `slot`'s next decode row, after its pending token (at the device seq_len S;
+        `ctx`: the fingerprint through it): the unmasked chain of the target's samples, with the one after the accepted
+        count drawn from (seed, S) made wrong (module docstring), whatever d is; −1 past them."""
         seed, S, k = int(self.seed[slot]), int(self.seq_len[slot]), self.k
         h = splitmix64((seed ^ (S * 0x9E3779B97F4A7C15) ^ 0x5BD1E995) & MASK64)
         drawn = 0
@@ -707,12 +737,15 @@ class FakeRunner(FakeChecks, Runner):
                 break
             drawn += 1
         mix = rope_mix(int(self.rope_off[slot]))
-        for j in range(k):
+        d = k if d is None else d
+        for j in range(d):
             t = self._sample(seed, S + 1 + j, ctx, mix)
             if j == drawn:
                 t = (t + 1) % self.vocab
             self.drafts[slot, j] = t
             ctx = context_hash((t,), ctx)
+        self.drafts[slot, d:] = -1
+        self.drafts_n[slot] = d
 
     # -- Runner API -----------------------------------------------------------------------------------------------
 
@@ -729,11 +762,14 @@ class FakeRunner(FakeChecks, Runner):
         h.bad = np.zeros(n, bool)
         h.mtp = np.zeros(n, bool)
         dev = plan.sched_tok_off < 0
-        # Masks: one per sample a MASKED row draws (1 + k for an MTP decode row), in plan order (runner.base).
+        # Masks: one per sample a MASKED row draws (1 + v for an MTP decode row), in plan order (runner.base).
+        h.v = int(plan.sched_n_draft[dev][0]) if self.k and dev.any() else self.k  # drafts verified (sched.plan)
+        h.d = plan.draft_n or self.k  # drafts made
+        self.counts["mixed_counts"] += bool(plan.draft_n and not dev.all())  # with explicit rows (mixed_draft_counts)
         h.masked = (plan.sched_flags & MASKED) != 0
         h.lpf = (plan.sched_flags & LOGPROBS) != 0
         if h.masked.any():
-            per = np.where(h.masked, np.where(dev & (self.k > 0), 1 + self.k, 1), 0)
+            per = np.where(h.masked, np.where(dev & (self.k > 0), 1 + h.v, 1), 0)
             h.mask_off, h.n_masks = np.cumsum(per) - per, int(per.sum())
         else:
             h.mask_off, h.n_masks = np.zeros(n, np.int64), 0
@@ -855,7 +891,7 @@ class FakeRunner(FakeChecks, Runner):
         n_out = np.zeros(n, np.int32)
         status = np.zeros(n, np.uint32)
         if n:
-            k, vocab = self.k, self.vocab
+            k, vocab, v = self.k, self.vocab, handle.v
             masked, off = handle.masked, handle.mask_off
             if masked.any():
                 self.counts["masked"] += int(masked.sum())
@@ -876,20 +912,20 @@ class FakeRunner(FakeChecks, Runner):
                 if rb or self.fp_bad[self.state_slot[slot]]:
                     self.poison_read.add(int(self.seed[slot]))
                 toks, st = self._mtp_decode(slot, rb or bool(bad[i]),
-                                            [mask(i, j) for j in range(1 + k)] if masked[i] else None,
-                                            lp_vals.setdefault(i, []) if lpf[i] else None)
+                                            [mask(i, j) for j in range(1 + v)] if masked[i] else None,
+                                            lp_vals.setdefault(i, []) if lpf[i] else None, v)
                 a = len(toks) - 1
                 committed = [int(self.pending[slot]), *toks[:a]]
                 if self.strict:
-                    self._check_kv(handle.plan, slot, p0, 1 + k, np.asarray(committed, np.int64), k - a)
+                    self._check_kv(handle.plan, slot, p0, 1 + v, np.asarray(committed, np.int64), v - a)
                     if st & NONFINITE:
-                        self._poison_kv(slot, p0, 1 + k)
+                        self._poison_kv(slot, p0, 1 + v)
                 bad[i] = st & NONFINITE
                 status[i] = st
                 self.rec_tok[slot] = committed
                 self.rec_bad[slot] = bool(st & NONFINITE)
                 self.fold_n[slot] = 1 + a
-                self.counts["drafts"] += k
+                self.counts["drafts"] += v
                 self.counts["accepted"] += a
                 after[i] = p0 + len(toks)
                 tokens[i, :len(toks)] = toks
@@ -924,12 +960,13 @@ class FakeRunner(FakeChecks, Runner):
             if k:  # every SAMPLE row drafts for its slot's next step (after its pending token)
                 for i in sampling:
                     slot = int(slots[i])
-                    if status[i]:
+                    if status[i]:  # a failed row drafts nothing; the next plan, built before its result, may verify
+                        self.drafts_n[slot] = handle.d  # what it holds: its request's later results are dropped
                         continue
                     c = int(self.fp_hash[self.state_slot[slot]])
                     if mtp[i]:  # the live state lags this row's commit (window records)
                         c = context_hash(self.rec_tok[slot], c)
-                    self._draft(slot, context_hash((int(self.pending[slot]),), c))
+                    self._draft(slot, context_hash((int(self.pending[slot]),), c), handle.d)
                     drafts[i] = self.drafts[slot]
             if status.any():
                 failed = status != 0
@@ -992,7 +1029,8 @@ def load_model(seconds: float) -> None:
 
 
 def make_fake_runner(model_dir: str | Path, opts: Any, mtp_k: int = 0, encoder_rows: int = 0,
-                     encoder_budget: int = 0, logprobs: bool = True, penalties: bool = True) -> FakeRunner:
+                     encoder_budget: int = 0, logprobs: bool = True, penalties: bool = True,
+                     draft_counts: Iterable[int] | None = None) -> FakeRunner:
     """Build from the model's config.json (geometry), `dev.runner.fake` options, the MTP depth, (images) the encoder
     cache's rows and the encoder's budget, and whether it takes LOGPROBS rows and penalties."""
     if opts.load_s:
@@ -1013,4 +1051,4 @@ def make_fake_runner(model_dir: str | Path, opts: Any, mtp_k: int = 0, encoder_r
                       bidirectional_images=bool(geo.get("bidirectional_images")) and encoder_rows > 0,
                       draft_kv=not geo.get("window"),  # Gemma 4's drafter (its assistant) writes no KV
                       precise_rows=opts.precise_rows, batch_invariant=opts.batch_invariant, logprobs=logprobs,
-                      penalties=penalties)
+                      penalties=penalties, draft_counts=draft_counts)

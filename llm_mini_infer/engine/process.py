@@ -77,7 +77,7 @@ def build_runner(cfg: Config) -> Runner:
         return make_fake_runner(cfg.model.path, cfg.dev.runner.fake, cfg.speculative.num_speculative_tokens or 0,
                                 encoder_rows=(im.encoder_cache_tokens or 0) if on else 0,
                                 encoder_budget=(im.encoder_budget or 0) if on else 0, logprobs=cfg.server.logprobs,
-                                penalties=cfg.server.penalties)
+                                penalties=cfg.server.penalties, draft_counts=cfg.draft_counts)
     from ..runner.cuda import make_cuda_runner
 
     return make_cuda_runner(cfg)
@@ -214,6 +214,8 @@ class EngineLoop:
                            spec_drafts=s.spec_drafts, spec_draft_tokens=s.spec_draft_tokens,
                            spec_accepted=s.spec_accepted,
                            spec_accepted_per_pos=[int(x) for x in s.spec_accepted_per_pos] if s.k else [],
+                           spec_verified_per_pos=[int(x) for x in s.spec_verified_per_pos] if s.k else [],
+                           spec_steps_by_count=[int(x) for x in s.steps_by_count] if s.k else [],
                            attention_replans=a.replans, attention_plans_kept=a.kept, attention_plans_unsplit=a.unsplit,
                            vision_plan_waits=a.vision_waits,
                            grammar_head_sparse=h.sparse, grammar_head_dense_off=h.dense_off,
@@ -617,6 +619,11 @@ def engine_main(cfg: Config, ready: Connection, ipc_path: str, heartbeat: Any = 
                                "whole in a step (dev.cache.refine_chunk_tokens)",
                       "bf16": "every prefill row of a prompt without a cache hit has BF16 activations",
                       "fp8": "off"}[precise], precise_cost)
+        missing = sorted(set(cfg.draft_counts) - set(caps.draft_counts))
+        if missing:  # the runner captured fewer counts than the config asks for (`config._derive_draft_counts`)
+            have = sorted({caps.mtp_depth, *caps.draft_counts})
+            raise ValueError(f"draft counts {missing}: this runner verifies {have}")
+        dsp = cfg.dev.speculative
         sched = Scheduler(max_num_seqs=sc.max_num_seqs, max_num_batched_tokens=sc.max_num_batched_tokens,
                           max_model_len=max_model_len, page_size=page_size, num_pages=cc.num_pages,
                           num_state_slots=cc.num_state_slots, eos_token_ids=cfg.eos_token_ids, policy=sc.policy,
@@ -639,7 +646,9 @@ def engine_main(cfg: Config, ready: Connection, ipc_path: str, heartbeat: Any = 
                           eos_free_finish=bool(cfg.dev.structured_output.eos_free_finish),
                           batch_invariant=caps.batch_invariant, logprobs=caps.logprobs,
                           penalties_vocab=caps.vocab_size if caps.penalties else 0,
-                          compile_timeout_s=cfg.dev.structured_output.compile_timeout_s)
+                          compile_timeout_s=cfg.dev.structured_output.compile_timeout_s,
+                          draft_counts=tuple(dsp.adaptive_counts or ()) if dsp.adaptive else (),
+                          count_schedule=tuple(dsp.count_schedule or ()), mixed_draft_counts=caps.mixed_draft_counts)
         if grammars is not None:  # the scheduler refuses the EOS-free finish where it cannot keep its outputs
             so = cfg.dev.structured_output
             log.info("structured output: the forced prefix %s, the EOS-free finish %s (dev.structured_output."

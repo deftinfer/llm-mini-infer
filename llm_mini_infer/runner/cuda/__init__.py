@@ -48,7 +48,8 @@ def make_cuda_runner(cfg: Config) -> Runner:
                                (o.prefill_split_from, PREFILL_KEYS) if o.prefill_split_from else None),
                            window_split_keys=SPLIT_KEYS if inv else 0, head_fixed_m=inv, encode_per_image=inv,
                            batch_invariant=inv, sync_check=o.sync_check, memory_history=o.memory_history,
-                           logprobs=cfg.server.logprobs, penalties=cfg.server.penalties)
+                           logprobs=cfg.server.logprobs, penalties=cfg.server.penalties,
+                           draft_counts=tuple(cfg.draft_counts))
     from ...kernels.attn_window import FULL_PREFILL_KEYS
 
     return CudaRunner(cfg.model.path, device=o.device, dtype=dtype, attention=o.attention, gdn=o.gdn,

@@ -537,9 +537,11 @@ def mtp_verify(s: _Static, tb: Any, r_slot: torch.Tensor, rp: int, cr: int, st: 
                k: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """MTP verification (architecture.md, "Speculative decoding") in both CUDA runners' step bodies (graph-safe). The
     target's samples of the step's sample tokens are `s.y[:st]` (statuses `s.y_st`). A verify row (kind _VERIFY) is
-    the window [pending, k drafts]: its drafts are accepted while each equals the target's sample at its position, is
-    no stop token, keeps the bonus below the slot's `max_len` and the sample there has status 0 (finite, mask not
-    empty). The bonus (the target's sample after the `a` accepted drafts) becomes pending, and seq_len += 1 + a.
+    the window [pending, v drafts], v = its `r_nq` − 1, at most `k` (the widest window the body was built for: the
+    step's count in a decode graph, the runner's k otherwise): its drafts are accepted while each equals the target's
+    sample at its position, is no stop token, keeps the bonus below the slot's `max_len` and the sample there has
+    status 0 (finite, mask not empty). The bonus (the target's sample after the `a` accepted drafts) becomes pending,
+    and seq_len += 1 + a.
     Explicit rows advance by n_query; a SAMPLE row's sample becomes pending. Writes each sample row's outputs (tokens
     [cr, 1 + k], n_out, status) and, with penalties, counts the committed samples (`penalties.commit_mtp`); returns
     per row (a, verify rows, rows that sampled)."""
@@ -550,16 +552,17 @@ def mtp_verify(s: _Static, tb: Any, r_slot: torch.Tensor, rp: int, cr: int, st: 
     ver = (kind == _VERIFY) & (r_slot > 0)
     cur = tb.seq_len.index_select(0, r_slot)
     lim = tb.max_len.index_select(0, r_slot)
-    ok = (tb.drafts.index_select(0, r_slot) == yw[:, :k]) & \
+    ok = (tb.drafts.index_select(0, r_slot)[:, :k] == yw[:, :k]) & \
         ~(tb.stop.index_select(0, r_slot)[:, :, None] == yw[:, None, :k]).any(1) & \
-        (cur[:, None] + 2 + ar[None, :k] <= lim[:, None] - 1) & (nw[:, :k] == 0)
+        (cur[:, None] + 2 + ar[None, :k] <= lim[:, None] - 1) & (nw[:, :k] == 0) & \
+        (ar[None, :k] < (s.r_nq[:rp] - 1)[:, None])  # a row narrower than k verifies its own drafts only
     a = ok.long().cumprod(1).sum(1) * ver
     bonus = yw.gather(1, a[:, None])[:, 0]
     bst = nw.gather(1, a[:, None])[:, 0]
     sampled = kind > _NO_SAMPLE
     c_row = s.c_row[:cr]
     n_out = torch.where(ver, 1 + a, sampled.long())
-    s.out_tok[:cr] = yw[c_row]
+    s.out_tok[:cr, :1 + k] = yw[c_row]
     s.out_n[:cr] = n_out[c_row]
     s.out_st[:cr] = bst[c_row]
     adv = torch.where(ver, 1 + a, s.r_nq[:rp]) * (r_slot > 0)

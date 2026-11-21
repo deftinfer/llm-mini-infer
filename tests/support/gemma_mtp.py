@@ -20,12 +20,18 @@ W = 8
 class Run:
     """The scheduler (window mode) and the engine loop over a GemmaRunner (`make`: CPU by default), with an optional
     oracle drafter. A runner with images (its `vision` option) gets the scheduler's encoder cache and image spans;
-    `forced_prefix`: the scheduler's (with `grammars`), and its batch invariance the runner's."""
+    `forced_prefix`: the scheduler's (with `grammars`), and its batch invariance the runner's. `draft_counts`: the
+    runner's counts below k; `count_schedule` cycles counts over the plans with decode rows, `adaptive` lets the
+    scheduler's policy choose among them (`sched.draft_counts`)."""
 
     def __init__(self, pair, k: int, *, caching: bool = True, max_num_seqs: int = 4, budget: int = 64,
                  num_pages: int = 512, interval: int = 8, grammars=None, make=gemma_cpu_runner, window: int = W,
-                 wps: int = 4, forced_prefix: bool = False, max_model_len: int = 256, **runner_kw):
+                 wps: int = 4, forced_prefix: bool = False, max_model_len: int = 256,
+                 draft_counts: tuple[int, ...] = (), count_schedule: tuple[int, ...] = (), adaptive: bool = False,
+                 **runner_kw):
         target, assistant = pair
+        if draft_counts:
+            runner_kw["draft_counts"] = draft_counts
         pc = gemma_pools(max_num_seqs=max_num_seqs, budget=budget, page_size=wps, num_pages=num_pages,
                          max_model_len=max_model_len, mtp_k=k)
         self.r = make(target, pc, mtp_k=k, assistant=assistant if k else None, **runner_kw)
@@ -39,7 +45,9 @@ class Run:
                                eos_token_ids=(EOS,), mtp_k=k, prefix_caching=caching, checkpoint_grid=wps,
                                decode_checkpoint_interval=interval, window=window, window_page_size=wps,
                                draft_kv=caps.draft_kv, grammars=grammars, forced_prefix=forced_prefix,
-                               batch_invariant=caps.batch_invariant, **mm)
+                               batch_invariant=caps.batch_invariant, count_schedule=count_schedule,
+                               draft_counts=caps.draft_counts if adaptive else (),
+                               mixed_draft_counts=caps.mixed_draft_counts, **mm)
         self.core = EngineCore(self.sched, self.r)
         self.out: dict[int, list[int]] = {}
         self.finish: dict[int, int] = {}
@@ -56,6 +64,29 @@ class Run:
                                     temperature=temperature, top_p=top_p, top_k=top_k, min_p=0.0,
                                     seed=seed or 100 + rid, stop_token_ids=list(stop), ignore_eos=ignore_eos,
                                     grammar=grammar, images=list(images)))
+
+    def check_drafts(self) -> Run:
+        """Check every step's drafts against its plan's count (`StepPlan.draft_n`): each SAMPLE row's d drafts (k on a
+        raise, and on a plan with explicit rows unless `Capabilities.mixed_draft_counts`), −1 past them;
+        `drafts_checked` counts the rows checked at each d, `mixed_drafts` the plans with explicit rows at each d."""
+        process, k = self.sched.process, self.k
+        self.drafts_checked: dict[int, int] = {}
+        self.mixed_drafts: dict[int, int] = {}
+
+        def checked(inf, tokens, n_out, gpu_busy_ns, status=None, drafts=None, *a, **kw):
+            if k and drafts is not None:
+                rows = (self.sched.aid[inf.slots] == inf.aids) & inf.sample
+                if status is not None:
+                    rows &= np.asarray(status) == 0
+                dr, d = np.asarray(drafts)[rows], self.sched._d(inf)
+                assert (dr[:, :d] >= 0).all() and (dr[:, d:] == -1).all(), (inf.step_id, d, dr.tolist())
+                self.drafts_checked[d] = self.drafts_checked.get(d, 0) + int(rows.sum())
+                if not inf.device.all():
+                    self.mixed_drafts[d] = self.mixed_drafts.get(d, 0) + 1
+            return process(inf, tokens, n_out, gpu_busy_ns, status, drafts, *a, **kw)
+
+        self.sched.process = checked
+        return self
 
     def run(self, oracle: dict[int, list[int]] | None = None, rng: np.random.Generator | None = None) -> Run:
         n = 0
@@ -106,11 +137,12 @@ def counters(s: Scheduler, k: int, masked: bool = False) -> np.ndarray:
     """A run's acceptance counters add up: every verify row counts its k drafts (with a grammar, only those it takes:
     `Scheduler.spec_draft_tokens`), the accepted ones are a prefix of them (the count per position does not grow with
     the position, the first at most the rows) and sum to the accepted total. Returns the counts per position."""
-    per = s.spec_accepted_per_pos
+    per, offered = s.spec_accepted_per_pos, s.spec_verified_per_pos
     assert len(per) == k and s.spec_drafts > 0
     assert 0 <= s.spec_accepted <= s.spec_draft_tokens <= s.spec_drafts * k
     if not masked:
-        assert s.spec_draft_tokens == s.spec_drafts * k
+        assert s.spec_draft_tokens == int(offered.sum())  # k each, or the count the plan verified
     assert int(per.sum()) == s.spec_accepted
     assert (np.diff(per) <= 0).all() and per[0] <= s.spec_drafts, per
+    assert (per <= offered).all() and (np.diff(offered) <= 0).all() and offered[0] == s.spec_drafts, offered
     return per

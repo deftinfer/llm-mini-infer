@@ -116,8 +116,9 @@ class FakeChecks:
         ps = self.ps
         live = self.state_slot[slots]
         fl, nql, seql, p0l, devl = flags.tolist(), nq.tolist(), seq.tolist(), plan.sched_pos0.tolist(), dev.tolist()
-        if plan.sched_n_draft.tolist() != [k if d else 0 for d in devl]:
-            self._fail(plan, f"n_draft must be {k} on device-input rows and 0 on explicit ones")
+        v, d = self._check_counts(plan, slots, dev)
+        if plan.sched_n_draft.tolist() != [v if x else 0 for x in devl]:
+            self._fail(plan, f"n_draft must be {v} on device-input rows and 0 on explicit ones")
         if k and any((t >= 0) != (not d and not f & SAMPLE) for t, d, f in zip(plan.sched_next_tok.tolist(), devl, fl)):
             self._fail(plan, "sched_next_tok must be set exactly on non-final explicit rows")
         if any(f & MASKED for f in fl):
@@ -141,8 +142,8 @@ class FakeChecks:
         for i in di:
             self.resumed[sl[i]] = False
         if di:
-            if any(p0l[i] != -1 or nql[i] != 1 + k for i in di):
-                self._fail(plan, f"device-input rows need pos0 = -1 and n_query = {1 + k}")
+            if any(p0l[i] != -1 or nql[i] != 1 + v for i in di):
+                self._fail(plan, f"device-input rows need pos0 = -1 and n_query = {1 + v}")
             if not all(self.sampled[sl[i]] for i in di):
                 ds = slots[dev]
                 self._fail(plan, f"device input before a SAMPLE step of the admission: {ds[~self.sampled[ds]]}")
@@ -150,7 +151,7 @@ class FakeChecks:
                 self._fail(plan, "STATE_ZERO on a device-input row")
             # The positions the row writes: the verify window and, under MTP, the drafter's chain after it (a drafter
             # without KV: the window alone); their pages, one slice of the row's page table
-            span = 1 if not k else 2 * k if self.draft_kv else 1 + k
+            span = 1 if not k else v + d if self.draft_kv else 1 + v
             if any((seql[i] + span - 1) // ps >= self.max_pages_per_seq for i in di):
                 self._fail(plan, "device-input positions beyond the page table")
             wpages = [self.rows[sl[i], seql[i] // ps:(seql[i] + span - 1) // ps + 1] for i in di]
@@ -200,8 +201,9 @@ class FakeChecks:
         dev = plan.sched_tok_off < 0
         ps = self.ps
         live = self.state_slot[slots]
-        if (plan.sched_n_draft != np.where(dev, k, 0)).any():
-            self._fail(plan, f"n_draft must be {k} on device-input rows and 0 on explicit ones")
+        v, d = self._check_counts(plan, slots, dev)
+        if (plan.sched_n_draft != np.where(dev, v, 0)).any():
+            self._fail(plan, f"n_draft must be {v} on device-input rows and 0 on explicit ones")
         if k and ((plan.sched_next_tok >= 0) != (~dev & ((flags & SAMPLE) == 0))).any():
             self._fail(plan, "sched_next_tok must be set exactly on non-final explicit rows")
         masked = (flags & MASKED) != 0
@@ -225,13 +227,13 @@ class FakeChecks:
         self.resumed[slots[dev]] = False
         if dev.any():
             ds = slots[dev]
-            if (plan.sched_pos0[dev] != -1).any() or (nq[dev] != 1 + k).any():
-                self._fail(plan, f"device-input rows need pos0 = -1 and n_query = {1 + k}")
+            if (plan.sched_pos0[dev] != -1).any() or (nq[dev] != 1 + v).any():
+                self._fail(plan, f"device-input rows need pos0 = -1 and n_query = {1 + v}")
             if not self.sampled[ds].all():
                 self._fail(plan, f"device input before a SAMPLE step of the admission: {ds[~self.sampled[ds]]}")
             if (flags[dev] & STATE_ZERO).any():
                 self._fail(plan, "STATE_ZERO on a device-input row")
-            span = 1 if not k else 2 * k if self.draft_kv else 1 + k
+            span = 1 if not k else v + d if self.draft_kv else 1 + v
             wpos = seq[dev][:, None] + np.arange(span)[None, :]
             if (wpos // ps >= self.max_pages_per_seq).any():
                 self._fail(plan, "device-input positions beyond the page table")
@@ -254,6 +256,31 @@ class FakeChecks:
                                  int(plan.sched_pos0[i]), int(seq[i]), int(flags[i]), int(live[i]), spans.get(i, []))
         self._check_ckpts(plan)
         return slots, pos0, nq, (flags & SAMPLE) != 0
+
+    def _check_counts(self, plan: StepPlan, slots: np.ndarray, dev: np.ndarray) -> tuple[int, int]:
+        """(v, d): the drafts the plan's device rows verify (one count) and those its SAMPLE rows make (`sched.plan`),
+        each k or one of `draft_counts` (on a plan with explicit rows, d below k only with `mixed_draft_counts`); v
+        never more than a row's slot holds (its last SAMPLE row's d)."""
+        k, counts = self.k, (self.k, *self.draft_counts)
+        d = plan.draft_n or k
+        if not k:
+            if plan.draft_n:
+                self._fail(plan, "draft_n without MTP")
+            return 0, 0
+        if d not in counts:
+            self._fail(plan, f"draft_n {d}: not a count this runner takes ({sorted(counts)})")
+        if plan.draft_n and not self.mixed_draft_counts and (plan.sched_tok_off >= 0).any():
+            self._fail(plan, f"draft_n {d} on a plan with explicit rows (they draft k)")
+        if not dev.any():
+            return k, d
+        vs = np.unique(plan.sched_n_draft[dev])
+        if len(vs) != 1 or int(vs[0]) not in counts:
+            self._fail(plan, f"device-input rows verify {vs.tolist()} drafts: one count of {sorted(counts)}")
+        v = int(vs[0])
+        held = self.drafts_n[slots[dev]]
+        if (held < v).any():
+            self._fail(plan, f"device-input rows verify {v} drafts; their slots hold {held.tolist()}")
+        return v, d
 
     def _check_spans(self, plan: StepPlan, dev: np.ndarray, pos0: np.ndarray,
                      nq: np.ndarray) -> dict[int, list[tuple[int, int]]]:
@@ -284,8 +311,8 @@ class FakeChecks:
             self._fail(plan, f"slot {slot}: token out of vocabulary")
         if not self.rows[slot, p0 // ps:(p0 + q - 1) // ps + 1].all():
             self._fail(plan, f"slot {slot}: positions [{p0}, {p0 + q}) not covered by pages")
-        # A SAMPLE row's drafter chain (MTP, a drafter with KV) writes k − 1 positions past the row, and reads them
-        chain = self.k - 1 if self.k and self.draft_kv and flags & SAMPLE else 0
+        # A SAMPLE row's drafter chain (MTP, a drafter with KV) writes d − 1 positions past the row, and reads them
+        chain = (plan.draft_n or self.k) - 1 if self.k and self.draft_kv and flags & SAMPLE else 0
         if chain:
             cp = self.rows[slot, (p0 + q) // ps:(p0 + q + chain - 1) // ps + 1]
             if not cp.all():

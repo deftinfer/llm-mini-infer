@@ -171,6 +171,8 @@ class EngineStats(_Msg):
     spec_draft_tokens: int = 0
     spec_accepted: int = 0
     spec_accepted_per_pos: list[int] = []
+    spec_verified_per_pos: list[int] = []  # verify rows whose window held each draft position (all at a fixed k)
+    spec_steps_by_count: list[int] = []  # plans of decode rows by the drafts they verified (index: the count)
     # FlashInfer's attention-plan counters (`runner.base.AttentionCounters`)
     attention_replans: int = 0
     attention_plans_kept: int = 0
