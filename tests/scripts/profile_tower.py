@@ -8,10 +8,12 @@ The image is a synthetic 1280 x 720 JPEG (`image_jpeg`), sized by the checkpoint
 pixels, patch grid (1, 36, 66), 2376 patches, 264 soft tokens, the 2439 bucket. It goes
 through the server's path, `ImageEncoder.encode` as the runner calls it: the uint8 pixels uploaded from pinned staging,
 patchified on the device, the tower replayed from the `VisionGraphs` graph of the smallest bucket that holds the call
-(the family's buckets at the budget and the encoder budget, as `runner.cuda.images.family_buckets` derives them; an
-image in another bucket is recorded), its 27 attention calls FlashInfer's ragged kernel as eager breaks, and the soft
-tokens written to the encoder pool. Only the image's bucket is captured (`--all-buckets`: every one, as the runner
-does). `--eager` compares the same call without graphs (every kernel launched by itself).
+(the family's buckets at the budget and the encoder budget, as `runner.cuda.images.family_buckets` derives them
+without one call per image; an image in another bucket is recorded), its 27 attention calls FlashInfer's ragged kernel
+as eager breaks, and the soft tokens written to the encoder pool. Only the image's bucket is captured
+(`--all-buckets`: every one, as the runner does with batch invariance off; with it on, the runner's list ends at the
+largest image's bucket, and every image takes the same bucket in both lists). `--eager` compares the same call without
+graphs (every kernel launched by itself).
 
 - `--mode torch`: per path, `--warmup` calls, then `--calls` calls timed with CUDA events (synchronized after each:
   the device time's median, p10 and p90, and the wall time), with NVML's power and SM clock; then `--calls` calls

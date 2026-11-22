@@ -122,3 +122,70 @@ def test_gemma_buckets_follow_max_soft_tokens() -> None:
     assert buckets(70) == at70
     assert sorted(set(buckets(280)) - set(at70)) == [2178, 2304, 2439] and set(at70) <= set(buckets(280))
     assert next(b for b in at70 if b >= 594) == 648
+
+
+# Gemma 4's buckets with one tower call per image, by images.max_soft_tokens: (the top bucket, their count), the same at
+# every encoder budget
+PER_IMAGE_BUCKETS = {70: (648, 4), 140: (1287, 9), 280: (2565, 19), 560: (5121, 19), 1120: (10116, 22)}
+
+
+def test_gemma_buckets_with_one_call_per_image_end_at_the_largest_image() -> None:
+    """With one tower call per image (batch invariance), Gemma 4's buckets end at the first that holds its largest
+    image (9 x max_soft_tokens patches, the most `aspect_ratio_size` gives): at each soft-token budget the same list
+    at every encoder budget from 2,048 to 32,768 tokens, the start of the whole list, so every image up to the largest
+    (each multiple of a soft token's 9 patches) takes the bucket it takes in the whole list, and always one. Without
+    one call per image, and for Qwen3.8 (no soft-token budget), the list is the whole one."""
+    from llm_mini_infer.runner.cuda.images import family_buckets
+    from llm_mini_infer.vision.gemma import SOFT_TOKENS, GemmaVision
+    from llm_mini_infer.vision.qwen import QwenVision
+
+    def pick(buckets: list[int], n: int) -> int | None:
+        return next((b for b in buckets if b >= n), None)
+
+    assert sorted(PER_IMAGE_BUCKETS) == sorted(SOFT_TOKENS)
+    for k in SOFT_TOKENS:
+        fam = GemmaVision(boi_id=255999, image_id=258880, eoi_id=258882, max_soft_tokens=k)
+        top, count = PER_IMAGE_BUCKETS[k]
+        for budget in [*range(2048, 32769, 2048), 3435, 7168, 10240, 12288]:
+            whole, ours = family_buckets(fam, 3, budget), family_buckets(fam, 3, budget, per_image=True)
+            assert (ours[-1], len(ours)) == (top, count) and ours == whole[:count], (k, budget)
+            assert all(pick(ours, n) == pick(whole, n) is not None for n in range(9, 9 * k + 1, 9)), (k, budget)
+    qwen = QwenVision(start_id=0, pad_id=0, end_id=0, patch=16, merge=2, temporal=2, min_pixels=65536,
+                      max_pixels=16777216, mean=(0.5,) * 3, std=(0.5,) * 3, rescale=1 / 255, mrope=True)
+    for budget in (2048, 16384, 32768):
+        assert family_buckets(qwen, 2, budget, per_image=True) == family_buckets(qwen, 2, budget)
+
+
+def test_synthetic_images_fit_the_position_table() -> None:
+    """The memory profile's synthetic images (`synthetic_grid`) at every encoder budget's B - 2 tokens up to 65,534
+    stay within Gemma 4's 10,240-entry position table: the most square divisor pair where it fits (every token kept),
+    else isqrt(t) rows (fewer than isqrt(t) tokens dropped). The divisor pair alone overruns the table at many counts
+    from 3,433 on (a prime count's strip, 3 x 10,299 patches; at a 16,384-token budget 6 x 24,573)."""
+    import math
+
+    from llm_mini_infer.runner.cuda.images import synthetic_grid
+
+    assert synthetic_grid(16382, 3) == (6, 24573) and synthetic_grid(16382, 3, 10240) == (381, 384)
+    assert synthetic_grid(3432, 3, 10240) == synthetic_grid(3432, 3) and synthetic_grid(3433, 3) == (3, 10299)
+    for t in range(280, 65535):
+        h, w = synthetic_grid(t, 3, 10240)
+        tokens = h * w // 9
+        assert h % 3 == w % 3 == 0 and max(h, w) <= 10240 and 0 <= t - tokens < math.isqrt(t), t
+        pair = synthetic_grid(t, 3)
+        if max(pair) <= 10240:
+            assert (h, w) == pair, t
+        if t % 97 == 0:  # the pair: the largest divisor up to the square root
+            a = max(d for d in range(1, math.isqrt(t) + 1) if t % d == 0)
+            assert pair == (3 * a, 3 * (t // a)), t
+
+
+def test_the_profile_encodes_a_budget_of_the_largest_images() -> None:
+    """The memory profile's image step (`profile_images`): as many images of max_soft_tokens as the step's image tokens
+    hold, then one of the rest; one image of them all below that, or without a soft-token budget (Qwen3.8)."""
+    from llm_mini_infer.runner.cuda.images import profile_images
+
+    assert profile_images(2046, 280) == [280] * 7 + [86]
+    assert profile_images(32766, 70) == [70] * 468 + [6]
+    assert profile_images(560, 280) == [280, 280]
+    assert profile_images(198, 280) == [198]
+    assert profile_images(2046, None) == [2046]

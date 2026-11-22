@@ -491,6 +491,46 @@ def test_the_patch_offsets_are_the_grids_patch_counts(tiny_mm, monkeypatch) -> N
     assert meta.cu.dtype == torch.int32 and meta.cu.device.type == "cpu" and meta.cu.tolist() == meta.cu_host
 
 
+def test_a_grid_past_the_position_table_is_refused_by_name(tiny_mm) -> None:
+    """The tiny tower's position table has 256 entries a side: a grid with a longer side (the memory profile's old
+    synthetic images of 89 and 254 soft tokens, 3 x 267 and 6 x 381 patches) is refused by name before the tower runs,
+    where it indexed past the table (an IndexError on a CPU, a device-side assert on CUDA). The profile's images of
+    those counts (`ImageEncoder.synthetic`) now fit, a few tokens fewer, and run."""
+    from llm_mini_infer.runner.cuda.images import ImageEncoder, VisionOptions
+
+    cpu = torch.device("cpu")
+    enc = ImageEncoder(tiny_mm, VisionOptions(encoder_rows=512, encoder_budget=256, max_soft_tokens=70), cpu,
+                       torch.float32)
+    enc.allocate(enc.cfg.out_hidden, flashinfer=False)
+    v = enc.vision
+    assert v.cfg.pos_size == v.cfg.max_grid == 256
+    assert v.meta([(1, 255, 3), (1, 3, 255)], cpu).n == 2 * 765
+    for _, h, w in ((1, 3, 267), (1, 6, 381), (1, 258, 3)):
+        with pytest.raises(ValueError, match=rf"a patch grid of {h} x {w} is past the position table \(256 entries\)"):
+            enc._tower(torch.zeros(h * w, v.cfg.patch_dim), [(1, 3, 3), (1, h, w)], graphs=False)
+    for t, grid, tokens in ((89, (1, 27, 27), 81), (254, (1, 45, 48), 240), (70, (1, 21, 30), 70)):
+        g, hw, n = enc.synthetic(t)
+        assert (g, n) == (grid, tokens) and hw == (g[1] * 4, g[2] * 4)
+        px = torch.from_numpy(enc._px_internal[:3 * hw[0] * hw[1]].copy()).view(3, *hw)
+        with torch.inference_mode():
+            out = enc._tower(v.patches(px), [g], graphs=False)
+        assert out.shape == (n, enc.cfg.out_hidden) and bool(torch.isfinite(out).all())
+
+
+def test_every_image_fits_the_31bs_position_table() -> None:
+    """At each of the five soft-token budgets the most elongated image `aspect_ratio_size` gives (a strip one soft
+    token high, pooling x max_soft_tokens patches long) stays within the position table of google/gemma-4-31B-it
+    (config.json's `position_embedding_size`): the tower's check never refuses a request's image."""
+    vc = json.loads((DATA / "gemma-4-31b-it.config.json").read_text())["vision_config"]
+    table, patch, k = vc["position_embedding_size"], vc["patch_size"], vc["pooling_kernel_size"]
+    assert (table, patch, k) == (10240, 16, 3)
+    shapes = [(1, 10**6), (10**6, 1), (9, 16), (1080, 1920), (3, 100_000), (100_000, 7)]
+    shapes += [(1, w) for w in range(1, 5000, 7)] + [(h, 1) for h in range(1, 5000, 11)]
+    for n in SOFT_TOKENS:
+        longest = max(max(aspect_ratio_size(h, w, patch, n * k * k, k)) // patch for h, w in shapes)
+        assert longest == k * n <= table, n
+
+
 @pytest.mark.parametrize("name", ["model.vision_tower.patch_embedder.input_proj.weight_scale",
                                   "model.embed_vision.embedding_post_projection_norm.weight",
                                   "vision_tower.std_bias"])

@@ -97,7 +97,7 @@ from .draft_head import DraftHead, special_token_ids, structural_token_ids
 from .fp8 import Fp8Runtime
 from .graphs import BreakableCapture, graph_name, graph_names, graph_summary, no_gc, parse_graph_name, warm_libraries
 from .heads import NO_HEADS, VARIANT_HEADS, GrammarSampling, Heads
-from .images import ImageEncoder, VisionOptions
+from .images import ImageEncoder, VisionOptions, profile_images
 from .logprobs import CHUNK as LP_CHUNK
 from .logprobs import LogprobsPass
 from .penalties import PenaltyTables, apply_admit, apply_explicit, stage_explicit
@@ -469,8 +469,8 @@ class GemmaRunner(Runner):
         self.bidi = self.mm and cfg.bidirectional == "vision"
         self.img: ImageEncoder | None = None
         if self.mm:
-            self.img = ImageEncoder(self.model_dir, vision, self.device, self.dtype, buckets=vision_buckets)
-            self.img.per_image = encode_per_image
+            self.img = ImageEncoder(self.model_dir, vision, self.device, self.dtype, buckets=vision_buckets,
+                                    per_image=encode_per_image)
             self.stats.update(vision_load_s=self.img.load_s, vision_weight_bytes=self.img.weight_bytes)
             log.info(self.img.describe(self.use_graphs))
         self.copy_stream = torch.cuda.Stream(self.device) if self.cuda else None
@@ -556,7 +556,8 @@ class GemmaRunner(Runner):
 
     @torch.inference_mode()
     def _profile(self) -> tuple[int, int, int]:
-        """Tiny pools, the CUDA graphs and representative steps: (activation peak, persistent bytes, graph pool)."""
+        """Tiny pools, the CUDA graphs and representative steps (with images first a step's budget of them, as
+        `profile_images` sizes them): (activation peak, persistent bytes, graph pool)."""
         gc.collect()
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
@@ -596,10 +597,15 @@ class GemmaRunner(Runner):
             t0 = time.perf_counter()
         torch.cuda.reset_peak_memory_stats(self.device)
         builder = self._builder()
-        if self.mm:  # the encoder at its budget (one image of that many tokens) and a row reading it
-            self._run([lambda: self._image_plan(builder, 1, slot=1, image_tokens=min(self.img.budget, b - 2),
-                                                pages_from=1)])
+        if self.mm:  # the encoder at its budget, in images of the largest size serving takes (`profile_images`: one
+            # tower call each with batch invariance, all of them in one without, as serving encodes them), and a row
+            # reading them
+            t1 = time.perf_counter()
+            images = profile_images(min(self.img.budget, b - 2), self.img.max_soft_tokens)
+            self._run([lambda: self._image_plan(builder, 1, slot=1, images=images, pages_from=1)])
             self._reset_tables()
+            torch.cuda.synchronize()
+            self.stats["profile_image_s"] = round(time.perf_counter() - t1, 2)
         drows = min(rows, b // self.L)
         pr = self.fp8.precise  # PRECISE rows possible (the precise prefix): their BF16 activations are the peak
         self._run([lambda: self._synthetic(builder, 1, full, pages_from=1, precise=pr),
@@ -917,7 +923,7 @@ class GemmaRunner(Runner):
             def image_step() -> StepPlan:
                 free = np.flatnonzero(~self.mirror.admitted[1:]) + 1
                 slot = int(free[0]) if len(free) else 1
-                return self._image_plan(b, 6, slot=slot, image_tokens=img, free=[] if len(free) else [1],
+                return self._image_plan(b, 6, slot=slot, images=[img], free=[] if len(free) else [1],
                                         pages_from=pc.num_pages - self._pages_of(img + 6))
             plans.append(image_step)
         graphs, self.use_graphs = self.use_graphs, False
@@ -927,14 +933,16 @@ class GemmaRunner(Runner):
             self.use_graphs = graphs
         self._reset_tables()
 
-    def _image_plan(self, b: PlanBuilder, step: int, *, slot: int, image_tokens: int, pages_from: int,
+    def _image_plan(self, b: PlanBuilder, step: int, *, slot: int, images: list[int], pages_from: int,
                     free: list[int] = ()) -> StepPlan:
-        """A plan admitting a prompt of one text token, one synthetic image of `image_tokens` tokens (its pixels from
-        `ImageEncoder.synthetic`) and one text token, with its ENCODE and, on a bidirectional model, its span
-        (profile and warm-up); full pages then window pages consecutive from `pages_from` (`_pages_of(image_tokens +
-        6)` of them: the prompt and room for two decode steps)."""
-        grid, hw = self.img.synthetic(image_tokens)
-        n = image_tokens + 2
+        """A plan admitting a prompt of one text token, synthetic images of `images` tokens back to back (their pixels
+        from `ImageEncoder.synthetic`, which may give an image a few tokens fewer) and one text token, with an ENCODE
+        of each (keys from 1 << 62, encoder rows consecutive) and, on a bidirectional model, its span (profile and
+        warm-up); full pages then window pages consecutive from `pages_from` (`_pages_of(n + 4)` of them, n the
+        prompt's tokens: the prompt and room for two decode steps)."""
+        shapes = [self.img.synthetic(t) for t in images]
+        total = sum(t for _, _, t in shapes)
+        n = total + 2
         b.begin()
         for s_ in free:
             b.add_free(s_)
@@ -942,13 +950,19 @@ class GemmaRunner(Runner):
         nf, nw = -(-(n + 4) // self.fps), -(-(n + 4) // self.ps)
         b.add_pages(slot, 0, list(range(pages_from, pages_from + nf)))
         b.add_wpages(slot, 0, list(range(pages_from + nf, pages_from + nf + nw)))
-        rows = np.arange(image_tokens, dtype=np.int64) % self.img.rows
-        b.add_encode(1 << 62, image_tokens, grid, hw, 0, rows)
+        rows = np.arange(total, dtype=np.int64) % self.img.rows
+        r0 = 0
+        for i, (grid, hw, t) in enumerate(shapes):
+            b.add_encode((1 << 62) + i, t, grid, hw, 0, rows[r0:r0 + t])
+            r0 += t
         emb = np.full(n, -1, np.int32)
-        emb[1:1 + image_tokens] = rows
+        emb[1:1 + total] = rows
         b.add_explicit_row(slot, self._synthetic_tokens(slot, n), 0, STATE_ZERO | SAMPLE, emb=emb)
         if self.bidi:
-            b.add_span(0, 1, 1 + image_tokens)
+            r0 = 1
+            for _, _, t in shapes:
+                b.add_span(0, r0, r0 + t)
+                r0 += t
         return b.finish(step)
 
     def _pages_of(self, n: int) -> int:

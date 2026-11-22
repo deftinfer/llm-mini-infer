@@ -75,8 +75,10 @@ def eager_tower_snapshot(img: Any, path: str, free_after_startup: int) -> dict[s
     """One tower call of the largest bucket's patches (`img`: a runner's `ImageEncoder`), eagerly, under CUDA memory
     history; the snapshot dumped to `path`. Returns its figures (also logged)."""
     dev = img.device
-    tokens = img.budget  # the largest bucket holds the step's budget of image tokens (`images.family_buckets`)
-    (_, gh, gw), _ = img.synthetic(tokens)
+    # the largest call (`images.family_buckets`): the largest image with one tower call per image (Gemma 4's
+    # max_soft_tokens), else the step's budget of image tokens in one call
+    tokens = min(img.budget, img.max_soft_tokens) if img.per_image and img.max_soft_tokens else img.budget
+    (_, gh, gw), _, tokens = img.synthetic(tokens)
     p = img.cfg.patch
     nbytes = 3 * gh * p * gw * p
     torch.cuda.synchronize(dev)

@@ -175,3 +175,109 @@ def test_images_with_mtp_match_transformers(tiny, tmp_path) -> None:
         if oracle:
             assert eng.sched.spec_accepted > eng.sched.spec_draft_tokens // 2
     assert outs[0] == refs and outs[1] == refs and outs[2] == refs
+
+
+def _fake(budget: int, pc):
+    from llm_mini_infer.runner.fake import FakeRunner
+
+    fake = FakeRunner(vocab_size=512, max_positions=pc.max_model_len, encoder_rows=2 * budget, encoder_budget=budget,
+                      window=W, window_kv_bytes_per_token=1024, bidirectional_images=True, strict=True, step_ms=0,
+                      sample_ms=0, spin_us=0)
+    fake.configure(pc)
+    return fake
+
+
+@pytest.mark.parametrize("budget,soft", [(32768, 70), (2048, 280), (300, 280), (200, 280), (4096, 1120)])
+def test_the_profile_image_plan_holds_a_budget_of_the_largest_images(tiny, budget, soft) -> None:
+    """The memory profile's image step (`GemmaRunner._image_plan` of `profile_images`): one prompt of the step's
+    budget whose B - 2 soft tokens are images of max_soft_tokens back to back and one of the rest (468 of 70 and one of
+    6 at 32,768), each with its ENCODE (keys from 1 << 62, encoder rows consecutive), its span and a grid within the
+    tiny tower's 256-entry position table (the 734 tokens left at 4,096 and 1,120 are a prime strip's: 729 of them),
+    on the pages of the prompt and two decode steps. The strict fake runner takes it, and refuses it without spans."""
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from llm_mini_infer.runner.base import PlanError, PoolConfig
+    from llm_mini_infer.runner.cuda.gemma import GemmaRunner
+    from llm_mini_infer.runner.cuda.images import ImageEncoder, VisionOptions, profile_images, synthetic_grid
+    from llm_mini_infer.sched.plan import PlanBuilder
+
+    ps, fps = 4, 16
+    img = ImageEncoder(tiny, VisionOptions(encoder_rows=2 * budget, encoder_budget=budget, max_soft_tokens=soft),
+                       torch.device("cpu"), torch.float32, per_image=True)
+    r = SimpleNamespace(fps=fps, ps=ps, img=img, bidi=True, cfg=SimpleNamespace(vocab_size=512))
+    for name in ("_image_plan", "_synthetic_tokens"):
+        setattr(r, name, getattr(GemmaRunner, name).__get__(r))
+    images = profile_images(budget - 2, soft)
+    want = [h * w // 9 for h, w in (synthetic_grid(t, 3, 256) for t in images)]
+    assert want == images or (budget, soft, images[-1], want[-1]) == (4096, 1120, 734, 729)
+    n = sum(want) + 2
+    nf, nw = -(-(n + 4) // fps), -(-(n + 4) // ps)
+    pc = PoolConfig(page_size=fps, num_pages=nf + nw + 2, num_state_slots=5, max_num_seqs=4,
+                    max_num_batched_tokens=budget, max_model_len=budget + 64, eos_token_ids=(), mtp_k=0,
+                    window_page_size=ps)
+
+    def plan_of():
+        return r._image_plan(PlanBuilder(4, budget, fps, pc.max_model_len, 0, W, ps), 1, slot=1, images=images,
+                             pages_from=1)
+
+    plan = plan_of()
+    starts = np.cumsum([0, *want])
+    assert len(plan.tokens) == n and plan.enc_tokens.tolist() == want
+    assert plan.enc_key.tolist() == [(1 << 62) + i for i in range(len(want))]
+    assert plan.enc_rows.tolist() == list(range(n - 2)) and plan.enc_row0.tolist() == starts[:-1].tolist()
+    assert plan.tok_emb.tolist() == [-1, *range(n - 2), -1]
+    assert plan.span_sched.tolist() == [0] * len(want)
+    assert plan.span_start.tolist() == (1 + starts[:-1]).tolist()
+    assert plan.span_end.tolist() == (1 + starts[1:]).tolist()
+    assert [h * w for _, h, w in plan.enc_grid.tolist()] == [9 * t for t in want]
+    assert int(plan.enc_grid[:, 1:].max()) <= 256 and (plan.enc_pixels == 0).all()
+    assert plan.page_id.tolist() == list(range(1, 1 + nf))
+    assert plan.wpage_id.tolist() == list(range(1 + nf, 1 + nf + nw))
+    fake = _fake(budget, pc)
+    h = fake.launch_forward(plan)
+    fake.launch_sample(h)
+    fake.wait(h)
+    r.bidi = False
+    with pytest.raises(PlanError, match="SPANS"):
+        _fake(budget, pc).launch_forward(plan_of())
+
+
+def test_the_runner_stages_and_encodes_469_images_in_a_step(tiny) -> None:
+    """The profile's image step at the smallest soft-token budget (70: the most images a step holds) and a
+    32,768-token budget (468 images of 70 and one of 6) through
+    the CPU runner's host side as `launch_forward` runs it, short of the forward (32,768 tokens through the full
+    layers' reference attention would take minutes): its ENCODE and spans fit the step's staging, and with one tower
+    call per image (the tower's buckets then end at its largest image's, 648 patches) every image's rows are written,
+    each 70-token image's those of the first (the same pixels)."""
+    from llm_mini_infer.runner.cuda.gemma import GemmaRunner
+    from llm_mini_infer.runner.cuda.images import VisionOptions, profile_images
+
+    from ..support.tiny_gemma import gemma_pools
+
+    budget = 32768
+    pc = gemma_pools(max_num_seqs=4, budget=budget, page_size=4, num_pages=budget // 2 + 64,
+                     max_model_len=budget + 64)
+    r = GemmaRunner(tiny, device="cpu", dtype=torch.float32, max_num_seqs=4, max_num_batched_tokens=budget,
+                    max_model_len=pc.max_model_len, check=True, encode_per_image=True,
+                    vision=VisionOptions(encoder_rows=2 * budget, encoder_budget=budget, max_soft_tokens=70))
+    assert r.img.per_image and r.img.buckets == [261, 387, 513, 648]
+    r.configure(pc)
+    images = profile_images(budget - 2, 70)
+    plan = r._image_plan(r._builder(), 1, slot=1, images=images, pages_from=1)
+    assert len(plan.enc_key) == len(plan.span_sched) == 469
+    with torch.inference_mode():
+        st = r._staging[0]
+        st.reset()
+        r._stage_effects(plan, st)
+        enc = r.img.stage(plan, st, True)
+        lay = r._layout(plan, st)
+        kind, size = r._mode(lay, False)
+        r._stage_static(lay, st, size, kind)
+        st.upload(r.static)
+        r.img.pool.zero_()
+        r.img.encode(plan, st, enc, False)
+    rows = r.img.pool[:budget - 2]
+    assert len(lay.spans[0]) == 469 and bool((rows.abs().sum(1) > 0).all())
+    assert all(torch.equal(rows[70 * i:70 * (i + 1)], rows[:70]) for i in range(1, 468))

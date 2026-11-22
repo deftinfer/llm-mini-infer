@@ -38,6 +38,36 @@ def logits_of(eng: Engine, rid: int, n: int) -> torch.Tensor:
     return torch.stack([eng.logits[(rid, p)] for p in range(n)]).float()
 
 
+@pytest.mark.parametrize("per_image", [True, False], ids=["per-image", "one-call"])
+def test_the_memory_profile_encodes_images_within_the_position_table(tiny, per_image) -> None:
+    """The startup memory profile with images and CUDA graphs at a 91-token budget, in a fresh process (a device-side
+    assert ends its CUDA context): its image step encodes an image of 70 soft tokens (the tiny tower's largest) and
+    one of 19 (`images.profile_images`), where it encoded one of 89, a prime count, whose 3 x 267-patch strip indexed
+    past the tiny tower's 256-entry position table (a device-side assert at startup). With one tower call per image
+    (batch invariance's; the image spans on our window kernel) the tower's graphs end at its largest image's bucket,
+    with one call for the step's images (the spans on FlashInfer's second pass) at the budget's."""
+    import os
+    import subprocess
+    import sys
+
+    code = ("from llm_mini_infer.runner.cuda.gemma import GemmaRunner\n"
+            "from llm_mini_infer.runner.cuda.images import VisionOptions\n"
+            f"r = GemmaRunner({str(tiny)!r}, device='cuda', max_num_seqs=4, max_num_batched_tokens=91, "
+            f"max_model_len=512, memory_utilization=0.5, graphs=True, encode_per_image={per_image}, "
+            f"window_split_keys={16 if per_image else 0}, "
+            "vision=VisionOptions(encoder_rows=192, encoder_budget=91, max_soft_tokens=70))\n"
+            "plans, plan = [], r._image_plan\n"
+            "r._image_plan = lambda *a, **kw: plans.append(kw['images']) or plan(*a, **kw)\n"
+            "caps = r.capabilities()\n"
+            "assert caps.memory_free_bytes > 0 and r.stats['graph_pool_bytes'] > 0\n"
+            "print('images', plans, 'vision graphs', r.stats['graphs']['vision'])\n")
+    env = {k: v for k, v in os.environ.items() if k not in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN")}
+    res = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env, timeout=600)
+    want = [261, 387, 513, 648] if per_image else [261, 387, 513, 648, 819]
+    assert res.returncode == 0 and f"images [[70, 19]] vision graphs {want}" in res.stdout, \
+        res.stdout[-1000:] + res.stderr[-3000:]
+
+
 def test_bf16_image_prompt_is_within_the_reference_paths_noise(tiny, tmp_path) -> None:
     """Our kernels in BF16 (chunks cut around both spans: a budget of 96) against transformers in fp32: as close as
     the torch reference path in BF16 (the same runner, torch attention and ops), and much closer to the bidirectional
