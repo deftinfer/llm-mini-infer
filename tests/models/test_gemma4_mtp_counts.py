@@ -37,13 +37,47 @@ def exercised(r: Run, schedule: tuple[int, ...]) -> None:
     assert r.drafts_checked.get(K) and any(r.drafts_checked.get(d) for d in range(1, K)), r.drafts_checked
 
 
-def run(pair, k: int, reqs: list[dict], oracle=None, rng=None, **kw) -> Run:
+def run(pair, k: int, reqs: list[dict], oracle=None, rng=None, masks=None, **kw) -> Run:
     r = Run(pair, k, **kw)
     if k:
         r.check_drafts()
+    if masks is not None:
+        recount_masks(r, masks)
     for q in reqs:
         r.add(**q)
     return r.run(oracle, rng)
+
+
+def recount_masks(r: Run, seen: dict[str, int]) -> None:
+    """The verify-mask counters recounted from each step's plan and results (`Scheduler.process` wrapped), apart from
+    the scheduler's window tables: `seen["read"]`, the masks verification read (one a sample: `n_out` on each live
+    MASKED verify row); `seen["lowered"]`, such rows at a count below k; `seen["rejected"]`, their first rejected
+    drafts (among the v the step verified, one that differs from the target's sample there), from the drafts the
+    slot's last SAMPLE row made. No row samples more than its step's 1 + v."""
+    s, process = r.sched, r.sched.process
+    made: dict[int, np.ndarray] = {}
+    seen.update(read=0, lowered=0, rejected=0)
+
+    def counted(inf, tokens, n_out, gpu_busy_ns, status=None, drafts=None, *a, **kw):
+        v = r.k if inf.v < 0 else inf.v
+        live = s.aid[inf.slots] == inf.aids
+        masked = np.zeros(len(inf.slots), bool)
+        if inf.masked is not None:
+            masked[inf.masked] = True
+        toks, n = np.asarray(tokens), np.asarray(n_out)
+        for i in np.flatnonzero(live & inf.device & masked).tolist():
+            assert n[i] <= 1 + v, (v, int(n[i]))
+            acc, d = int(n[i]) - 1, made.get(int(inf.slots[i]))
+            seen["read"] += acc + 1
+            seen["lowered"] += v < r.k
+            seen["rejected"] += acc < v and d is not None and d[acc] != toks[i, acc]
+        out = process(inf, tokens, n_out, gpu_busy_ns, status, drafts, *a, **kw)
+        if drafts is not None:
+            for i in np.flatnonzero(live & inf.sample).tolist():
+                made[int(inf.slots[i])] = np.asarray(drafts)[i].copy()
+        return out
+
+    s.process = counted
 
 
 def greedy(max_tokens: int = 18, **extra) -> list[dict]:
@@ -107,15 +141,38 @@ def test_masked_outputs_equal_under_a_schedule_of_counts(pair, params) -> None:
                  ignore_eos=False, grammar=q.get("grammar", "")) for q in reqs]
     outs = []
     for k, schedule in ((0, ()), (K, (1, 3)), (K, (5, 2, 1)), (K, (2,))):
-        grammar = FakeGrammar(512, (EOS,))
-        r = run(pair, k, reqs, grammars=Grammars(grammar), caching=False,
+        grammar, seen = FakeGrammar(512, (EOS,)), {}
+        r = run(pair, k, reqs, masks=seen, grammars=Grammars(grammar), caching=False,
                 draft_counts=COUNTS if k else (), count_schedule=schedule)
-        assert r.sched.grammars.errors == 0
-        if k:
+        s = r.sched
+        assert s.grammars.errors == 0
+        if k:  # the counters count what each step verified at its count (`Scheduler._rejections`)
             exercised(r, schedule)
+            assert seen["lowered"] and seen["rejected"] and s.window_masks_sum > 0, seen
+            assert (s.window_masks.sum(), s.first_rejections.sum()) == (seen["read"], seen["rejected"]), seen
         outs.append((r.out, r.finish))
     assert all(o == outs[0] for o in outs[1:])
     assert outs[0][1][0] == FinishReason.STOP and outs[0][0][0][-1] == EOS
+
+
+@pytest.mark.parametrize("given, k_list, lists", [
+    (None, [1, 2, 4, 8], {1: [1, 2, 4, 8, 16], 2: [1, 2, 4, 8, 16], 3: [1, 2, 4, 8, 12]}),
+    ([1, 2, 4, 8], [1, 2, 4, 8], {1: [1, 2, 4, 8, 16], 2: [1, 2, 4, 8, 16], 3: [1, 2, 4, 8, 12]}),
+    ([1, 2, 4, 8, 32], [1, 2, 4, 8], {1: [1, 2, 4, 8, 16], 2: [1, 2, 4, 8, 16], 3: [1, 2, 4, 8, 12]}),
+    ([1, 2, 4], [1, 2, 4], {1: [1, 2, 4], 2: [1, 2, 4], 3: [1, 2, 4]}),
+    ([32, 64], [], {1: [], 2: [], 3: []}),
+])
+def test_decode_buckets_are_cut_at_each_counts_rows(pair, given, k_list, lists) -> None:
+    """A given decode_buckets list is cut at each width's rows (budget // (1 + v), at most max_num_seqs); one that
+    reaches k's rows gets each count's own rows appended where it stops short of them; one that stops below k's rows
+    is kept as given; no list: each width's defaults."""
+    from ..support.tiny_gemma import gemma_cpu_runner, gemma_pools
+
+    target, assistant = pair
+    pc = gemma_pools(max_num_seqs=16, budget=48, mtp_k=K)  # rows: 8 at k, 16 at counts 1 and 2, 12 at 3
+    r = gemma_cpu_runner(target, pc, mtp_k=K, assistant=assistant, draft_counts=COUNTS, decode_buckets=given)
+    assert r.decode_buckets == k_list and r._dbuckets(K) == k_list
+    assert {v: r._dbuckets(v) for v in COUNTS} == lists
 
 
 def test_counts_change_across_a_preemption_and_a_readmission(pair) -> None:

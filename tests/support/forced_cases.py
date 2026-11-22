@@ -7,6 +7,7 @@ from collections import Counter
 from typing import Any
 
 import numpy as np
+from hypothesis import assume
 
 from llm_mini_infer.cache.pools import pages_for_one_request
 from llm_mini_infer.engine.messages import MASK_CLASSES, POPCOUNT_BUCKETS, FinishReason
@@ -215,7 +216,8 @@ class Probe:
 
 class MaskOracle:
     """The verify-mask counters recomputed from what the fake runner verified (`launch_sample` wrapped): for every MTP
-    verify row with masks, the drafts it verified, its 1 + k masks, its tokens and status. A row counts when its
+    verify row with masks, the v drafts it verified (k, or the step's draft count: `handle.v`), its 1 + v masks, its
+    tokens and status. A row counts when its
     request was the row's at `process` and no failure there took it (`_fail` wrapped), or when its request was
     preempted while it was in flight and still waits for it (a held sample, delivered unless its status says NONFINITE
     or an empty mask, which no row counts with): the masks it read are those
@@ -232,8 +234,11 @@ class MaskOracle:
         launch, process, fail = r.launch_sample, s.process, s._fail
 
         def launch_sample(handle: Any, n_masks: int = 0) -> None:
-            seen = [(i, r.drafts[slot].copy(), r._masks[handle.mask_off[i]:handle.mask_off[i] + 1 + r.k].copy())
+            v = int(handle.v)  # the drafts the step verifies, as the scheduler's `_v` (its masks: 1 + v a row)
+            seen = [(i, r.drafts[slot, :v].copy(), r._masks[handle.mask_off[i]:handle.mask_off[i] + 1 + v].copy())
                     for i, slot in enumerate(handle.rows[0].tolist()) if handle.mtp[i] and handle.masked[i]]
+            if seen and v < self.k:
+                event("verify rows with masks at a count below k")
             step = handle.step_id
             launch(handle, n_masks)
             res = handle.result
@@ -276,7 +281,7 @@ class MaskOracle:
                     p = int(unpack_mask(masks[j], self.vocab).sum())
                     hist[np.searchsorted(POPCOUNT_BUCKETS, p)] += 1
                     total += p if vocab_sum else int(np.bitwise_count(masks[j].view(np.uint32)).sum())
-                if acc < self.k and drafts[acc] != toks[acc]:
+                if acc < len(drafts) and drafts[acc] != toks[acc]:  # a draft verified and rejected
                     a = unpack_mask(masks[acc], self.vocab)
                     p = int(a.sum())
                     rej[(EOS_CLASS if a[EOS] else FORCED) if p == 1 else FREE if a.all() else CHOICE] += 1
@@ -428,6 +433,17 @@ def structured_window_workloads(draw):
 
 
 @st.composite
+def structured_window_count_workloads(draw):
+    """`structured_window_workloads` at k of 2 or more with a draft count per step (`mtp_workloads.with_counts`): the
+    forced prefix, the EOS-free finish and the verify-mask counters while the verified and drafted counts change."""
+    from .mtp_workloads import with_counts
+
+    w = draw(structured_window_workloads())
+    assume(w["mtp_k"] > 1)  # a count below k
+    return with_counts(draw, w)
+
+
+@st.composite
 def structured_hybrid_workloads(draw):
     """Qwen's shape with structured output: a hybrid GDN model, whose state checkpoints are CKPT records (on a grid of 8
     or 16 inside a chunk, or at its n_query: on a final chunk, at its prompt's end, only for a branch point that a
@@ -510,6 +526,17 @@ def structured_hybrid_workloads(draw):
                 forced_prefix=draw(st.integers(0, 2)) > 0, eos_free_finish=draw(st.integers(0, 2)) > 0,
                 **(dict(encoder_rows=draw(st.sampled_from([32, 48, 128])),
                         encoder_budget=draw(st.sampled_from([24, 32, 64]))) if mrope else {}))
+
+
+@st.composite
+def structured_hybrid_count_workloads(draw):
+    """`structured_hybrid_workloads` at k of 2 or 3 with a draft count per step (`mtp_workloads.with_counts`): Qwen's
+    shape, its drafter with KV, while the verified and drafted counts change."""
+    from .mtp_workloads import with_counts
+
+    w = draw(structured_hybrid_workloads())
+    assume(w["mtp_k"] > 1)  # a count below k
+    return with_counts(draw, w)
 
 
 def run_switches_workload(w: dict) -> Harness:

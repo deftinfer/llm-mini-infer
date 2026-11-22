@@ -369,7 +369,9 @@ class DevCudaConfig(_Group):
     # Our CUDA kernels and the FP8 GEMMs; false: their torch references (the sampler stays fused on CUDA), with no CUDA
     # graphs or PDL; Gemma 4 then needs `attention: torch` (its full attention is our kernel)
     fused_ops: bool = True
-    decode_buckets: list[int] | None = None  # batch sizes with a decode graph (default: default_decode_buckets)
+    # Batch sizes with a decode graph (default: default_decode_buckets), cut at each width's row limit; with draft
+    # counts (dev.speculative.adaptive) a count's limit is added when the list reaches k's and stops below it
+    decode_buckets: list[int] | None = None
     token_buckets: list[int] | None = None  # token counts with a breakable graph (default: default_token_buckets)
     vision_buckets: list[int] | None = None  # patch counts with a vision-tower graph ([]: eager; default: derived)
     fp8_gemm: Literal["auto", "cutlass", "sglang", "flashinfer", "torch"] = "auto"  # block-FP8 GEMMs (kernels.fp8)
@@ -399,7 +401,10 @@ class DevCudaConfig(_Group):
     batch_invariant: bool | None = None
     # With batch invariance, the full layers' prefill split (architecture.md, "Batch invariance"): a prefill query with
     # more keys than this splits them by a size from its position. Default: 8,192 (`kernels.attn512.PREFILL_FROM`); at
-    # model.max_model_len or more no query splits (for measurements). Qwen3.8: at least 2,048, its split's base
+    # model.max_model_len or more no query splits (for measurements). Gemma 4: a query takes its keys whole up to the
+    # larger of this and 16,384 (`kernels.attn512.PREFILL_KEYS`, the split size past it), so a value below 16,384
+    # changes nothing. Qwen3.8: the keys split in 2,048-key splits (`kernels.attn_window.FULL_PREFILL_KEYS`) from this
+    # value up, so at least 2,048. At most 2**31 - 1 (a 32-bit int in our kernels)
     prefill_split_from: int | None = None
 
 
@@ -1018,9 +1023,11 @@ def _derive_grammar_tokens(cfg: Config, reasons: dict[str, str]) -> None:
 
 
 # dev.runner.cuda.batch_invariant's longest default context on Qwen3.8 (Gemma 4: any): past it a long prompt's prefill
-# on our full-attention kernel (`kernels.attn_window.FullAttention`, 64-row tiles) falls more than 10% behind
-# FlashInfer's, so the default leaves the switch to be set
+# on our full-attention kernel (`kernels.attn_window.FullAttention`, 64-row tiles) is behind FlashInfer's (measured on
+# one RTX PRO 6000 Server Edition: a cold 32k prompt's prefill about 7% behind, a cold 128k one 12%; 65,536 not
+# measured), so the default leaves the switch to be set
 QWEN_INVARIANT_MAX_LEN = 32_768
+LONG_REASON = "off: model.max_model_len "  # the start of the reason for a length past it (`capped_invariance_note`)
 
 
 # Our kernels read and write BF16 (the Qwen runner's take any tensor they are given): fp32 on CUDA takes their torch
@@ -1053,6 +1060,9 @@ def _derive_kernels(cfg: Config, hf: dict[str, Any], reasons: dict[str, str]) ->
     if o.prefill_split_from is not None and (o.prefill_split_from < 1 or not o.batch_invariant):
         raise ValueError(f"dev.runner.cuda.prefill_split_from {o.prefill_split_from}: at least 1, with "
                          "dev.runner.cuda.batch_invariant on (the split is its kernels')")
+    if o.prefill_split_from is not None and o.prefill_split_from > 2**31 - 1:
+        raise ValueError(f"dev.runner.cuda.prefill_split_from {o.prefill_split_from}: at most {2**31 - 1:,} (our "
+                         "kernels take it as a 32-bit int)")
     if o.prefill_split_from is not None and not gemma:
         from .kernels.attn_window import FULL_PREFILL_KEYS
 
@@ -1074,9 +1084,9 @@ def _derive_batch_invariance(cfg: Config, hf: dict[str, Any], gemma: bool, reaso
     `DevCudaConfig`). Raises when it is set on and `_invariance_blocked` gives a reason."""
     o = cfg.dev.runner.cuda
     short = (cfg.model.max_model_len or 0) <= QWEN_INVARIANT_MAX_LEN
-    long = (f"off: model.max_model_len {cfg.model.max_model_len} is past {QWEN_INVARIANT_MAX_LEN:,}, where a long "
-            "prompt's prefill on our full-attention kernel falls more than 10% behind FlashInfer's; forced on, a "
-            "query's bits still depend on its position and keys alone; set it to take that")
+    long = (f"{LONG_REASON}{cfg.model.max_model_len} is past {QWEN_INVARIANT_MAX_LEN:,}, where a long prompt's "
+            "prefill on our full-attention kernel trails FlashInfer's (12% on a cold 128k prompt, 7% on a 32k one); "
+            "forced on, a query's bits still depend on its position and keys alone; set it to take that")
     from .sched.plan import CKPT_GRID
 
     # The Qwen runner cuts its prompts on the GDN prefill's 64-token grid too; its MTP layer writes KV of its own, so
@@ -1098,11 +1108,28 @@ def _derive_batch_invariance(cfg: Config, hf: dict[str, Any], gemma: bool, reaso
             "on: Qwen3.8 with a block-FP8 checkpoint; a row's attention, GDN prefill, in_proj_ba, sparse head and "
             "image bits do not depend on the rows beside it, and a prompt's chunks are cut on the GDN prefill's "
             "64-token grid (nor its FP8 projections': CUTLASS at every M)" if o.batch_invariant else
-            long if not short else
             "off: a BF16 checkpoint, whose projections run at the step's M (cuBLAS picks its kernel by M); set it for "
-            "the rest" if not fp8 else f"off: {cant}")
+            "the rest" if not fp8 else long if not short else f"off: {cant}")
     elif o.batch_invariant and cant:
         raise ValueError(f"dev.runner.cuda.batch_invariant: {cant}")
+
+
+def capped_invariance_note(cfg: Config, len_derived: bool) -> str:
+    """A warning, or "", for a Qwen3.8 whose derived model.max_model_len was capped (the runner's positions, the KV
+    pool: `engine.process.engine_main`) to QWEN_INVARIANT_MAX_LEN or less: batch invariance's default was decided on the
+    length before the cap."""
+    why = cfg.reasons.get("dev.runner.cuda.batch_invariant", "")
+    if (not len_derived or cfg.dev.runner.cuda.batch_invariant or not why.startswith(LONG_REASON)
+            or cfg.model.max_model_len > QWEN_INVARIANT_MAX_LEN):
+        return ""
+    from .sched.plan import CKPT_GRID
+
+    if _invariance_blocked(cfg, CKPT_GRID, draft_kv=True):
+        return ""
+    n = cfg.model.max_model_len
+    return (f"dev.runner.cuda.batch_invariant is off: its default was decided on the derived model.max_model_len, past "
+            f"{QWEN_INVARIANT_MAX_LEN:,}, before it was capped to {n:,}; setting model.max_model_len to {n:,} or "
+            "dev.runner.cuda.batch_invariant on turns it on")
 
 
 def _invariance_blocked(cfg: Config, grid: int, draft_kv: bool) -> str:

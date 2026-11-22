@@ -105,7 +105,7 @@ The benchmark's llm-mini-infer ran with the image's configuration file and `--se
 - Nothing about other GPUs, MoE models or tensor parallelism.
 - No ranking across hosts: where a row names two hosts, its cells come from different machines of the same type.
 - Not that reproducible answers are llm-mini-infer's alone: vLLM gives 500 of 500 on Gemma 4 with DeepGEMM off.
-- Not that invariance is free: on Gemma 4 chat it costs llm-mini-infer 4.2% of throughput on one host.
+- Not that invariance is free: on Gemma 4 chat it costs llm-mini-infer 4.2% of throughput on one host at a context of 8,184.
 - Not a throughput win on Gemma 4 chat at 64 in flight: 661 against 657 tokens/s is a tie.
 - Not that SGLang's deterministic mode reproduces Gemma 4's answers: it gives nearly every image one answer.
 - Not that llm-mini-infer's Qwen3.8 answers are always identical: 496 of 500 were.

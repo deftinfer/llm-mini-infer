@@ -1,6 +1,6 @@
 """Long fuzz campaigns in one command (see `tests/support/fuzzing.py`).
 
-    uv run python -m tests.scripts.fuzz_campaign                   # 22 suites × seeds 11, 22, 33, 44 × 20,000 workloads
+    uv run python -m tests.scripts.fuzz_campaign                   # 27 suites × seeds 11, 22, 33, 44 × 20,000 workloads
     uv run python -m tests.scripts.fuzz_campaign --examples 2000 --seeds 1 2 --suites cache_sched
     uv run python -m tests.scripts.fuzz_campaign --replay results/fuzz/<time>/failures/cache_sched-0123abcd4567.json
 
@@ -50,6 +50,9 @@ SUITES = {
     "logprobs": "tests/runner/test_logprobs.py::test_random_logprobs_workloads",
     "mtp_counts": "tests/sched/test_mtp_sched.py::test_random_mtp_count_workloads",
     "arena_mtp_counts": "tests/sched/test_window_mtp.py::test_random_arena_mtp_count_workloads",
+    "structured_window_counts": "tests/sched/test_forced_tokens.py::test_random_structured_window_count_workloads",
+    "structured_hybrid_counts": "tests/sched/test_forced_tokens.py::test_random_structured_hybrid_count_workloads",
+    "logprobs_counts": "tests/runner/test_logprobs.py::test_random_logprobs_count_workloads",
 }
 _STATS = re.compile(r"(\d+) passing(?: examples?)?, (\d+) failing(?: examples?)?,(?: and)? (\d+) invalid")
 

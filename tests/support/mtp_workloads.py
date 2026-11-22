@@ -70,12 +70,12 @@ def mtp_workloads(draw):
                 row_tokens=draw(st.sampled_from([0, 0, 1, 40, 160, 640])))
 
 
-def with_counts(draw, w: dict) -> dict:
-    """A workload with draft counts per step (`sched.draft_counts`): the policy over every count below k, or a schedule
-    of counts cycled over the plans with decode rows (lowering and raising, `Scheduler.held`); plans with explicit
-    rows drafting the count too, or k (`Capabilities.mixed_draft_counts`)."""
+def with_counts(draw, w: dict, adaptive: bool = True) -> dict:
+    """A workload with draft counts per step (`sched.draft_counts`): the policy over every count below k (unless not
+    `adaptive`), or a schedule of counts cycled over the plans with decode rows (lowering and raising,
+    `Scheduler.held`); plans with explicit rows drafting the count too, or k (`Capabilities.mixed_draft_counts`)."""
     k = w["mtp_k"]
-    if k > 1 and draw(st.booleans()):
+    if adaptive and k > 1 and draw(st.booleans()):
         w["adaptive"] = True
     else:
         w["count_schedule"] = draw(st.lists(st.integers(1, k), min_size=1, max_size=6))

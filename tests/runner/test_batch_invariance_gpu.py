@@ -170,6 +170,21 @@ def test_a_requests_bits_do_not_depend_on_the_draft_counts(runs) -> None:
         assert other.heads.sparse > 0
 
 
+def test_a_requests_bits_do_not_depend_on_the_draft_counts_past_the_split_sizes(runs) -> None:
+    """The draft counts' test at the long case's sizes (`LONG`: splits of 16 keys, 32 past 512, 64 past 1024; a
+    prefill query past 64 keys split by 16): request 0's answer under schedules of counts, alone and beside requests
+    1-3, has the bits of its run at a fixed k at every position both kept, past both size boundaries."""
+    alone = runs("long", False, **LONG)
+    for beside, schedule in ((False, (2, 1, 3)), (True, (1, 3, 2)), (True, (3, 1, 1, 2))):
+        other = runs("long", beside, draft_counts=(1, 2), count_schedule=schedule, **LONG)
+        common = same_states(alone, other, "long")
+        assert max(common) > 1024, schedule  # the answer passes both size boundaries
+        n, _, differ = logits_compared(alone, other, common)
+        assert n >= len(common) and not differ, \
+            f"{schedule}: {len(differ)} of {n} logits differ, the first at {differ[:1]}"
+        assert other.heads.sparse > 0
+
+
 def test_a_requests_bits_do_not_depend_on_the_requests_beside_it_past_the_split_sizes(runs) -> None:
     """The full layers' split sizes double with a query's position (16 keys, 32 past 512, 64 past 1024) and a prefill
     row splits the queries past 64 keys by 16: request 0's 600-token prompt (chunked by the budget, its queries past 64
@@ -211,9 +226,11 @@ def test_the_dense_heads_logits_beside_other_requests(runs) -> None:
         raise LogitsDiffer(f"{len(differ)} of {n} logits differ, the first at (position, token) {differ[0]}")
 
 
-@pytest.mark.parametrize("case", ["text", "image"])
+@pytest.mark.parametrize("case", ["text", "image", "long"])
 def test_the_alone_runs_bits_are_the_golden(runs, case, fp8_pair, mm_pair, refresh_golden) -> None:
-    alone = runs(case, False)
-    entry = golden.key(case, golden.gpu(), golden.weights_digest(fp8_pair if case == "text" else mm_pair))
+    """Request 0's alone run per case (the long one at `LONG`'s sizes, which its entry's name does not record: a change
+    to them changes its digest) against this GPU's entry for the case's weights."""
+    alone = runs(case, False, **(LONG if case == "long" else {}))
+    entry = golden.key(case, golden.gpu(), golden.weights_digest(mm_pair if case == "image" else fp8_pair))
     golden.check(GOLDEN, entry, golden.bits_digest(alone.hidden, alone.logits, alone.images), refresh=refresh_golden,
                  stack=golden.versions(), test="tests/runner/test_batch_invariance_gpu.py")

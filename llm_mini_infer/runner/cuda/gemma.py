@@ -273,6 +273,28 @@ class _GStaging(_Staging):
         self.n32 = self.h32.numpy()
 
 
+def attention_staging(slots: int, budget: int, heads: int, full_kv_heads: int, sliding_kv_heads: int, L: int,
+                      window: int, window_split_keys: int, span_tokens: int, mtp: bool) -> int:
+    """The int32 one step's attention plans stage at most (`_GStaging`'s n32): FlashInfer's plans and the rows;
+    attn512's items, orders and groups (`kernels.attn512`); our sliding kernel's tables (`window_split_keys`,
+    `kernels.attn_window`; 0: FlashInfer's); the image spans' FlashInfer plan (`span_tokens`: the step's tokens, 0
+    without images); the MTP drafter's FlashInfer plan and attn512's rows and items (at most 9/5 of a wave and a
+    margin)."""
+    from ...kernels.attn512 import Attn512
+    from ...kernels.attn_window import WindowAttention
+
+    n32 = 16 * slots + 64 + 8 * (slots + 1)
+    n32 += Attn512.staging_bound(slots, budget, heads // full_kv_heads, full_kv_heads)
+    if window_split_keys:
+        n32 += WindowAttention.staging_bound(slots, budget, heads // sliding_kv_heads, sliding_kv_heads, L, window,
+                                             window_split_keys)
+    if span_tokens:
+        n32 += 4 * (span_tokens + 2)
+    if mtp:
+        n32 += 8 * (slots + 1) + 4 * (slots + 4 * 1024)
+    return n32
+
+
 class GemmaRunner(Runner):
     def __init__(self, model_dir: str | Path, *, device: str = "cuda", dtype: torch.dtype | None = None,
                  attention: str = "auto", max_num_seqs: int = 64, max_num_batched_tokens: int = 2048,
@@ -338,7 +360,9 @@ class GemmaRunner(Runner):
         self.grammar = grammar
         self.always_split = always_split
         self.attn512_split_keys = attn512_split_keys
-        self.attn512_prefill = attn512_prefill
+        from ...kernels.attn512 import PREFILL_FROM, PREFILL_KEYS
+
+        self.attn512_prefill = attn512_prefill or (PREFILL_FROM, PREFILL_KEYS)
         self.window_split_keys = window_split_keys
         self.inv = batch_invariant
         self.max_model_len = min(max_model_len or cfg.max_position_embeddings, cfg.max_position_embeddings)
@@ -388,6 +412,8 @@ class GemmaRunner(Runner):
         for v in self.counts:
             r = min(max_num_seqs, max_num_batched_tokens // (1 + v))
             self._buckets_v[v] = sorted(b for b in (decode_buckets or default_decode_buckets(r)) if 0 < b <= r)
+            if decode_buckets and self.decode_buckets[-1:] == [rows] and self._buckets_v[v][-1] < r:
+                self._buckets_v[v].append(r)  # a given list that covers k's rows covers this count's (r of them)
         self.token_buckets = sorted(b for b in (token_buckets or default_token_buckets(max_num_batched_tokens))
                                     if 0 < b <= max_num_batched_tokens)
         t1 = time.perf_counter()
@@ -454,7 +480,8 @@ class GemmaRunner(Runner):
         self._allocated = False
         self._pool: Any = None
         # keyed (name, size, v, d): the drafts a decode graph's rows verify and those its SAMPLE rows make (the forward
-        # graphs of split steps at d = k: theirs do not depend on it); the break graphs at (k, k)
+        # graphs of split steps at d = k: theirs do not depend on it); the break graphs at v = k, d = k, and below k
+        # on the split steps' sampling graphs when counts mix (`mixed_counts`)
         self._graphs: dict[tuple[str, int, int, int], BreakableCapture] = {}
 
     # -- geometry and memory ---------------------------------------------------------------------------------
@@ -701,21 +728,10 @@ class GemmaRunner(Runner):
             cap_i += (STOP_W + 2) * slots + 8 * slots
         if self.logprobs:  # the LOGPROBS samples' indices
             cap_i += smax + LP_CHUNK
-        from ...kernels.attn512 import Attn512
-
-        n32 = 16 * slots + 64 + 8 * (slots + 1)  # FlashInfer plans; rows
-        n32 += Attn512.staging_bound(slots, pc.max_num_batched_tokens, cfg.num_heads // cfg.full_kv_heads,
-                                     cfg.full_kv_heads)  # attn512's items, orders and groups (`kernels.attn512`)
-        if self.window_split_keys and self.attn_kind == "flashinfer":  # our sliding kernel's tables
-            from ...kernels.attn_window import WindowAttention
-
-            n32 += WindowAttention.staging_bound(slots, pc.max_num_batched_tokens,
-                                                 cfg.num_heads // cfg.sliding_kv_heads, cfg.sliding_kv_heads, L,
-                                                 self.window, self.window_split_keys)
-        if self.mm:
-            n32 += 4 * (tmax + 2)  # the spans' FlashInfer plan
-        if self.k:  # the drafter's: a FlashInfer plan and attn512's rows and items (at most 9/5 of a wave and a margin)
-            n32 += 8 * (slots + 1) + 4 * (slots + 4 * 1024)
+        n32 = attention_staging(slots, pc.max_num_batched_tokens, cfg.num_heads, cfg.full_kv_heads,
+                                cfg.sliding_kv_heads, L, self.window,
+                                self.window_split_keys if self.attn_kind == "flashinfer" else 0,
+                                tmax if self.mm else 0, bool(self.k))
         cap_f, cap_b = 3 * slots, 0
         if self.penalties:  # the device tables (`runner.cuda.penalties`), and what a step stages for them
             self.tables.pen = PenaltyTables(slots, cfg.vocab_size, dev)
@@ -752,22 +768,21 @@ class GemmaRunner(Runner):
                                                         upper_bounds=bool(self.k))
                 workspace = self.attn_w.workspace
             self.stats.update(window_split_keys=self.window_split_keys)
-            from ...kernels.attn512 import PREFILL_FROM, PREFILL_KEYS
-
-            whole, pkeys = self.attn512_prefill or (PREFILL_FROM, PREFILL_KEYS)
+            whole, pkeys = self.attn512_prefill
             self.attn_f: Any = Attn512(self.pools, self.rotary, cfg.num_heads, cfg.full_kv_heads,
                                        cfg.full_rope_angles, dev, max_tokens=pc.max_num_batched_tokens,
                                        max_rows=pc.max_num_seqs, qo_per_row=L, split_keys=self.attn512_split_keys,
                                        max_kv=self.max_model_len + L, prefill_from=whole, prefill_keys=pkeys)
             self.stats.update(attn512_resident=self.attn_f.resident, attn512_split_keys=self.attn512_split_keys)
             # The other counts' decode graphs (`draft_counts`): their rows' 1 + v queries, each width's own plans
-            # (a decode bucket's tables are static), the k-wide instances' split partials shared
-            for v in self.counts if self.use_graphs else ():  # eager and break steps plan on the k-wide ones
+            # (a decode bucket's tables are static), the k-wide instances' split partials shared; graphs only, so no
+            # eager tables (eager and break steps plan on the k-wide ones)
+            for v in self.counts if self.use_graphs else ():
                 if self.window_split_keys:
                     aw: Any = WindowAttention(self.pools, cfg.num_heads, cfg.sliding_kv_heads, cfg.sliding_head_dim,
                                               dev, self.window, max_tokens=pc.max_num_batched_tokens,
                                               max_rows=pc.max_num_seqs, qo_per_row=1 + v,
-                                              split_keys=self.window_split_keys, share=self.attn_w)
+                                              split_keys=self.window_split_keys, share=self.attn_w, graph_only=True)
                 else:
                     aw = FlashInferWindowAttention(self.pools, cfg.num_heads, cfg.sliding_kv_heads,
                                                    cfg.sliding_head_dim, dt, dev, self.window,
@@ -776,7 +791,7 @@ class GemmaRunner(Runner):
                 af = Attn512(self.pools, self.rotary, cfg.num_heads, cfg.full_kv_heads, cfg.full_rope_angles, dev,
                              max_tokens=pc.max_num_batched_tokens, max_rows=pc.max_num_seqs, qo_per_row=1 + v,
                              split_keys=self.attn512_split_keys, max_kv=self.max_model_len + L, share=self.attn_f,
-                             prefill_from=whole, prefill_keys=pkeys)
+                             prefill_from=whole, prefill_keys=pkeys, graph_only=True)
                 self._attn_v[v] = (aw, af)
             log.info("attn512: %d CTAs resident at once (%d an SM)", self.attn_f.resident,
                      self.attn_f.resident // self.attn_f.sms)
@@ -1069,12 +1084,13 @@ class GemmaRunner(Runner):
                 self.img.capture(self._pool)
         torch.cuda.synchronize()
         self._reset_tables()
-        self.stats["graphs"] = graph_summary([key[:2] for key in self._graphs if key[2] == self.k],
+        self.stats["graphs"] = graph_summary([key[:2] for key in self._graphs if key[2] == key[3] == self.k],
                                              variants=self.gs.variants if self.grammar else [],
                                              vision=self.img.graph_buckets() if self.mm else [])
-        if self.counts:
+        if self.counts:  # the summary is k's (v = d = k); every graph by the drafts its rows verify, and all of them
             self.stats["graphs"]["counts"] = {v: sum(1 for key in self._graphs if key[2] == v)
                                               for v in (self.k, *self.counts)}
+            self.stats["graphs"]["total"] = len(self._graphs)
 
     def _capture_one(self, key: tuple[str, int, int, int], make: Callable[[], StepPlan]) -> None:
         self._reset_tables()

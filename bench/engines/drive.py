@@ -620,15 +620,15 @@ def long_loads(context: int) -> tuple[list[LoadSpec], list[str]]:
 
 
 def loads_for(ctx: Ctx, unit: Unit) -> list[LoadSpec]:
-    """The loads of a unit, in order, only those `--load` names when it names any (a named deviation). Raises
-    LookupError when A2 has no A1 rate to start from, or when `--load` names a load the unit does not have."""
+    """The loads of a unit, in order, only those `--load` names that it has when it names any (a named deviation).
+    Raises LookupError when A2 has no A1 rate to start from, or when the unit has none of the loads `--load` names."""
     loads = family_loads(ctx, unit)
     keep = getattr(ctx.args, "load", None) or []
-    missing = sorted(set(keep) - {spec.name for spec in loads})
-    if missing:
-        raise LookupError(f"--load {', '.join(missing)}: not among family {unit.family}'s loads here "
+    kept = [spec for spec in loads if spec.name in keep]
+    if keep and not kept:
+        raise LookupError(f"--load {', '.join(keep)}: none among family {unit.family}'s loads here "
                           f"({', '.join(spec.name for spec in loads) or 'none'})")
-    return [spec for spec in loads if spec.name in keep] if keep else loads
+    return kept if keep else loads
 
 
 def family_loads(ctx: Ctx, unit: Unit) -> list[LoadSpec]:
@@ -1204,7 +1204,8 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--meta-extra", default="{}", help="JSON merged into every manifest")
     ap.add_argument("--m-concurrency", type=int, default=48, help="family M: conversations in flight")
     ap.add_argument("--load", action="append", default=[], metavar="NAME",
-                    help="run only this load of the family (repeatable; a named deviation)")
+                    help="run only the named loads of the family (repeatable; a unit keeps those it has, one with none "
+                         "is left out; a named deviation)")
     ap.add_argument("--context", type=int, default=arms.CONTEXT, help="the context every arm serves (default: "
                     "%(default)s); family L's loads that do not fit it are skipped")
     ap.add_argument("--tokenizer", help="the clients' tokenizer: a folder or repo id (default: the model's repo id)")

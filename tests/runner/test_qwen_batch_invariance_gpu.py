@@ -219,10 +219,12 @@ def test_the_dense_heads_logits_beside_other_requests(runs) -> None:
         raise LogitsDiffer(f"{len(differ)} of {n} logits differ, the first at (position, token) {differ[0]}")
 
 
-@pytest.mark.parametrize("case", ["text", "image"])
+@pytest.mark.parametrize("case", ["text", "image", "long"])
 def test_the_alone_runs_bits_are_the_golden(runs, case, text_model, vl_model, refresh_golden) -> None:
-    alone = runs(case, "alone")
-    entry = golden.key(f"qwen-{case}", golden.gpu(), golden.weights_digest((text_model,) if case == "text" else
-                                                                             (vl_model,)))
+    """Request 0's alone run per case (the long one at `LONG`'s sizes, which its entry's name does not record: a change
+    to them changes its digest) against this GPU's entry for the case's weights."""
+    alone = runs(case, "alone", **(LONG if case == "long" else {}))
+    entry = golden.key(f"qwen-{case}", golden.gpu(), golden.weights_digest((vl_model,) if case == "image" else
+                                                                             (text_model,)))
     golden.check(GOLDEN, entry, golden.bits_digest(alone.hidden, alone.logits, alone.images), refresh=refresh_golden,
                  stack=golden.versions(), test="tests/runner/test_qwen_batch_invariance_gpu.py")

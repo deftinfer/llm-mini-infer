@@ -67,6 +67,8 @@ STRATEGIES = {
     "window_precise": ("precise_cases", "window_precise_workloads"), "nan": ("nan_cases", "nan_workloads"),
     "structured_window": ("forced_cases", "structured_window_workloads"),
     "structured_hybrid": ("forced_cases", "structured_hybrid_workloads"),
+    "structured_window_counts": ("forced_cases", "structured_window_count_workloads"),
+    "structured_hybrid_counts": ("forced_cases", "structured_hybrid_count_workloads"),
 }
 MODULES = {mod: importlib.import_module(f"tests.support.{mod}") for mod, _ in STRATEGIES.values()}
 # Faults (module docstring): of a running request's state; of a row the step checks next; of the plan

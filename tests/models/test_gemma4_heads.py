@@ -161,6 +161,21 @@ def test_the_factory_passes_a_set_attention_kind(pair) -> None:
         make_cuda_runner(cfg)
 
 
+@pytest.mark.parametrize("split_from", [None, 4096])
+def test_the_runner_takes_its_full_layers_prefill_split(pair, split_from) -> None:
+    """dev.runner.cuda.prefill_split_from, set, is the length from which the runner splits its full layers' prefill;
+    unset, the kernels' default (`attn512.PREFILL_FROM`), with their key count."""
+    from llm_mini_infer import config
+    from llm_mini_infer.kernels.attn512 import PREFILL_FROM, PREFILL_KEYS
+    from llm_mini_infer.runner.cuda import make_cuda_runner
+
+    over = {} if split_from is None else {"dev.runner.cuda.prefill_split_from": split_from}
+    cfg = config.derive(config.load(None, {"model.path": str(pair[0]), "runner.kind": "cuda",
+                                           "dev.runner.cuda.device": "cpu", **over}))
+    r = make_cuda_runner(cfg)
+    assert r.attn512_prefill == (PREFILL_FROM if split_from is None else split_from, PREFILL_KEYS)
+
+
 def test_the_factory_passes_the_batch_invariance_switch(pair, monkeypatch) -> None:
     """`make_cuda_runner` on Gemma 4 with the switch derived on: the runner gets its parts and the switch itself, which
     it reports, so the scheduler's final chunks take their forced prefix whole (`Scheduler.forced_whole`); off, none.

@@ -15,6 +15,22 @@
    "torch": "2.14.1+cu130"
   }
  },
+ "long/sm_120-188sm/c7e6cbcaae8f0e97": {
+  "hidden": "0091d63092d03d691d03e731a1734438eaeca79aed6b29782a0dabfb1dd28e1f",
+  "images": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "logits": "d0ee81f1201127bdfaf208c8bbc7ebd49200884e0d4d2bb6199d2fa11fc44427",
+  "versions": {
+   "cublas": "13.1.1.3",
+   "cuda": "13.0",
+   "cutlass": "cutlass-120a-da5aebbd96ce381f sha256:f3e7d12493d607e2",
+   "driver": "595.112.07",
+   "flashinfer": "0.7.2",
+   "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+   "kernels": "120-debd3f77f9d049cc sha256:961c25fe5b60154f",
+   "pillow": "13.0.0",
+   "torch": "2.14.1+cu130"
+  }
+ },
  "qwen-image/sm_120-188sm/196307fb349534a6": {
   "hidden": "e03d446f1aec940b075f18e988811538526a683a6e83b54f029abc304b7e611d",
   "images": "ff1762fc3ecfa7627d4a1ef0776a24103f98380df84b7be4cb2f5450505c7d4a",
@@ -27,6 +43,22 @@
    "flashinfer": "0.7.2",
    "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
    "kernels": "120-54b7316d115e8153 sha256:740b09cc33ceed4a",
+   "pillow": "13.0.0",
+   "torch": "2.14.1+cu130"
+  }
+ },
+ "qwen-long/sm_120-188sm/353af16061d1b39c": {
+  "hidden": "8cc66f980dba8bc0e97380c622799ae37daffd2489cb455311001453ec6dbcc1",
+  "images": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "logits": "35ab2a34f701f604cead48f6b3acba409ba12b3c539f0a05dbb22e254ef351f8",
+  "versions": {
+   "cublas": "13.1.1.3",
+   "cuda": "13.0",
+   "cutlass": "cutlass-120a-da5aebbd96ce381f sha256:f3e7d12493d607e2",
+   "driver": "595.112.07",
+   "flashinfer": "0.7.2",
+   "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+   "kernels": "120-debd3f77f9d049cc sha256:961c25fe5b60154f",
    "pillow": "13.0.0",
    "torch": "2.14.1+cu130"
   }

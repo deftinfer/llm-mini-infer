@@ -157,11 +157,11 @@ def run_example(suite: str, example: Any) -> None:
         from .window_workloads import run_gemma_image_workload as run
     elif suite in ("precise", "window_precise"):
         from .precise_cases import run_precise_workload as run
-    elif suite == "logprobs":
+    elif suite in ("logprobs", "logprobs_counts"):
         from .logprob_workload import run_logprobs_workload as run
     elif suite == "nan":
         from .nan_cases import run_nan_workload as run
-    elif suite in ("structured_window", "structured_hybrid"):
+    elif suite in ("structured_window", "structured_hybrid", "structured_window_counts", "structured_hybrid_counts"):
         from .forced_cases import run_switches_workload as run
     elif suite in ("window_mtp", "arena_mtp", "arena_mtp_counts", "gemma_images_mtp"):
         from .window_mtp import run_window_mtp_workload
