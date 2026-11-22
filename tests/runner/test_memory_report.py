@@ -46,11 +46,7 @@ def test_the_startup_line(monkeypatch, tmp_path) -> None:
         "memory at the end of startup: device: 10.00 GiB reserved, 9.00 GiB allocated, 2.00 of 96.00 GiB free"
 
 
-def test_the_eager_tower_runs_under_memory_history(monkeypatch, tmp_path) -> None:
-    """One tower call of the step's budget of image tokens (the largest bucket), eagerly, between the history's start
-    and its dump to the file; the history stops after a failure too. Its peak is the allocator's above what was
-    allocated before it."""
-    log: list = []
+def _cuda_stubs(monkeypatch, log: list) -> None:
     c, mem = torch.cuda, torch.cuda.memory
     monkeypatch.setattr(c, "synchronize", lambda d=None: None)
     monkeypatch.setattr(c, "memory_allocated", lambda d=None: 30 * GiB)
@@ -59,6 +55,14 @@ def test_the_eager_tower_runs_under_memory_history(monkeypatch, tmp_path) -> Non
     monkeypatch.setattr(c, "reset_peak_memory_stats", lambda d=None: log.append("reset"))
     monkeypatch.setattr(mem, "_record_memory_history", lambda enabled="all", **kw: log.append(("history", enabled)))
     monkeypatch.setattr(mem, "_dump_snapshot", lambda path: log.append(("dump", path)))
+
+
+def test_the_eager_tower_runs_under_memory_history(monkeypatch, tmp_path) -> None:
+    """One tower call of the step's budget of image tokens (the largest bucket without one call per image), eagerly,
+    between the history's start and its dump to the file; the history stops after a failure too. Its peak is the
+    allocator's above what was allocated before it."""
+    log: list = []
+    _cuda_stubs(monkeypatch, log)
     calls: list = []
 
     def tower(patches, grids, graphs):
@@ -66,8 +70,8 @@ def test_the_eager_tower_runs_under_memory_history(monkeypatch, tmp_path) -> Non
         return patches
 
     img = SimpleNamespace(device=torch.device("cpu"), budget=280, cfg=SimpleNamespace(patch=16, merge=3),
-                          _px_internal=np.zeros(3 * 30 * 16 * 84 * 16, np.uint8),
-                          synthetic=lambda n: ((1, 30, 84), (480, 1344)),
+                          per_image=False, max_soft_tokens=70, _px_internal=np.zeros(3 * 30 * 16 * 84 * 16, np.uint8),
+                          synthetic=lambda n: ((1, 30, 84), (480, 1344), n),
                           vision=SimpleNamespace(patches=lambda px: px.reshape(-1, 768)), _tower=tower)
     path = str(tmp_path / "tower.pickle")
     fig = memory_report.eager_tower_snapshot(img, path, free_after_startup=2 * GiB)
@@ -80,6 +84,28 @@ def test_the_eager_tower_runs_under_memory_history(monkeypatch, tmp_path) -> Non
     with pytest.raises(MemoryError):
         memory_report.eager_tower_snapshot(img, path, free_after_startup=2 * GiB)
     assert log == ["reset", ("history", "all"), ("history", None)]
+
+
+@pytest.mark.parametrize("per_image,soft,want", [(True, 70, 70), (True, None, 2048), (False, 70, 2048)])
+def test_with_one_call_per_image_the_eager_tower_takes_the_largest_image(monkeypatch, tmp_path, per_image, soft,
+                                                                        want) -> None:
+    """With one tower call per image (batch invariance) no call holds more than the largest image (Gemma 4's
+    max_soft_tokens, `images.family_buckets`): the snapshot's one call is of that image, its tokens those `synthetic`
+    gives. Without one call per image, or without a soft-token budget (Qwen3.8), it is of the step's budget."""
+    _cuda_stubs(monkeypatch, [])
+    asked, calls = [], []
+
+    def synthetic(n: int):
+        asked.append(n)
+        return (1, 21, 30), (336, 480), 70
+
+    img = SimpleNamespace(device=torch.device("cpu"), budget=2048, cfg=SimpleNamespace(patch=16, merge=3),
+                          per_image=per_image, max_soft_tokens=soft, _px_internal=np.zeros(3 * 336 * 480, np.uint8),
+                          synthetic=synthetic, vision=SimpleNamespace(patches=lambda px: px.reshape(-1, 768)),
+                          _tower=lambda patches, grids, graphs: calls.append((tuple(patches.shape), grids)) or patches)
+    fig = memory_report.eager_tower_snapshot(img, str(tmp_path / "tower.pickle"), free_after_startup=2 * GiB)
+    assert asked == [want] and calls == [((630, 768), [(1, 21, 30)])]
+    assert (fig["tokens"], fig["patches"]) == (70, 630)
 
 
 def test_the_setting_is_off_by_default() -> None:

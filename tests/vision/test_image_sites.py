@@ -145,11 +145,14 @@ def tiny_mm(tmp_path_factory):
     return make_tiny_gemma_mm(tmp_path_factory.mktemp("g4mm"), depth=1)
 
 
-def test_the_runner_builds_its_tower_buckets_at_the_setting(tiny_mm, caplog) -> None:
+@pytest.mark.parametrize("invariant", [True, False], ids=["invariant", "not-invariant"])
+def test_the_runner_builds_its_tower_buckets_at_the_setting(tiny_mm, caplog, invariant) -> None:
     """The runner's site sizes nothing, so the family's check cannot catch it: the tiny model's checkpoint says 70
     soft tokens, the setting 280, and the runner's options carry 280 to the tower, whose graph buckets are the 280
-    family's (28 at a 2,048-token encoder budget, against 25 at 70: the dense region ends at the largest image). Its
-    startup line names tower graphs only when the runner captures CUDA graphs: on CPU the tower runs eagerly."""
+    family's. With batch invariance (Gemma 4's default: one tower call per image) the 19 up to the first that holds its
+    largest image (2,520 patches; at 70, 4); without it the 28 to a 2,048-token encoder budget's 18,432 patches (at 70,
+    25: the dense region ends at the largest image). Its startup line names tower graphs only when the runner captures
+    CUDA graphs: on CPU the tower runs eagerly."""
     import logging
 
     from llm_mini_infer import config
@@ -158,18 +161,20 @@ def test_the_runner_builds_its_tower_buckets_at_the_setting(tiny_mm, caplog) -> 
     from llm_mini_infer.vision.gemma import GemmaVision
 
     cfg = config.derive(config.load(None, {"model.path": str(tiny_mm), "runner.kind": "cuda",
-                                           "dev.runner.cuda.device": "cpu", "images.max_soft_tokens": 280}))
+                                           "dev.runner.cuda.device": "cpu", "images.max_soft_tokens": 280,
+                                           "dev.runner.cuda.batch_invariant": invariant}))
     assert cfg.images.max_soft_tokens == 280 and cfg.dev.images.encoder_budget == 2048
     with caplog.at_level(logging.INFO, logger="llm_mini_infer.runner.cuda.gemma"):
         runner = make_cuda_runner(cfg)
     enc = runner.img
     fam = {k: GemmaVision(boi_id=501, image_id=500, eoi_id=502, patch=4, max_soft_tokens=k) for k in (280, 70)}
-    assert enc.max_soft_tokens == 280
-    assert enc.buckets == family_buckets(fam[280], 3, 2048) and len(enc.buckets) == 28
-    assert len(family_buckets(fam[70], 3, 2048)) == 25
+    count, top, at70 = (19, "2,565", 4) if invariant else (28, "18,432", 25)
+    assert enc.max_soft_tokens == 280 and enc.per_image is invariant
+    assert enc.buckets == family_buckets(fam[280], 3, 2048, per_image=invariant) and len(enc.buckets) == count
+    assert len(family_buckets(fam[70], 3, 2048, per_image=invariant)) == at70
     (line,) = [r.getMessage() for r in caplog.records if r.getMessage().startswith("vision tower loaded")]
     assert not runner.use_graphs
     assert line.endswith("images of at most 280 soft tokens; no tower graphs (CUDA graphs off): the tower runs "
                          "eagerly"), line
-    assert enc.describe(True).endswith("images of at most 280 soft tokens; tower graphs for 28 buckets of "
-                                       "261-18,432 patches")
+    assert enc.describe(True).endswith(f"images of at most 280 soft tokens; tower graphs for {count} buckets of "
+                                       f"261-{top} patches")
