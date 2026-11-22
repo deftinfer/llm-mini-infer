@@ -824,8 +824,8 @@ class CudaRunner(Runner):
         self.mrope = self.mm and len(cfg.mrope_section) == 3
         self.img: ImageEncoder | None = None
         if self.mm:
-            self.img = ImageEncoder(self.model_dir, vision, self.device, self.dtype, buckets=vision_buckets)
-            self.img.per_image = batch_invariant  # one tower call per image (batch invariance)
+            self.img = ImageEncoder(self.model_dir, vision, self.device, self.dtype, buckets=vision_buckets,
+                                    per_image=batch_invariant)  # one tower call per image (batch invariance)
             self.stats.update(vision_load_s=self.img.load_s, vision_weight_bytes=self.img.weight_bytes)
             log.info(self.img.describe(self.use_graphs))
         self.copy_stream = torch.cuda.Stream(self.device) if self.cuda else None
@@ -1264,7 +1264,7 @@ class CudaRunner(Runner):
         from ...vision.family import ImageSize, Span
         from ...vision.qwen import QwenVision
 
-        grid, hw = self.img.synthetic(image_tokens)
+        grid, hw, image_tokens = self.img.synthetic(image_tokens)  # as many tokens: Qwen's tower takes any grid
         p = self.img.cfg.patch
         n = image_tokens + 2
         rows = np.arange(image_tokens, dtype=np.int64) % self.img.rows

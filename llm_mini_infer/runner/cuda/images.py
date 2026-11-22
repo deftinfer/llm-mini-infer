@@ -13,13 +13,15 @@ encoder and its cache"): the Qwen runner (`runner.py`) and Gemma 4's (`gemma.py`
 - **The embedding scatter** (`embeds`): a token whose `tok_emb` names a row takes that row as its input embedding
   instead of its token's (graph-safe: a `torch.where` over the token embeddings).
 - **CUDA graphs of the tower** (`VisionGraphs`), one per bucket of patches, captured with the runner's other graphs.
-- **Synthetic images** (`synthetic`) for the memory profile and the warm-up: an image of n soft tokens, its grid and
-  its pixels from a fixed random buffer.
+- **Synthetic images** (`synthetic`) for the memory profile and the warm-up: an image of n soft tokens, its grid
+  (within the tower's position table) and its pixels from a fixed random buffer; the profile's step encodes a budget
+  of the largest images serving takes (`profile_images`).
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import time
 from dataclasses import dataclass
 from enum import IntEnum
@@ -69,8 +71,9 @@ def default_vision_buckets(max_patches: int, unit: int = 4, dense: int = 2048) -
     tokens; Gemma 4: its largest image, 2,520 patches), then about 1.25x apart up to `max_patches`, each rounded up to
     a multiple of `unit` (the patches of one soft token: merge², so the pooling of a bucket's padding stays separate).
     Padding wastes at most a 128-row step up to `dense` (a third at 256-384 patches, under a tenth past 1,280), at most
-    a quarter past it. Every call up to the budget replays a graph: an eager call would allocate activations the memory
-    profile does not reserve (it measures the tower from its graphs)."""
+    a quarter past it. Every call up to the budget (with one call per image, up to the largest image: `family_buckets`)
+    replays a graph: an eager call would allocate activations the memory profile does not reserve (it measures the
+    tower from its graphs)."""
     out, b = [], 256
     top = max(2048, dense)
     while b < max_patches:
@@ -82,13 +85,43 @@ def default_vision_buckets(max_patches: int, unit: int = 4, dense: int = 2048) -
     return sorted(set(out))
 
 
-def family_buckets(fam: Any, merge: int, budget: int) -> list[int]:
+def family_buckets(fam: Any, merge: int, budget: int, per_image: bool = False) -> list[int]:
     """The default buckets of a family's tower for an encoder budget (image tokens per step): dense up to the family's
     largest image when that is at most 4,096 patches (Gemma 4: 2,520), else to 2,048 (Qwen's default sizing allows
-    images far larger than typical ones)."""
+    images far larger than typical ones). `per_image` (one tower call per image) on a family with a soft-token budget
+    (Gemma 4's `max_soft_tokens`, which no image exceeds): the list ends at its first bucket that holds the largest
+    image, as no call is larger. It is the whole list up to there, so every call takes the bucket it takes in the
+    whole list: the same GEMM shapes, the same bits."""
     unit = merge * merge
     largest = unit * fam.max_tokens()
-    return default_vision_buckets(unit * budget, unit, largest if largest <= 4096 else 2048)
+    out = default_vision_buckets(unit * budget, unit, largest if largest <= 4096 else 2048)
+    if per_image and fam.max_soft_tokens is not None:
+        cap = unit * min(budget, fam.max_soft_tokens)  # the largest call's patches: one image
+        out = out[:next(i for i, b in enumerate(out) if b >= cap) + 1]
+    return out
+
+
+def synthetic_grid(tokens: int, merge: int, max_side: int | None = None) -> tuple[int, int]:
+    """The patch grid (h, w) of a synthetic image of `tokens` soft tokens (merge x merge patches each), as near square
+    as their divisors allow; where that is a strip with a side past `max_side` patches (a prime count, say),
+    isqrt(tokens) rows of tokens // isqrt(tokens) soft tokens, a few tokens fewer (each side then at most
+    merge x (isqrt(tokens) + 2))."""
+    root = math.isqrt(tokens)
+    a = next(d for d in range(root, 0, -1) if tokens % d == 0)
+    if max_side is not None and merge * (tokens // a) > max_side:
+        a = root
+    return merge * a, merge * (tokens // a)
+
+
+def profile_images(tokens: int, largest: int | None) -> list[int]:
+    """The soft tokens of each image the memory profile's image step encodes, `tokens` of them in all: as many images
+    of the largest size (`largest`, Gemma 4's `max_soft_tokens`) as they hold, then one of the rest; one image of
+    them all without a largest size (None). Each is an image serving can take, its grid one a request's image has (as
+    vLLM's profile, which encodes the most images of the largest size the budget holds)."""
+    if not largest:
+        return [tokens]
+    k, rest = divmod(tokens, largest)
+    return [largest] * k + ([rest] if rest else [])
 
 
 class VisionGraphs:
@@ -179,10 +212,12 @@ class _BreakAttention:
 
 class ImageEncoder:
     """A runner's image path (module docstring). Built with the runner (it loads the tower), `allocate`d with its
-    pools, `capture`d with its graphs (its phase: `Phase`); ENCODE needs it allocated."""
+    pools, `capture`d with its graphs (its phase: `Phase`); ENCODE needs it allocated. `buckets`: the tower's graph
+    buckets (None: `family_buckets`, which `per_image` shortens); `per_image`: one tower call per image (batch
+    invariance)."""
 
     def __init__(self, model_dir: str | Path, opts: VisionOptions, device: torch.device, dtype: torch.dtype,
-                 buckets: list[int] | None = None):
+                 buckets: list[int] | None = None, per_image: bool = False):
         from ...vision import family as vf
 
         t0 = time.perf_counter()
@@ -207,7 +242,7 @@ class ImageEncoder:
             self.arena = map_readonly(opts.arena)
         side = c.merge * c.patch
         self.px_bytes = 3 * side * side * self.budget  # the uint8 pixels of a budget's soft tokens
-        self.buckets = family_buckets(fam, c.merge, self.budget) if buckets is None else \
+        self.buckets = family_buckets(fam, c.merge, self.budget, per_image) if buckets is None else \
             sorted(b for b in buckets if b > 0)
         self.load_s = round(time.perf_counter() - t0, 2)
         self.weight_bytes = sum(p.numel() * p.element_size() for p in self.vision.parameters())
@@ -217,8 +252,9 @@ class ImageEncoder:
         self.life = Lifecycle("the image encoder", Phase.LOADED, _EDGES)
         self._px_internal: np.ndarray | None = None  # pixels of internal plans (profile, warm-up, capture)
         # One tower call per image (batch invariance): an image's GEMMs then run at its own bucket's M, not the
-        # step's images' together, which cuBLAS may give another kernel (other bits) when other images join the step
-        self.per_image = False
+        # step's images' together, which cuBLAS may give another kernel (other bits) when other images join the step.
+        # Read at each ENCODE; the default buckets follow the constructor's (`family_buckets`)
+        self.per_image = per_image
 
     # -- lifetime -------------------------------------------------------------------------------------------------
 
@@ -339,16 +375,17 @@ class ImageEncoder:
 
     # -- synthetic images (memory profile, warm-up) ---------------------------------------------------------------
 
-    def synthetic(self, tokens: int) -> tuple[tuple[int, int, int], tuple[int, int]]:
-        """An image of `tokens` soft tokens as near square as its divisors allow: (its patch grid (1, h, w), its pixel
-        size), with internal pixels (`stage(..., internal=True)` from offset 0) for it."""
+    def synthetic(self, tokens: int) -> tuple[tuple[int, int, int], tuple[int, int], int]:
+        """An image of `tokens` soft tokens as near square as its divisors allow, its grid within the tower's
+        (`max_grid`: Gemma 4's position table; Qwen's has none), else a few tokens fewer (`synthetic_grid`): (its patch
+        grid (1, h, w), its pixel size, its soft tokens), with internal pixels (`stage(..., internal=True)` from
+        offset 0) for it."""
         m, p = self.cfg.merge, self.cfg.patch
-        a = max(d for d in range(1, int(tokens ** 0.5) + 1) if tokens % d == 0)
-        gh, gw = m * a, m * (tokens // a)
+        gh, gw = synthetic_grid(tokens, m, getattr(self.cfg, "max_grid", None))
         need = 3 * gh * gw * p * p
         if self._px_internal is None or len(self._px_internal) < need:
             self._px_internal = np.random.default_rng(0).integers(0, 256, max(self.px_bytes, need), dtype=np.uint8)
-        return (1, gh, gw), (gh * p, gw * p)
+        return (1, gh, gw), (gh * p, gw * p), gh * gw // (m * m)
 
     def describe(self, graphs: bool) -> str:
         """The startup line. `graphs`: whether the runner captures CUDA graphs (`capture` then takes one per bucket;

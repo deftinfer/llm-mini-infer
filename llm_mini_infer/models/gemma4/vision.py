@@ -68,6 +68,12 @@ class GemmaVisionConfig:
         return self.pooling
 
     @property
+    def max_grid(self) -> int:
+        """The longest side of a patch grid the tower takes: the position table's entries (`GemmaVisionEncoder.meta`;
+        the runner's synthetic images stay within it)."""
+        return self.pos_size
+
+    @property
     def patch_dim(self) -> int:
         return 3 * self.patch * self.patch
 
@@ -283,14 +289,18 @@ class GemmaVisionEncoder(nn.Module):
         return got
 
     def meta(self, grids: list[tuple[int, int, int]], device: torch.device) -> GemmaEncodeMeta:
-        """A batch of images (grids (t, h, w) in patches; t must be 1)."""
+        """A batch of images (grids (t, h, w) in patches; t must be 1, and no side past the position table: a request's
+        image never is, its longest side pooling x images.max_soft_tokens patches at most)."""
         parts, cu = [], [0]
-        k = self.cfg.pooling
+        k, pos = self.cfg.pooling, self.cfg.pos_size
         for t, h, w in grids:
             if t != 1:
                 raise NotImplementedError("video (temporal grids > 1) is not supported")
             if h % k or w % k:
                 raise ValueError(f"a patch grid of {h} x {w} does not pool by {k}")
+            if h > pos or w > pos:
+                raise ValueError(f"a patch grid of {h} x {w} is past the position table ({pos} entries); lower "
+                                 "images.max_soft_tokens or this image's tokens")
             parts.append(self.grid_meta(h, w, device))
             cu.append(cu[-1] + h * w)
         cos, sin, xs, ys = (x[0] if len(parts) == 1 else torch.cat(list(x)) for x in zip(*parts))
