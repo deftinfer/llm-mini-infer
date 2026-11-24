@@ -146,7 +146,7 @@ llm-mini-infer's prefix cache is a radix tree over token ids. It holds KV pages 
 
 Gemma 4's sliding layers need only each request's last `sliding_window` positions. Their KV lives in **window pages** that are released as soon as a row's window has passed them, and the full layers' KV lives in **full pages** shared through the prefix cache.
 
-- **One KV arena.** Both kinds of page have equal bytes: a window page holds a page size of positions (16) of every sliding layer, and a full page as many positions of the full layers as fill the same bytes (320 on Gemma 4 31B). One free list and one reference count serve both, so the split follows the load and nothing fragments. Window pages keep FlashInfer's per-layer layout. A page reused as the other kind loses its contents.
+- **One KV arena.** Both kinds of page have equal bytes: a window page holds a page size of positions (16) of every sliding layer, and a full page as many positions of the full layers as fill the same bytes (320 on Gemma 4 31B; 640 with `dev.cache.kv_cache_dtype fp8`, which keeps the full layers' one stored plane in FP8 E4M3 at scale 1.0, the sliding layers in BF16). One free list and one reference count serve both, so the split follows the load and nothing fragments. Window pages keep FlashInfer's per-layer layout. A page reused as the other kind loses its contents.
 - **Window checkpoints** play the hybrid state checkpoint's role: the request's own window pages, held by reference, taken at the same points. A hit shares pages of both kinds and copies the partial last page of each.
 - **Under pressure,** in order: the cached windows of unlocked nodes (least recently used first), then cached full pages, then duplicate tree pages, then the windows on paths that running requests hold, and only then a preemption. In each pass, demoted windows go first ([Eviction](#eviction)). Unlocked windows go first because they are most of the cache's bytes. Windows on held paths go last because evicting them frees almost nothing (their pages are shared) and forces the shared prefix to be recomputed.
 
@@ -256,7 +256,7 @@ Plain `nn.Module`s that get their batch metadata from a per-step context (`model
 
 ### FP8
 
-Block-FP8 checkpoints (one scale per 128 × 128 block) load through one path for both formats: Hugging Face's `fp8` method (Qwen3.8) and compressed-tensors `FP8_BLOCK` (Gemma 4). Every projection the checkpoint quantizes is an FP8 GEMM; embeddings, norms, the vision towers and the KV cache stay BF16. Activations are quantized dynamically per token and per 128-group by the kernels that produce them. The GEMM library needs an SM 12.x GPU; on a CPU the torch reference runs.
+Block-FP8 checkpoints (one scale per 128 × 128 block) load through one path for both formats: Hugging Face's `fp8` method (Qwen3.8) and compressed-tensors `FP8_BLOCK` (Gemma 4). Every projection the checkpoint quantizes is an FP8 GEMM; embeddings, norms, the vision towers and the KV cache stay BF16 (Gemma 4's full layers' KV in FP8 with `dev.cache.kv_cache_dtype fp8`: [sliding-window models](#sliding-window-models)). Activations are quantized dynamically per token and per 128-group by the kernels that produce them. The GEMM library needs an SM 12.x GPU; on a CPU the torch reference runs.
 
 ### Sampling
 

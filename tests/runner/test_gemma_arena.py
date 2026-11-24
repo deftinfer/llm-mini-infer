@@ -1,9 +1,12 @@
-"""Gemma's KV arena (runner/cuda/gemma.py `_Arena`) on the CPU: its page copy moves both overlaid views."""
+"""Gemma's KV arena (runner/cuda/gemma.py `_Arena`) on the CPU: its page copy moves both overlaid views; its layout in
+bytes, the full layers in FP8 included."""
 
 from __future__ import annotations
 
+import json
 import types
 
+import pytest
 import torch
 
 from llm_mini_infer.runner.cuda.gemma import _Arena
@@ -41,3 +44,51 @@ def test_arena_copy_moves_both_views_of_a_page() -> None:
     assert torch.equal(a.mem[:, dst], before[:, src]), "the page's bytes are not the source's"
     others = [p for p in pages if p != dst]
     assert torch.equal(a.mem[:, others], before[:, others]), "another page changed"
+
+
+def gemma31b_cfg():
+    from llm_mini_infer.models.gemma4.model import Gemma4Config
+
+    from ..support.paths import ROOT
+
+    return Gemma4Config.from_hf(json.loads((ROOT / "tests/data/gemma-4-31b-it-fp8-block.config.json").read_text()))
+
+
+def test_the_arena_counts_in_bytes() -> None:
+    """`_Arena.layout` divides a chunk's bytes by a full position's: the same sub-pages for any one dtype (BF16 and
+    fp32 alike), twice the positions when the full layers' KV is FP8 in a BF16 buffer; Gemma 4 31B's full page is 320
+    positions in BF16 and 640 in FP8 (12.5 MiB either way: 40 KiB or 20 KiB a position). A dtype other than the
+    buffer's or FP8 is refused."""
+    cfg = gemma31b_cfg()
+    assert _Arena.layout(cfg, 16) == _Arena.layout(cfg, 16, 4) == (5, 64, 2 * 16 * 16 * 256)
+    assert _Arena.layout(cfg, 16, 2, torch.float8_e4m3fn) == (5, 128, 2 * 16 * 16 * 256)
+    assert _Arena.full_page_size(cfg, 16) == 320 and _Arena.full_page_size(cfg, 16, 2, torch.float8_e4m3fn) == 640
+    assert _Arena.layout(arena_cfg(), 4, 4) == (2, 8, 128)
+    with pytest.raises(ValueError, match="buffer's dtype"):
+        _Arena(arena_cfg(), 4, 6, torch.bfloat16, torch.device("cpu"), torch.float16)
+
+
+def test_an_fp8_arena_views_the_same_bytes_and_copies_both_kinds() -> None:
+    """With the full layers in FP8 (a BF16 buffer): `fkv` is a uint8 view of the buffer's bytes, [full layers,
+    groups·pages, sub, heads, dim] with twice the BF16 view's sub; full page p (its sub-pages) is window page p's bytes
+    and no other page's; `_Arena.copy` moves both kinds of page, FP8 bytes and BF16 values alike."""
+    cfg = types.SimpleNamespace(**{**vars(arena_cfg()), "k_eq_v": True})
+    a = _Arena(cfg, 4, 6, torch.bfloat16, torch.device("cpu"), torch.float8_e4m3fn)
+    bf = _Arena(cfg, 4, 6, torch.bfloat16, torch.device("cpu"))
+    assert a.fkv.dtype == torch.uint8 and a.wkv.dtype == a.mem.dtype == torch.bfloat16
+    assert (a.groups, a.sub, a.page_size) == (2, 2 * bf.sub, 2 * bf.page_size) == (2, 32, 64)
+    assert a.fkv.shape == (2, a.groups * a.num_pages, a.sub, 1, 8) and a.fkv.data_ptr() == a.mem.data_ptr()
+    assert a.fkv.numel() == a.mem.numel() * 2
+    fkv = a.fkv.reshape(2, a.groups, a.num_pages, -1)  # [full layer, sub-page group, page, bytes]
+    a.wkv[:, 3].fill_(1.0)
+    assert bool((fkv[:, :, 3] != 0).all()) and not bool(fkv[:, :, [p for p in range(6) if p != 3]].any())
+    a.mem.zero_()
+    src, dst = 1, 4
+    fval = torch.arange(fkv[1, :, src].numel(), dtype=torch.int64).remainder(251).to(torch.uint8) + 1
+    fkv[1, :, src] = fval.reshape(fkv[1, :, src].shape)
+    a.wkv[:2, src] = 7.0
+    before = a.mem.clone()
+    a.copy(torch.tensor([src]), torch.tensor([dst]))
+    assert torch.equal(fkv[1, :, dst], fkv[1, :, src]) and bool((a.wkv[:2, dst] == 7.0).all())
+    assert torch.equal(a.mem[:, dst], before[:, src])
+    assert torch.equal(a.mem[:, [p for p in range(6) if p != dst]], before[:, [p for p in range(6) if p != dst]])

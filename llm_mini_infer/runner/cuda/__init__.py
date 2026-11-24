@@ -49,7 +49,9 @@ def make_cuda_runner(cfg: Config) -> Runner:
                            window_split_keys=SPLIT_KEYS if inv else 0, head_fixed_m=inv, encode_per_image=inv,
                            batch_invariant=inv, sync_check=o.sync_check, memory_history=o.memory_history,
                            logprobs=cfg.server.logprobs, penalties=cfg.server.penalties,
-                           draft_counts=tuple(cfg.draft_counts))
+                           draft_counts=tuple(cfg.draft_counts), kv_cache_dtype=cfg.dev.cache.kv_cache_dtype)
+    if cfg.dev.cache.kv_cache_dtype != "auto":  # config.derive refuses it first
+        raise ValueError(f"dev.cache.kv_cache_dtype {cfg.dev.cache.kv_cache_dtype}: Gemma 4's full layers only")
     from ...kernels.attn_window import FULL_PREFILL_KEYS
 
     return CudaRunner(cfg.model.path, device=o.device, dtype=dtype, attention=o.attention, gdn=o.gdn,

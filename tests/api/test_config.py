@@ -575,6 +575,42 @@ def test_gemma_batch_invariance_is_on_at_any_context(tmp_path) -> None:
         "off: dev.cache.page_size 8 is not a multiple of 16 (our attention kernels' KV tile)")
 
 
+def test_the_kv_cache_dtype(tmp_path) -> None:
+    """`dev.cache.kv_cache_dtype`: auto by default, every layer's KV in the model's dtype; fp8 on Gemma 4 with
+    attention_k_eq_v and a BF16 runner (on the CPU set, on CUDA its default), the reason naming the full layers;
+    refused by name on Qwen3.8 (the fake runner too), on a Gemma 4 that stores K and V, on a float32 runner (the CPU's
+    auto too) and, until our FP8 kernel is built, with our kernels on CUDA. vLLM's name for it, outside the dev group,
+    is refused as a dev setting."""
+    g = _gemma_checkpoint(tmp_path / "g")  # google/gemma-4-31B-it: attention_k_eq_v
+    fp8 = {"dev.cache.kv_cache_dtype": "fp8"}
+    cpu = {"dev.runner.cuda.device": "cpu", "dev.runner.cuda.dtype": "bfloat16"}
+
+    def derive(path: Path, **kw) -> config.Config:
+        return config.derive(config.load(None, {"model.path": str(path), **kw}))
+
+    cfg = derive(g)
+    assert cfg.dev.cache.kv_cache_dtype == "auto"
+    assert cfg.reasons["dev.cache.kv_cache_dtype"] == "auto: the model's dtype for every layer"
+    refs = {"dev.runner.cuda.fused_ops": False, "dev.runner.cuda.attention": "torch"}  # CUDA's torch references
+    for kw in (cpu, {"runner.kind": "fake"}, refs):
+        cfg = derive(g, **fp8, **kw)
+        assert cfg.dev.cache.kv_cache_dtype == "fp8"
+        assert cfg.reasons["dev.cache.kv_cache_dtype"].startswith("fp8: Gemma 4's full-attention layers in FP8 E4M3")
+    for kw, why in (({}, "our FP8 attention kernel is not built yet"),
+                    ({"dev.runner.cuda.device": "cpu"}, r"not float32 \(dev\.runner\.cuda\.dtype auto on the CPU\)"),
+                    ({**cpu, "dev.runner.cuda.dtype": "float32"}, r"needs a BF16 runner, not float32: set")):
+        with pytest.raises(ValueError, match=rf"^dev\.cache\.kv_cache_dtype fp8: .*{why}"):
+            derive(g, **fp8, **kw)
+    (tmp_path / "q").mkdir()
+    with pytest.raises(ValueError, match="Gemma 4's full-attention layers only, not for qwen3_5_text"):
+        derive(_model(tmp_path / "q", 512, 0), **fp8, **{"runner.kind": "fake"})
+    with pytest.raises(ValueError, match="attention_k_eq_v only"):
+        derive(_gemma(tmp_path / "kv"), **fp8, **cpu)  # no attention_k_eq_v: K and V stored
+    moved = r"cache\.kv_cache_dtype: dev settings \(tests.*: set dev\.cache\.kv_cache_dtype"
+    with pytest.raises(ValueError, match=moved):
+        config.load(None, {"cache.kv_cache_dtype": "fp8"})
+
+
 def test_qwen_batch_invariance(tmp_path) -> None:
     """The Qwen runner's batch invariance defaults on for a block-FP8 checkpoint up to QWEN_INVARIANT_MAX_LEN while a
     step can always cut a prefill on the 64-token grid (max_num_batched_tokens past a grid, a final chunk's forced
@@ -830,7 +866,7 @@ def test_the_settings_split(tmp_path, monkeypatch, capsys, caplog) -> None:
     from llm_mini_infer import cli, entrypoint
 
     dev = [k.removeprefix("dev.") for k in config.leaves(config.Config) if k.startswith("dev.")]
-    assert len(config.SETTINGS) == 60 < 61 and len(dev) == 65 and not set(dev) & set(config.SETTINGS)
+    assert len(config.SETTINGS) == 60 < 61 and len(dev) == 66 and not set(dev) & set(config.SETTINGS)
     for name, value in (("runner.cuda.fused_ops", False), ("cache.num_pages", 10), ("runner.fake.step_ms", 1.0),
                         ("scheduler.mixed_step_row_tokens", 100)):
         got = config.load(None, {f"dev.{name}": value}).dev
