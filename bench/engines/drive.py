@@ -78,7 +78,8 @@ FIRST = {"c1": ["--first-index", "0"], "c16": ["--first-index", "1000000"], "c64
          "mixed": ["--first-index", "3000000"],
          "h1k": ["--first-index", "3000000"], "h8k": ["--first-index", "3100000"], "h32k": ["--first-index", "3200000"],
          "p32k": ["--first-index", "4000000"], "p128k": ["--first-index", "4100000"],
-         "s32k": ["--first-index", "5000000"], "s128k": ["--first-index", "5100000"]}
+         "s32k": ["--first-index", "5000000"], "s128k": ["--first-index", "5100000"],
+         "a32k": ["--first-index", "6000000"]}
 VERSION_PACKAGES = ("vllm", "sglang", "sglang-kernel", "llm-mini-infer", "torch", "flashinfer-python",
                     "flashinfer-cubin", "flashinfer-jit-cache", "triton", "xgrammar", "llguidance", "transformers",
                     "deep-gemm", "sgl-kernel")
@@ -583,10 +584,14 @@ def long_loads(context: int) -> tuple[list[LoadSpec], list[str]]:
     for each load left out. Decode: one client over a prompt of 1k, 8k and 32k tokens. Chat: family I's cell at c=16,
     and at c=64 three times, each from its own first index. Prefill: every prompt distinct, one token back, so the time
     to first token is a cold prefill. Cached: a short turn after a long shared prefix, which the warm-up requests
-    write into the cache. A "32k" or "128k" prompt is `LONG_TOKENS`' 32,000 or 130,000 tokens, so it fits a context of
-    32,768 or 131,072 beside its reply. The loads with `--requests` end with their requests (run.py ignores
-    `--warmup`, `--duration` and `--tail` for them); the long ones replace FIXED's `--timeout` (a long prompt takes
-    longer than 120 s on a slow prefill)."""
+    write into the cache. Arena: 32 clients over distinct "32k" prompts with replies of 1,024 tokens, a load where the
+    KV arena binds (with BF16 KV fewer of the 32 fit at once than with FP8; the server's log says how many requests of
+    a length fit); its 64 requests queue 32 at a time, so one may wait behind a wave of 32k prefills (about a million
+    tokens, minutes at a few thousand tokens a second) before its own prefill and decode, and its `--timeout`, counted
+    per request from the send, is 3,600 s. A "32k" or "128k" prompt is `LONG_TOKENS`' 32,000 or 130,000 tokens, so it
+    fits a context of 32,768 or 131,072 beside its reply. The loads with `--requests` end with their requests (run.py
+    ignores `--warmup`, `--duration` and `--tail` for them); the long ones replace FIXED's `--timeout` (a long prompt
+    takes longer than 120 s on a slow prefill)."""
     k32, k128 = (str(n) for n in LONG_TOKENS)
     decode = ["--workload", "chat", "--max-tokens", "256", "--ignore-eos", "--concurrency", "1",
               "--warmup-requests", "2"]
@@ -594,6 +599,8 @@ def long_loads(context: int) -> tuple[list[LoadSpec], list[str]]:
     cached = ["--workload", "chat", "--input-tokens", "128", "--max-tokens", "16", "--concurrency", "1",
               "--requests", "8", "--warmup-requests", "2"]
     long = {"--timeout": "900"}
+    arena = ["--workload", "chat", "--input-tokens", k32, "--max-tokens", "1024", "--ignore-eos", "--concurrency", "32",
+             "--requests", "64", "--warmup-requests", "0"]
     c64 = [LoadSpec(f"chat-c64{'' if r == 1 else f'-r{r}'}",
                     [*CHAT, "--concurrency", "64", "--first-index", str(int(FIRST["c64"][1]) + 100_000 * (r - 1))])
            for r in (1, 2, 3)]
@@ -606,7 +613,8 @@ def long_loads(context: int) -> tuple[list[LoadSpec], list[str]]:
         LoadSpec("prefill-32k", [*prefill, "--input-tokens", k32, "--requests", "3", *FIRST["p32k"]], long),
         LoadSpec("prefill-128k", [*prefill, "--input-tokens", k128, "--requests", "3", *FIRST["p128k"]], long),
         LoadSpec("cached-32k", [*cached, "--shared-prefix-tokens", k32, *FIRST["s32k"]], long),
-        LoadSpec("cached-128k", [*cached, "--shared-prefix-tokens", k128, *FIRST["s128k"]], long)]
+        LoadSpec("cached-128k", [*cached, "--shared-prefix-tokens", k128, *FIRST["s128k"]], long),
+        LoadSpec("arena-c32-h32k", [*arena, *FIRST["a32k"]], {"--timeout": "3600"})]
     kept, skipped = [], []
     for spec in every:
         need = tokens_of(spec.args, "--shared-prefix-tokens") + tokens_of(spec.args, "--input-tokens")

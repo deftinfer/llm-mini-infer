@@ -89,6 +89,9 @@ VLLM_OWN_K = {
 OURS_OWN_K = {"gemma": (0, 1, 2, 3, 5), "qwen": (0, 1, 2, 3)}
 # ... and a count per step chosen from the load at the headline k (Gemma 4's assistant only)
 ADAPTIVE_SET = "dev.speculative.adaptive=true"
+# ... and the full-attention layers' KV cache in FP8 (family L, Gemma 4 only: Qwen3.8's FP8 KV is not built): a full KV
+# page holds twice the positions, so a long request takes about half the KV arena
+KV_FP8_SET = "dev.cache.kv_cache_dtype=fp8"
 
 
 @dataclass(frozen=True)
@@ -272,7 +275,12 @@ def arms(model: str, context: int = CONTEXT) -> dict[str, list[Arm]]:
            "K": [Arm("ours", model, k=k, context=context) for k in OURS_OWN_K[model]] +
                 ([Arm("ours", model, sets=(ADAPTIVE_SET,), label="adaptive", context=context)]
                  if model == "gemma" else [])}
-    out["L"] = list(out["I"])  # the long contexts: each engine in both modes, usually ours alone (--engines ours)
+    # The long contexts: each engine in both modes, usually ours alone (--engines ours); on Gemma 4, llm-mini-infer
+    # once more in its default mode with the KV cache in FP8, after its two mode arms
+    out["L"] = list(out["I"])
+    if model == "gemma":
+        at = max(i for i, a in enumerate(out["L"]) if a.engine == "ours") + 1
+        out["L"].insert(at, Arm("ours", model, sets=(KV_FP8_SET,), label="kvfp8", context=context))
     if model == "qwen":
         # The multi-turn cell: llm-mini-infer with superseded checkpoints demoted and not, at checkpoint slots below
         # the conversations in flight; vLLM's and SGLang's own caches (capacity not matched)

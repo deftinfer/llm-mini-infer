@@ -695,7 +695,7 @@ def test_ours_is_invariant_by_default_on_gemma_and_on_qwen_up_to_its_limit_and_f
     assert default("ours", 32768, "qwen") and not default("ours", 32769, "qwen")
     assert not default("vllm", 8184, "gemma") and not default("sglang", 32768, "gemma")
     for family in ("I", "L"):
-        ours = [a for a in arms.arms("gemma", 32768)[family] if a.engine == "ours"]
+        ours = [a for a in arms.arms("gemma", 32768)[family] if a.engine == "ours" and not a.sets]
         assert [a.name for a in ours] == ["ours-ctx32768", "ours-ctx32768-nobi"]
         assert [arms.batch_invariant(a) for a in ours] == [True, False]
         assert "dev.runner.cuda.batch_invariant=false" in arms.argv(ours[1], "/x/bin")
@@ -706,6 +706,21 @@ def test_ours_is_invariant_by_default_on_gemma_and_on_qwen_up_to_its_limit_and_f
                            (65536, ["ours-ctx65536", "ours-ctx65536-bi"])):
         ours = [a for a in arms.arms("qwen", context)["I"] if a.engine == "ours"]  # on at 32,768, off past it
         assert [a.name for a in ours] == names
+
+
+def test_family_l_has_the_fp8_kv_arm_on_gemma_only_after_the_two_ours_arms_in_the_engines_default_mode():
+    gemma = arms.arms("gemma", 262144)
+    assert [a.name for a in gemma["L"] if a.engine == "ours"] == [
+        "ours-ctx262144", "ours-ctx262144-nobi", "ours-ctx262144-kvfp8"]
+    assert [a.name for a in gemma["L"]].index("ours-ctx262144-kvfp8") == 2
+    fp8 = gemma["L"][2]
+    cmd = arms.argv(fp8, "/x/bin")
+    assert fp8.sets == (arms.KV_FP8_SET,) and arms.KV_FP8_SET == "dev.cache.kv_cache_dtype=fp8"
+    assert cmd[cmd.index("dev.cache.kv_cache_dtype=fp8") - 1] == "--set"
+    assert not any("batch_invariant" in x for x in cmd) and arms.batch_invariant(fp8)
+    assert arms.arms("gemma")["L"][2].name == "ours-kvfp8"
+    assert not any(a.sets for a in gemma["I"]) and "kvfp8" not in " ".join(a.name for a in gemma["I"])
+    assert not any(a.sets for fam in ("I", "L") for a in arms.arms("qwen", 32768)[fam])
 
 
 def test_the_invariance_limit_is_the_packages():
@@ -721,13 +736,13 @@ def test_family_l_keeps_the_loads_that_fit_the_context():
 
     chat = ["chat-c16", "chat-c64", "chat-c64-r2", "chat-c64-r3"]
     names = ["decode-c1-h1k", "decode-c1-h8k", "decode-c1-h32k", *chat, "prefill-32k", "prefill-128k", "cached-32k",
-             "cached-128k"]
+             "cached-128k", "arena-c32-h32k"]
     kept, skipped = fits(8184)
-    assert kept == ["decode-c1-h1k", *chat] and len(skipped) == 6
+    assert kept == ["decode-c1-h1k", *chat] and len(skipped) == 7
     assert "decode-c1-h8k skipped" in skipped[0] and "8,448" in skipped[0] and "8,184" in skipped[0]
     kept, skipped = fits(32768)  # the "32k" loads fit a 32,768 context beside their replies
     assert kept == [*names[:7], "prefill-32k", "cached-32k"]
-    assert [n.split()[1] for n in skipped] == ["prefill-128k", "cached-128k"]
+    assert [n.split()[1] for n in skipped] == ["prefill-128k", "cached-128k", "arena-c32-h32k"]  # 33,088 > 32,768
     assert fits(131072) == (names, [])
     assert fits(262144) == (names, [])
 
@@ -746,6 +761,13 @@ def test_family_l_loads_have_their_own_first_indexes_and_their_own_timeouts():
     assert all("--requests" in by[n].args and "--duration" not in by[n].args for n in bounded)
     assert all(by[n].fixed == {"--timeout": "900"} for n in bounded if not n.startswith("decode"))
     assert "--requests" not in by["chat-c16"].args
+    arena = by["arena-c32-h32k"]
+    assert list(by)[-1] == "arena-c32-h32k" and first["arena-c32-h32k"] == "6000000"
+    assert arena.fixed == {"--timeout": "3600"}  # its requests queue behind a wave of 32k prefills
+    for flag, value in (("--concurrency", "32"), ("--input-tokens", "32000"), ("--max-tokens", "1024"),
+                        ("--requests", "64"), ("--warmup-requests", "0"), ("--workload", "chat")):
+        assert arena.args[arena.args.index(flag) + 1] == value
+    assert "--ignore-eos" in arena.args and not {"--duration", "--shared-prefix-tokens"} & set(arena.args)
 
 
 def test_family_l_dry_run_names_the_skipped_loads_and_the_manifest_does_too(rig, capsys):
@@ -753,8 +775,8 @@ def test_family_l_dry_run_names_the_skipped_loads_and_the_manifest_does_too(rig,
     argv = ["--out", str(rig.out), "--model", "gemma", "--family", "L", "--engines", "ours", "--context", "32768"]
     assert drive.main([*argv, "--dry-run"]) == 0
     out = capsys.readouterr().out
-    assert [ln.split(":")[0] for ln in out.splitlines() if ln.startswith("L ")] == ["L ours-ctx32768",
-                                                                                  "L ours-ctx32768-nobi"]
+    assert [ln.split(":")[0] for ln in out.splitlines() if ln.startswith("L ")] == [
+        "L ours-ctx32768", "L ours-ctx32768-nobi", "L ours-ctx32768-kvfp8"]
     assert "load prefill-32k:" in out and "load prefill-128k:" not in out and "prefill-128k skipped" in out
     assert not rig.out.exists()
 
