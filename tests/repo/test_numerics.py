@@ -5,6 +5,7 @@ tests/support/tiny_gemma.py)."""
 from __future__ import annotations
 
 import contextlib
+import functools
 import importlib
 import io
 import json
@@ -12,7 +13,7 @@ import math
 import os
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -606,16 +607,19 @@ def test_kv_scales_file(tmp_path) -> None:
 
 
 def test_arm_names_and_twins() -> None:
-    """`<switch>[-kv8|-kv8all][-cache][-eager]` (`s` after the KV tag with scales), and each FP8-KV arm's twin."""
+    """`<switch>[-kv8|-kv8all|-kvfp8][-cache][-eager]` (`s` after the fake-quant's tag with scales; `-kvfp8` the real
+    FP8 pool), and each FP8-KV arm's twin."""
     assert nfo.arm_name("on", False, True) == "on" and nfo.arm_name("off", True, False) == "off-cache-eager"
     assert nfo.arm_name("on", True, False, "fp8") == "on-kv8-cache-eager"
     assert nfo.arm_name("on", False, True, "fp8-all") == "on-kv8all"
     assert nfo.arm_name("off", False, True, "fp8", kv_scaled=True) == "off-kv8s"
+    assert nfo.arm_name("on", True, False, kv_cache_dtype="fp8") == "on-kvfp8-cache-eager"
     for arm, twin in [("on-kv8", "on"), ("on-kv8-cache-eager", "on-cache-eager"), ("on-kv8all", "on"),
-                      ("off-kv8s", "off"), ("on", None), ("on-cache", None), ("off-eager", None)]:
+                      ("off-kv8s", "off"), ("on-kvfp8", "on"), ("on-kvfp8-cache-eager", "on-cache-eager"),
+                      ("on", None), ("on-cache", None), ("off-eager", None)]:
         assert nf.twin(arm) == twin, arm
-    assert nf.default_pairs(["on", "on-kv8", "off-kv8", "on-kv8all", "on-cache"]) == [("on-kv8", "on"),
-                                                                                       ("on-kv8all", "on")]
+    assert nf.default_pairs(["on", "on-kv8", "off-kv8", "on-kv8all", "on-cache", "on-kvfp8"]) == [
+        ("on-kv8", "on"), ("on-kv8all", "on"), ("on-kvfp8", "on")]
 
 
 def _spy_attention(monkeypatch, seen: dict[tuple[str, int], list[bool]]) -> None:
@@ -724,6 +728,46 @@ def test_kv_fake_quant_on_every_layer(tiny_gemma: Tiny, tiny_qwen: Tiny, tmp_pat
     assert all(0 < e["values"][0] == e["values"][1] for k, e in kv.items() if k.startswith("sliding:"))
     with pytest.raises(ValueError, match="fp8-all"):
         _kv8_run(tiny_qwen, tmp_path, "fp8-all")
+
+
+def test_the_real_fp8_pool_equals_the_fake_quant(tiny_gemma: Tiny, tmp_path) -> None:
+    """`--kv-cache-dtype fp8` (a real FP8 pool: `dev.cache.kv_cache_dtype`, the full layers' bytes in uint8) against
+    `--kv-dtype fp8` (a BF16 pool whose written slots are rounded through E4M3) on the tiny Gemma 4 with its assistant,
+    a BF16 CPU runner (the torch references), eager: the two arms' tokens, hidden states and acceptance are the same
+    bit for bit on every request (`same`), and both differ from the BF16 arm's. The fake-quant refuses an FP8 pool, and
+    Qwen3.8 refuses the real one."""
+    opts = nfo.Options(device="cpu", dtype="bfloat16", max_model_len=1024, budget=128, max_num_seqs=4, memory_gb=0.05,
+                       k=K, soft_tokens=tiny_gemma.refs["options"]["soft_tokens"])
+    run = functools.partial(nfo.run_arm, tiny_gemma.refs, switch="on", graphs=False, out=tmp_path)
+    real = run(opts=replace(opts, kv_cache_dtype="fp8"))
+    fake = run(opts=opts, kv_dtype="fp8")
+    bf16 = run(opts=opts)
+    assert (real["arm"], fake["arm"], bf16["arm"]) == ("on-kvfp8-eager", "on-kv8-eager", "on-eager")
+    assert not (real["wrong"] or fake["wrong"] or bf16["wrong"])
+    assert real["settings"]["page_size"] == 2 * fake["settings"]["page_size"]  # a full page of twice the positions
+    same = nfo.same(tmp_path / "on-kvfp8-eager", tmp_path / "on-kv8-eager")
+    assert len(same) == len(tiny_gemma.refs["requests"]) and all(r["positions"] > 0 for r in same)
+    assert all(r["ok"] and r["tokens"] and r["hidden"] and r["accept"] for r in same), same
+    assert not all(r["hidden"] for r in nfo.same(tmp_path / "on-kvfp8-eager", tmp_path / "on-eager"))
+    nfo.main(["same", str(tmp_path / "on-kvfp8-eager"), str(tmp_path / "on-kv8-eager")])
+    with pytest.raises(SystemExit):
+        nfo.main(["same", str(tmp_path / "on-kvfp8-eager"), str(tmp_path / "on-eager")])
+    (tmp_path / "on-kv8-eager" / "r0.pt").rename(tmp_path / "r0.pt")  # a request missing from one folder
+    (tmp_path / "on-kvfp8-eager" / "results.pt").write_bytes(b"")  # not a request's capture: ignored
+    got = {r["rid"]: r for r in nfo.same(tmp_path / "on-kvfp8-eager", tmp_path / "on-kv8-eager")}
+    assert sorted(got) == [0, 1, 2] and not got[0]["ok"] and got[0]["missing"] == str(tmp_path / "on-kv8-eager")
+    assert got[1]["ok"] and got[2]["ok"]
+    with pytest.raises(SystemExit):
+        nfo.main(["same", str(tmp_path / "on-kvfp8-eager"), str(tmp_path / "on-kv8-eager")])
+    with pytest.raises(ValueError, match="FP8 already"):
+        run(opts=replace(opts, kv_cache_dtype="fp8"), kv_dtype="fp8")
+
+
+def test_the_real_fp8_pool_is_gemma_4s(tiny_qwen: Tiny, tmp_path) -> None:
+    opts = nfo.Options(device="cpu", dtype="bfloat16", max_model_len=1024, budget=128, max_num_seqs=4, memory_gb=0.05,
+                       k=K, kv_cache_dtype="fp8")
+    with pytest.raises(ValueError, match="Gemma 4's full layers only"):
+        nfo.run_arm(tiny_qwen.refs, switch="on", graphs=False, out=tmp_path, opts=opts)
 
 
 def _cap(tokens: list[int], prompt_len: int, forced: int, hidden: torch.Tensor, accept: list[int]) -> dict[str, Any]:
