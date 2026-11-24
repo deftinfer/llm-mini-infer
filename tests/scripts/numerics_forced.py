@@ -10,6 +10,7 @@ the model and process-wide flags).
     python3 -m tests.scripts.numerics_forced run --refs <dir>/refs.json --arm off [--cache] [--concurrency 8] \\
         [--rids 0,3]
     python3 -m tests.scripts.numerics_forced run --refs <dir>/refs.json --arm on --no-graphs --taps --core-layers 3,31
+    python3 -m tests.scripts.numerics_forced run --refs <dir>/refs.json --arm on --kv-dtype fp8 [--concurrency 8]
     (Gemma 4: --model RedHatAI/gemma-4-31B-it-FP8-block --assistant google/gemma-4-31B-it-assistant)
 
 **The engine** (`Engine`) is the server's, in-process: the runner, its pools sized as `engine.process` sizes them from
@@ -22,8 +23,8 @@ the EOS-free finish, the precise prefix (`runner.cuda.fp8_cold_prefill` reuse; i
 mixed-step bound derived from the profile's step costs (off with `--memory-gb`), images on where the checkpoint has a
 tower. An arm sets `dev.runner.cuda.batch_invariant` (`on`, `off`; Gemma 4's five runner switches together, as
 `make_cuda_runner` sets them), the prefix cache (`--cache`; Qwen's checkpoint slots as the server sizes them) and CUDA
-graphs (`--no-graphs`: every step eager). Its name, and its folder under `--out`: `on`, `off`, `on-cache`, `off-cache`,
-each with `-eager` when graphs are off.
+graphs (`--no-graphs`: every step eager), and with `--kv-dtype` the KV an FP8 pool would hold (below). Its name, and
+its folder under `--out`: `<switch>[-kv8|-kv8all][-cache][-eager]` (`arm_name`), e.g. `on`, `off-cache`, `on-kv8-eager`.
 
 **References** (`refs`; `build_requests`, `make_refs`): each request's prompt as the server builds it (the chat template
 with thinking off, `Renderer.encode`, the frontend's image expansion), answered greedily by the engine under the
@@ -33,7 +34,11 @@ by default, one request at a time, the prefix cache off:
   defaults: a system prompt of `synthetic.PROMPT_TOKENS`, one generated image per request index, a share
   `synthetic.TALL_SHARE` of them portrait; the short user text; the strict schema as compact guidance JSON,
   `json_schema_grammar(schema, "guidance", disable_any_whitespace=True)`);
-- `chat`: bench/load/run.py's `chat_workload` prompts (`--input-tokens`, 2,048 by default), text only, no grammar.
+- `chat`: bench/load/run.py's `chat_workload` prompts (`--input-tokens`, 2,048 by default), text only, no grammar;
+- `recall`: chat's prompts asking for the words in order from the first, so the answer reads the prompt's start (at a
+  long context, past Gemma 4's sliding window); text only, no grammar.
+A long context: `--input-tokens 32768 --max-model-len 65536` (a forced run takes the references' max_model_len); a
+prompt whose answer could pass max_model_len is refused.
 `<out>/refs.json` keeps, per request, what rebuilds its prompt (workload, index, its token parts with each image by its
 index, the grammar's name and its forced prefix's length), the expanded prompt to check the rebuild against, the answer
 (EOS stripped) and the finish.
@@ -46,6 +51,17 @@ reference. `--concurrency 1` runs each request alone; N keeps N in flight (a clo
 to `<out>/<arm>/r<rid>.pt` (`torch.save`; tensors on the CPU), and `<out>/<arm>/run.json` holds the settings, the whole
 run's counters, each request's acceptance and the timings; a markdown table is printed. A request whose output is not
 its reference (a grammar error) fails the run after run.json is written.
+
+**The KV fake-quant** (`run --kv-dtype`; `KvFakeQuant`): each layer's KV write is followed, before that layer's
+attention reads it, by the written slots rounded through float8_e4m3fn and back (`e4m3_round`: clamp to ±448 at the
+scale, round to nearest even); `fp8` on the full-attention layers (Gemma 4's one stored plane, Qwen's K and V and its
+MTP layer's), `fp8-all` on Gemma 4's sliding layers too. Every E4M3 value is a BF16 value, so a kernel that reads an FP8
+pool by converting each tile to BF16 before today's arithmetic (FlashInfer's FP8 prefill does) reads exactly this BF16
+pool: the arm's tokens, hidden states and acceptance are that design's, the drafter's and the precise prefix's included.
+The scale is 1.0 unless `--kv-scales` sets per-layer powers of two (exact too); Gemma 4's full layers store k / rms(k)
+per head, at most sqrt(512) = 22.6, never saturated. run.json's `kv_fake_quant`: the settings and, per layer and plane,
+the values written, those saturated and the largest magnitude (and the power-of-two scales that would keep them in
+range).
 
 **The capture** (one dict per request; the shape the fp32 analysis reads):
 - `model` ("qwen" | "gemma"), `model_dir`, `assistant_dir`, `arm`, `settings` (the engine's: the `Options`, the pools,
@@ -109,6 +125,7 @@ import functools
 import importlib.util
 import json
 import logging
+import math
 import os
 import sys
 import tempfile
@@ -130,7 +147,11 @@ CHAT_TOKENS = 2048  # the chat workload's prompt tokens
 MAX_TOKENS = 384  # a reference answer's tokens at most
 DRAIN = 32  # captured steps kept on the device between drains (one host sync a drain)
 ARMS = ("on", "off")
-WORKLOADS = ("scene", "chat")
+WORKLOADS = ("scene", "chat", "recall")
+# recall: chat's prompt with its instruction turned around (bench/load/run.py's chat_workload words it so)
+REVERSE, FORWARD = "Repeat these words in reverse order:", "Repeat these words in order, from the first:"
+KV_DTYPES = ("fp8", "fp8-all")  # `--kv-dtype`: the full-attention layers' KV, or every layer's (Gemma 4's sliding too)
+E4M3_MAX = 448.0  # float8_e4m3fn's largest finite value
 
 log = logging.getLogger("numerics_forced")
 
@@ -187,8 +208,10 @@ class HelpFormatter(argparse.RawDescriptionHelpFormatter):
         return f"{h} (default: %(default)s)"
 
 
-def arm_name(switch: str, cache: bool, graphs: bool) -> str:
-    return switch + ("-cache" if cache else "") + ("" if graphs else "-eager")
+def arm_name(switch: str, cache: bool, graphs: bool, kv_dtype: str | None = None, kv_scaled: bool = False) -> str:
+    """`<switch>[-kv8|-kv8all][-cache][-eager]`, `s` after the KV tag when per-layer scales other than 1 are set."""
+    kv = "" if kv_dtype is None else "-kv8" + ("all" if kv_dtype == "fp8-all" else "") + ("s" if kv_scaled else "")
+    return switch + kv + ("-cache" if cache else "") + ("" if graphs else "-eager")
 
 
 # -- the checkpoint ----------------------------------------------------------------------------------------------------
@@ -319,7 +342,7 @@ def build_requests(model_dir: Path, workloads: Sequence[str], indices: Sequence[
                                    synthetic.TALL_SHARE)  # as the bench counts; the images as `image` gives them
             grammars[wl] = _scene_grammar(model_dir, inp.schema)
             forced = len(_grammars(model_dir).forced_prefix(grammars[wl]))
-        elif wl == "chat":
+        elif wl in ("chat", "recall"):
             chat = _bench_load().chat_workload(tok, input_tokens, MAX_TOKENS, seed)
             forced = 0
         else:
@@ -331,6 +354,10 @@ def build_requests(model_dir: Path, workloads: Sequence[str], indices: Sequence[
                                                      {"type": "image_url", "image_url": {"url": f"image:{i}"}}]}]
             else:
                 msgs = chat.body(i)["messages"]
+                if wl == "recall":
+                    if REVERSE not in msgs[0]["content"]:
+                        raise ValueError(f"recall: chat's prompt no longer asks {REVERSE!r}")
+                    msgs = [{**msgs[0], "content": msgs[0]["content"].replace(REVERSE, FORWARD, 1)}]
             conv = to_template_messages(msgs, r.content_format, r.supports_developer_role,
                                         fam.placeholder if fam is not None else "")
             ids = r.encode(r.render(conv, add_generation_prompt=True, **kw)).tolist()
@@ -1086,6 +1113,153 @@ def accept_summary(accept: list[tuple[int, int]], k: int) -> dict[str, Any]:
             "per_pos": [float((a > j).mean()) for j in range(k)]}
 
 
+# -- the KV fake-quant -------------------------------------------------------------------------------------------------
+
+
+def e4m3_round(x: Any, scale: float = 1.0) -> Any:
+    """x stored as float8_e4m3fn at `scale` and read back in x's dtype: clamp(x / scale, ±448) (PTX's `.satfinite`: an
+    overflow or an infinity saturates, a NaN stays NaN), rounded to nearest even, times `scale`. Every E4M3 value is a
+    BF16 value, so with a power-of-two scale the read is exact: what an FP8 pool dequantized into BF16 holds."""
+    import torch
+
+    y = x.float() if scale == 1.0 else x.float() / scale
+    y = y.clamp(-E4M3_MAX, E4M3_MAX).to(torch.float8_e4m3fn).float()
+    return (y if scale == 1.0 else y * scale).to(x.dtype)
+
+
+def pow2_scale(amax: float) -> float:
+    """The smallest power of two s >= 1 with amax / s <= 448 (1.0 for a NaN or an infinity)."""
+    return 2.0 ** max(0, math.ceil(math.log2(amax / E4M3_MAX))) if amax > E4M3_MAX and math.isfinite(amax) else 1.0
+
+
+def load_kv_scales(path: str | Path) -> dict[tuple[str, int], tuple[float, float]]:
+    """`--kv-scales`: a JSON object {"<kind>:<pool index>": [K's scale, V's scale]} (kind "full" or "sliding"), or a
+    forced run's run.json, whose `kv_fake_quant.pow2_scales` is one (the scales its largest values ask for)."""
+    d = json.loads(Path(path).read_text())
+    if "kv_fake_quant" in d:
+        d = (d["kv_fake_quant"] or {}).get("pow2_scales")
+        if d is None:
+            raise ValueError(f"{path}: a forced run without --kv-dtype, so no KV scales")
+    out = {}
+    for key, ss in d.items():
+        kind, _, i = key.partition(":")
+        if kind not in ("full", "sliding") or not i.isdigit() or len(ss) != 2:
+            raise ValueError(f"{path}: KV scales are {{\"full:3\": [k, v], ...}}, not {key!r}: {ss!r}")
+        out[(kind, int(i))] = (float(ss[0]), float(ss[1]))
+    return out
+
+
+class KvFakeQuant:
+    """`--kv-dtype`: the KV an FP8 pool would hold, in today's BF16 pools. Each layer's KV write goes through one of two
+    context methods (`Gemma4Context.qkv_store`, Qwen's `ForwardContext.qk_rope_store`: the store ops' only callers);
+    wrapped here, each rounds the step's written slots in place (`e4m3_round`) right after the store, before that
+    layer's attention reads them, so a step's own new keys are rounded too. Graph capture runs the Python once: the
+    rounding is in every graph. `fp8`: Gemma 4's full layers (its one stored plane with `attention_k_eq_v`, else K and
+    V) and Qwen's every attention layer, the MTP layer included (the pool's last; K after its norm and RoPE, V);
+    `fp8-all`: Gemma 4's sliding layers too. The drafter reads the rounded KV like the target, and the precise prefix
+    and a hit's recomputed KV write through the same methods. Counters per layer and plane stay on the device (no host
+    sync inside a graph): the values real tokens wrote (padding rows write the null page, 0), those beyond 448 × the
+    scale (saturated by the clamp) and the largest magnitude. `scales`: (kind, pool index) -> (K's, V's), each a power
+    of two (default 1.0, the engines' default without checkpoint scales; neither checkpoint ships any). Its temporaries
+    count in the memory profile, so an arm's pools can hold a few pages fewer than its BF16 twin's (`--num-pages` pins
+    them)."""
+
+    SLOTS = 256  # (kind, layer) pairs counted
+
+    def __init__(self, dtype: str, device: str, scales: dict[tuple[str, int], tuple[float, float]] | None = None):
+        import torch
+
+        if dtype not in KV_DTYPES:
+            raise ValueError(f"KV dtype {dtype!r}: one of {', '.join(KV_DTYPES)}")
+        for key, ss in (scales or {}).items():
+            if not all(s > 0 and math.frexp(s)[0] == 0.5 for s in ss):
+                raise ValueError(f"KV scales {ss} of {key}: powers of two (their dequantization is exact)")
+        self.dtype, self.scales = dtype, dict(scales or {})
+        self.slot: dict[tuple[str, int], int] = {}
+        self.values = torch.zeros((self.SLOTS, 2), dtype=torch.int64, device=device)
+        self.saturated = torch.zeros_like(self.values)
+        self.amax = torch.zeros((self.SLOTS, 2), dtype=torch.float32, device=device)
+        self._undo: list[tuple[Any, str, Any]] = []
+
+    @property
+    def scaled(self) -> bool:
+        return any(s != 1.0 for ss in self.scales.values() for s in ss)
+
+    def settings(self) -> dict[str, Any]:
+        return {"dtype": self.dtype, "format": "float8_e4m3fn", "clamp": E4M3_MAX,
+                "layers": "full and sliding" if self.dtype == "fp8-all" else "full",
+                "scales": {f"{k}:{i}": list(ss) for (k, i), ss in sorted(self.scales.items())} or 1.0}
+
+    def install(self) -> None:
+        """The wrappers, before the engine is built (its memory profile and graph capture store KV)."""
+        from llm_mini_infer.models.gemma4.backend import SLIDING, Gemma4Context
+        from llm_mini_infer.models.qwen3_5.backend import ForwardContext
+
+        gemma, qwen = Gemma4Context.qkv_store, ForwardContext.qk_rope_store
+        every = self.dtype == "fp8-all"
+
+        def gemma_store(ctx: Any, layer: Any, qkv: Any) -> Any:
+            q = gemma(ctx, layer, qkv)
+            sliding = layer.kind == SLIDING
+            if every or not sliding:
+                m, p = ctx.meta, ctx.pools
+                kv = p.wkv[layer.index] if sliding else p.fkv[layer.index]
+                planes = {1: kv} if kv.dim() == 4 else {0: kv[:, 0], 1: kv[:, 1]}  # k_eq_v: V alone
+                self.round("sliding" if sliding else "full", layer.index, planes,
+                           m.w_page if sliding else m.f_page, m.w_off if sliding else m.f_off)
+            return q
+
+        def qwen_store(ctx: Any, layer: Any, qkv: Any) -> Any:
+            q = qwen(ctx, layer, qkv)
+            kv = ctx.pools.kv[layer.index]
+            self.round("full", layer.index, {0: kv[:, 0], 1: kv[:, 1]}, ctx.meta.kv_page, ctx.meta.kv_off)
+            return q
+
+        self._undo = [(Gemma4Context, "qkv_store", gemma), (ForwardContext, "qk_rope_store", qwen)]
+        Gemma4Context.qkv_store, ForwardContext.qk_rope_store = gemma_store, qwen_store
+
+    def uninstall(self) -> None:
+        for cls, name, f in self._undo:
+            setattr(cls, name, f)
+        self._undo = []
+
+    def round(self, kind: str, index: int, planes: dict[int, Any], page: Any, off: Any) -> None:
+        """Rounds `planes` (0: K, 1: V; [pages, page_size, heads, dim] views) at the step's (`page`, `off`) slots."""
+        import torch
+
+        if not page.numel():
+            return
+        slot = self.slot.setdefault((kind, index), len(self.slot))
+        if slot >= self.SLOTS:
+            raise RuntimeError(f"more than {self.SLOTS} KV layers")
+        real = (page != 0)[:, None, None]
+        scales = self.scales.get((kind, index), (1.0, 1.0))
+        for j, plane in planes.items():
+            x = plane[page, off]
+            a = torch.where(real, x.abs().float(), 0.0)
+            self.values[slot, j] += real.sum() * x[0].numel()
+            self.saturated[slot, j] += (a > E4M3_MAX * scales[j]).sum()
+            self.amax[slot, j] = torch.maximum(self.amax[slot, j], a.amax())
+            plane[page, off] = e4m3_round(x, scales[j])
+
+    def reset(self) -> None:
+        """Zeroes the counters in place (a captured graph holds their addresses)."""
+        for t in (self.values, self.saturated, self.amax):
+            t.zero_()
+
+    def report(self) -> dict[str, Any]:
+        """The counters by layer (`kind:index`, K and V; a plane never written has 0 values), their totals, and the
+        power-of-two scales (>= 1) that would have kept every value within 448 (`--kv-scales` takes them)."""
+        vals, sat, amax = self.values.tolist(), self.saturated.tolist(), self.amax.tolist()
+        layers = {f"{k}:{i}": {"values": vals[s], "saturated": sat[s], "amax": amax[s]}
+                  for (k, i), s in sorted(self.slot.items())}
+        return {**self.settings(), "layers": layers,
+                "values": sum(sum(e["values"]) for e in layers.values()),
+                "saturated": sum(sum(e["saturated"]) for e in layers.values()),
+                "amax": max((max(e["amax"]) for e in layers.values()), default=0.0),
+                "pow2_scales": {key: [pow2_scale(a) for a in e["amax"]] for key, e in layers.items()}}
+
+
 # -- references --------------------------------------------------------------------------------------------------------
 
 
@@ -1114,6 +1288,11 @@ def make_refs(model: str | Path, requests: Sequence[dict[str, Any]], *, assistan
     try:
         by = {q["rid"]: q for q in requests}
         prompts = {rid: eng.expand(q["parts"]) for rid, q in by.items()}
+        max_len = eng.settings["max_model_len"]  # a forced run asks the answer's length + 2
+        long = sorted(rid for rid, (ids, _) in prompts.items() if len(ids) + max_tokens + 2 > max_len)
+        if long:
+            raise ValueError(f"requests {long}: the prompt and {max_tokens} + 2 answer tokens pass max_model_len "
+                             f"{max_len} (raise --max-model-len: 65,536 for --input-tokens 32768)")
         t0 = time.perf_counter()
 
         def add(rid: int) -> None:
@@ -1146,14 +1325,16 @@ def run_arm(refs: dict[str, Any] | str | Path, *, switch: str, cache: bool = Fal
             taps: bool = False, core_layers: Sequence[int] = (), concurrency: int = 1,
             rids: Sequence[int] | None = None, out: str | Path | None = None, opts: Options | None = None,
             model: str | Path | None = None, assistant: str | Path | None = None,
-            hid_out: bool | None = None) -> dict[str, Any]:
+            hid_out: bool | None = None, kv_dtype: str | None = None,
+            kv_scales: dict[tuple[str, int], tuple[float, float]] | None = None) -> dict[str, Any]:
     """One arm's forced run of the references (`refs`: refs.json's content or its path; module docstring): its captures
     to `<out>/<arm>/r<rid>.pt` and `<out>/<arm>/run.json` (`out` default: the references' folder). `opts`: the engine's
-    settings (default: `Options()`), always with free drafts (no draft universe; `draft_vocab` None: the whole head)
-    and the references' image budget. `taps` and `core_layers` (which needs `taps`) run with graphs off. `model`,
-    `assistant`: other folders of the same checkpoints. `hid_out`: where the final states come from (`Recorder`; None:
-    `hid_out` with graphs, the forward's output eagerly). Returns run.json's content; raises after writing it when an
-    output is not its reference."""
+    settings (default: `Options()` at the references' max_model_len), always with free drafts (no draft universe;
+    `draft_vocab` None: the whole head) and the references' image budget. `taps` and `core_layers` (which needs `taps`)
+    run with graphs off. `model`, `assistant`: other folders of the same checkpoints. `hid_out`: where the final states
+    come from (`Recorder`; None: `hid_out` with graphs, the forward's output eagerly). `kv_dtype`, `kv_scales`: the KV
+    fake-quant (`KvFakeQuant`), its counters in run.json's `kv_fake_quant`. Returns run.json's content; raises after
+    writing it when an output is not its reference."""
     import torch
 
     from llm_mini_infer.grammar.engine import Grammars
@@ -1168,23 +1349,35 @@ def run_arm(refs: dict[str, Any] | str | Path, *, switch: str, cache: bool = Fal
         raise ValueError("core layers need taps (--taps): their captures live in the taps (taps.core)")
     model_dir = resolve(model) if model else Path(refs["model_dir"])
     asst = resolve(assistant) if assistant else Path(refs["assistant_dir"]) if refs.get("assistant_dir") else None
-    opts = opts or Options()
+    if kv_dtype == "fp8-all" and model_kind(model_dir) != "gemma":
+        raise ValueError("--kv-dtype fp8-all adds Gemma 4's sliding layers: fp8 rounds every layer of this model")
+    opts = opts or Options(max_model_len=refs.get("settings", {}).get("max_model_len", MAX_LEN))
     opts = replace(opts, draft_universe=False, draft_vocab=opts.draft_vocab or 0,
                    soft_tokens=refs.get("options", {}).get("soft_tokens", opts.soft_tokens))
     want = set(rids) if rids is not None else None
     reqs = [q for q in refs["requests"] if want is None or q["rid"] in want]
     if want is not None and want - {q["rid"] for q in reqs}:
         raise ValueError(f"no reference for rids {sorted(want - {q['rid'] for q in reqs})}")
-    arm = arm_name(switch, cache, graphs)
+    kvq = KvFakeQuant(kv_dtype, opts.device, kv_scales) if kv_dtype is not None else None
+    arm = arm_name(switch, cache, graphs, kv_dtype, kvq is not None and kvq.scaled)
     folder = Path(out) if out else src.parent if src else results_dir("forced")
     (folder / arm).mkdir(parents=True, exist_ok=True)
     _, eos = grammar_eos(model_dir)
     answers = {q["rid"]: [int(t) for t in q["answer"]] for q in reqs}
     forced = Grammars(ForcedEach(vocab_size(model_dir), eos, answers, {q["rid"]: int(q["forced"]) for q in reqs}))
-    eng = Engine(model_dir, asst, opts, switch=switch, cache=cache, graphs=graphs, grammars=forced, requests=reqs)
+    if kvq is not None:
+        kvq.install()
+    try:
+        eng = Engine(model_dir, asst, opts, switch=switch, cache=cache, graphs=graphs, grammars=forced, requests=reqs)
+    except BaseException:
+        if kvq is not None:
+            kvq.uninstall()
+        raise
     early = taps  # big captures go to disk as their requests finish
     summary: dict[str, Any] = {}
     try:
+        if kvq is not None:
+            kvq.reset()  # the memory profile and graph capture stored KV too
         by = {q["rid"]: q for q in reqs}
         prompts = {rid: eng.expand(q["parts"]) for rid, q in by.items()}
         for rid, (ids, _) in prompts.items():
@@ -1193,7 +1386,8 @@ def run_arm(refs: dict[str, Any] | str | Path, *, switch: str, cache: bool = Fal
                                  "checkpoint, tokenizer or image budget?)")
 
         conf = {**eng.settings, "arm": arm, "taps": taps, "core_layers": list(core_layers),
-                "concurrency": concurrency, "teacher_forced": True}
+                "concurrency": concurrency, "teacher_forced": True,
+                "kv_fake_quant": kvq.settings() if kvq is not None else None}
 
         def save(rid: int, q: Request) -> None:
             ids, images = prompts[rid]
@@ -1231,6 +1425,7 @@ def run_arm(refs: dict[str, Any] | str | Path, *, switch: str, cache: bool = Fal
         wrong = sorted(rid for rid in by if eng.out[rid][:len(answers[rid])] != answers[rid])
         res = {"model": eng.kind, "model_dir": str(model_dir), "assistant_dir": str(asst) if asst else None,
                "arm": arm, "settings": conf, "counters": eng.counters(),
+               "kv_fake_quant": kvq.report() if kvq is not None else None,
                "requests": [summary[rid] for rid in sorted(summary)], "wrong": wrong,
                "timings": {"load_s": round(eng.load_s, 2), "run_s": round(run_s, 2),
                            "save_s": round(time.perf_counter() - t1, 2)}}
@@ -1240,7 +1435,11 @@ def run_arm(refs: dict[str, Any] | str | Path, *, switch: str, cache: bool = Fal
                                f"{res['counters']['grammar_errors']} grammar errors")
         return res
     finally:
-        eng.close()
+        try:
+            eng.close()
+        finally:
+            if kvq is not None:
+                kvq.uninstall()
 
 
 def capture(eng: Engine, q: Request, arm: str, conf: dict[str, Any], ids: list[int], images: list[Any], *,
@@ -1316,7 +1515,14 @@ def run_tables(res: dict[str, Any]) -> str:
                                   ("prompt_len", "prompt"), ("cached", "cached"), ("answer_len", "answer"),
                                   ("verify_steps", "verify"), ("tokens_per_verify", "tokens / verify"),
                                   ("per_pos", "by position"), ("hvalid", "states"), ("tvalid", "taps")])
-    return f"{top}\n\n{per}"
+    kv = res.get("kv_fake_quant")
+    if not kv:
+        return f"{top}\n\n{per}"
+    rows = [{"layer": key, "values": e["values"], "saturated": e["saturated"], "amax": [round(a, 2) for a in e["amax"]],
+             "scales": kv["pow2_scales"][key]} for key, e in kv["layers"].items()]
+    lay = table(rows, [("layer", "KV layer"), ("values", "values K V"), ("saturated", "saturated K V"),
+                       ("amax", "max |x| K V"), ("scales", "power-of-two scales")])
+    return f"{top}\n\n{per}\n\n{kv['dtype']} KV, {kv['saturated']} of {kv['values']} values saturated:\n\n{lay}"
 
 
 # -- the command line --------------------------------------------------------------------------------------------------
@@ -1330,8 +1536,9 @@ def _engine_args(p: argparse.ArgumentParser) -> None:
                    help="the runner's dtype (auto: BF16 on CUDA, fp32 on the CPU)")
     g.add_argument("--k", type=int, default=3,
                    help="drafts a step (the server's: 3 from Qwen3.8's MTP layer, 5 from an assistant)")
-    g.add_argument("--max-model-len", type=int, default=MAX_LEN,
-                   help="model.max_model_len (batch invariance's default range)")
+    g.add_argument("--max-model-len", type=int, default=None,
+                   help=f"model.max_model_len (refs: {MAX_LEN:,}, batch invariance's default range; run: the "
+                        "references')")
     g.add_argument("--budget", type=int, default=2048, help="scheduler.max_num_batched_tokens")
     g.add_argument("--max-num-seqs", type=int, default=64, help="scheduler.max_num_seqs")
     g.add_argument("--page-size", type=int, default=16, help="dev.cache.page_size (Gemma 4: the window page)")
@@ -1365,6 +1572,8 @@ def _options(args: argparse.Namespace, **kw: Any) -> Options:
 
 
 def cmd_refs(args: argparse.Namespace) -> None:
+    if args.max_model_len is None:
+        args.max_model_len = MAX_LEN
     workloads = [w for w in args.workload.split(",") if w]
     indices = parse_ids(args.indices)
     model_dir = resolve(args.model)
@@ -1384,11 +1593,16 @@ def cmd_refs(args: argparse.Namespace) -> None:
 
 
 def cmd_run(args: argparse.Namespace) -> None:
+    if args.max_model_len is None:  # the references'
+        args.max_model_len = json.loads(args.refs.read_text()).get("settings", {}).get("max_model_len", MAX_LEN)
+    if args.kv_scales is not None and args.kv_dtype is None:
+        raise SystemExit("--kv-scales needs --kv-dtype")
     res = run_arm(args.refs, switch=args.arm, cache=args.cache, graphs=args.graphs, taps=args.taps,
                   core_layers=parse_ids(args.core_layers), concurrency=args.concurrency,
                   rids=parse_ids(args.rids) if args.rids else None, out=args.out,
                   opts=_options(args, draft_universe=False, draft_vocab=args.draft_vocab), model=args.model,
-                  assistant=args.assistant)
+                  assistant=args.assistant, kv_dtype=args.kv_dtype,
+                  kv_scales=load_kv_scales(args.kv_scales) if args.kv_scales else None)
     print(run_tables(res), flush=True)
 
 
@@ -1399,13 +1613,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     p = sub.add_parser("refs", help="greedy references under the real grammars (refs.json)",
                        formatter_class=HelpFormatter)
     p.add_argument("--model", required=True, help="a checkpoint folder or a repo id")
-    p.add_argument("--workload", default="scene", help="scene, chat, or both (comma-separated)")
+    p.add_argument("--workload", default="scene", help="scene, chat, recall, or several (comma-separated)")
     p.add_argument("--indices", default="0-3", help="the workloads' request indices, e.g. 0-7,14")
     p.add_argument("--max-tokens", type=int, default=MAX_TOKENS, help="a reference answer's tokens at most")
     p.add_argument("--soft-tokens", type=int, default=SOFT_TOKENS,
                    help="Gemma 4's images.max_soft_tokens (the checkpoint's own budget: 280 on gemma-4-31B-it)")
-    p.add_argument("--input-tokens", type=int, default=CHAT_TOKENS, help="chat: each prompt's tokens")
-    p.add_argument("--seed", type=int, default=0, help="chat: the prompts' seed")
+    p.add_argument("--input-tokens", type=int, default=CHAT_TOKENS, help="chat, recall: each prompt's tokens")
+    p.add_argument("--seed", type=int, default=0, help="chat, recall: the prompts' seed")
     p.add_argument("--arm", default="on", choices=ARMS, help="dev.runner.cuda.batch_invariant on or off")
     p.add_argument("--out", type=Path, default=None,
                    help="the folder for refs.json (default: results/numerics/forced/<UTC time>)")
@@ -1421,6 +1635,12 @@ def main(argv: Sequence[str] | None = None) -> None:
                    help="model layers whose kernels' inputs and outputs to keep (--taps), e.g. 3,31")
     p.add_argument("--rids", default="", help="the references to force (default: all), e.g. 0-3")
     p.add_argument("--draft-vocab", type=int, default=0, help="the drafter's head (0: the whole vocabulary)")
+    p.add_argument("--kv-dtype", default=None, choices=KV_DTYPES,
+                   help="round the KV each step writes through float8_e4m3fn (the module docstring): fp8 the "
+                        "full-attention layers', fp8-all Gemma 4's sliding layers' too (default: BF16 KV)")
+    p.add_argument("--kv-scales", type=Path, default=None,
+                   help="per-layer power-of-two KV scales (`load_kv_scales`: a JSON object, or a run.json whose "
+                        "largest values set them; default: 1.0)")
     p.add_argument("--out", type=Path, default=None, help="the run's folder, <out>/<arm>/ (default: refs.json's)")
     _engine_args(p)
     p.set_defaults(fn=cmd_run)

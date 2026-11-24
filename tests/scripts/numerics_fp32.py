@@ -64,17 +64,29 @@ its markdown tables):
 - `target`: per arm, the fp32 head on its hidden against on H_fp32 at the positions predicting the answer: the share
   whose argmax is H_fp32's, the share whose argmax is the reference token, the top-1 margins (Gemma's softcapped) and
   H_fp32's margins where the arm disagrees.
+- `pairs`: an arm against another on the same references (by default each FP8-KV arm, `numerics_forced --kv-dtype`,
+  against its BF16 twin: its name without `-kv8[all][s]`), from the fp32 head on each one's hidden state
+  alone, at the positions predicting the answer both computed: the top-1 agreement and its first miss in each answer,
+  the margins, and each arm's tokens per verify step; with `--chain` also each one's argmax = H_fp32's share, their
+  discordant positions (b: only the first agrees with H_fp32; c: only the second) and the difference. "free" counts the
+  positions past the grammar's forced prefix only (the prefix's tokens are near-certain). The intervals resample
+  requests (a cluster bootstrap, `--boot` draws, seed 0), since positions within an answer are correlated: a one-sided
+  95% lower bound on the agreement, two-sided 95% intervals on the differences (a percentile bootstrap: it means
+  little with few requests, and with no miss in any request the bound is the share itself). By workload (forced runs'
+  run.json).
 - `all`: `layers` and `chain` in one pass over the layers, then `drafter`, `target` and `report`.
 - `report DIR`: one markdown summary of the results in DIR (`report.md`).
-`drafter` and `target` run the chain first unless `--chain` names a chain's results.
+`drafter` and `target` run the chain first unless `--chain` names a chain's results; `pairs` runs no chain.
 
     python3 -m tests.scripts.numerics_fp32 all <run> [--rids 0-3,7] [--out DIR] [--device cuda]
     python3 -m tests.scripts.numerics_fp32 layers <run>/on-eager <run>/off-eager
     python3 -m tests.scripts.numerics_fp32 drafter <run> --chain <a chain's --out> [--k 3]
+    python3 -m tests.scripts.numerics_fp32 pairs <run> [--pair on-eager:on] [--chain <a chain's --out>]
     python3 -m tests.scripts.numerics_fp32 report <out>
 
 The function API (tests/repo/test_numerics.py drives it on the tiny models, CPU, fp32): `make_ref`, `Request` (or
-`load_requests`), `sweep` (layers and chain), `drafter`, `target`; `draft_qwen`/`draft_gemma` return the drafts.
+`load_requests`), `sweep` (layers and chain), `drafter`, `target`, `pair`; `draft_qwen`/`draft_gemma` return the
+drafts.
 
 **Fixed differences from the engine:** the cos/sin caches in fp32 (BF16 there); Gemma's full-layer keys from the fp32
 stored plane (from the BF16-rounded V there); every projection on fp32 activations (FP8 there, BF16 on PRECISE rows);
@@ -108,6 +120,8 @@ MEASURES = ("mixer", "mlp", "layer")
 ROWS = 4096  # rows of a position-wise computation (an MLP) at a time
 HEAD_CHUNK = 16384  # vocabulary rows of the fp32 head at a time
 CAPTURE = re.compile(r"r(\d+)\.pt")
+KV_TAG = re.compile(r"-kv8(?:all)?s?(?=-|$)")  # numerics_forced's FP8-KV arms (`arm_name`)
+BOOT = 10_000  # cluster-bootstrap draws (`pairs`)
 
 
 def log(msg: str) -> None:
@@ -198,6 +212,16 @@ def arm_folders(paths: list[Path]) -> dict[str, Path]:
             raise FileNotFoundError(f"{p}: no captures (r<rid>.pt) in it or in its folders")
         for d in found:
             out[d.name if d.name not in out else f"{d.parent.name}/{d.name}"] = d
+    return out
+
+
+def workloads(paths: list[Path]) -> dict[int, str]:
+    """Each request's workload, from the forced runs' run.json beside their captures."""
+    out: dict[int, str] = {}
+    for d in arm_folders(paths).values():
+        if (d / "run.json").exists():
+            for q in json.loads((d / "run.json").read_text()).get("requests", []):
+                out.setdefault(int(q["rid"]), q.get("workload"))
     return out
 
 
@@ -1225,6 +1249,100 @@ def target(ref: QwenRef | GemmaRef, req: Request, chain: Chain) -> dict[str, Any
         return res
 
 
+# -- arm against arm ---------------------------------------------------------------------------------------------------
+
+
+def twin(arm: str) -> str | None:
+    """An FP8-KV arm's BF16 twin, its name without the KV tag (`on-kv8-cache` -> `on-cache`); None for another arm."""
+    t = KV_TAG.sub("", arm, count=1)
+    return t if t != arm else None
+
+
+def default_pairs(arms: list[str]) -> list[tuple[str, str]]:
+    """Each FP8-KV arm with its twin, where the twin is among `arms`."""
+    return [(a, t) for a in arms if (t := twin(a)) in arms]
+
+
+def pair(ref: QwenRef | GemmaRef, req: Request, a: str, b: str, chain: Chain | None = None) -> dict[str, Any] | None:
+    """Arm `a` against arm `b` on one request (`pairs`, the module docstring), at the positions predicting the answer
+    that both computed (None: none): per band ("all"; "free": past the forced prefix) the positions, the top-1
+    agreements and with `chain` each arm's argmax = H_fp32's (fp32_a, fp32_b) and the discordant counts (b, c); the
+    first disagreement among the free positions (its index in the answer; None: none); a's top-1 margins and b's where
+    they disagree (free positions); each arm's verify steps and accepted drafts (its capture's `accept`)."""
+    import torch
+
+    def r5(x: torch.Tensor) -> list[float]:
+        return np.round(x.double().cpu().numpy(), 5).tolist()
+
+    with reference_numerics():
+        dev, dt = ref.dev, ref.dtype
+        pos = torch.arange(req.prompt_len - 1, req.n - 1)
+        pos = pos[req.hvalid(a)[pos] & req.hvalid(b)[pos]]
+        if not len(pos):
+            return None
+        ai, a1, a2 = head_top(req.caps[a]["hidden"][pos].to(dev, dt), ref.head, ref.softcap)
+        bi, b1, b2 = head_top(req.caps[b]["hidden"][pos].to(dev, dt), ref.head, ref.softcap)
+        free = (pos >= req.prompt_len - 1 + req.forced).to(dev)
+        same = ai == bi
+        fi = head_top(chain.hidden.to(dev, dt)[pos.to(dev)], ref.head, ref.softcap)[0] if chain is not None else None
+        bands: dict[str, Any] = {}
+        for band, m in (("all", torch.ones_like(free)), ("free", free)):
+            e = {"n": int(m.sum()), "agree": int((same & m).sum())}
+            if fi is not None:
+                ok_a, ok_b = (ai == fi) & m, (bi == fi) & m
+                e.update(fp32_a=int(ok_a.sum()), fp32_b=int(ok_b.sum()), b=int((ok_a & ~ok_b).sum()),
+                         c=int((~ok_a & ok_b).sum()))
+            bands[band] = e
+        miss = torch.nonzero(free & ~same).flatten().cpu()
+        first = int(pos[int(miss[0])]) - (req.prompt_len - 1) if len(miss) else None
+        acc = {arm: req.caps[arm]["accept"].long() for arm in (a, b)}
+        return {"rid": req.rid, "pair": [a, b], "bands": bands, "first_miss": first,
+                "answer": req.n - req.prompt_len, "margins": r5((a1 - a2)[free]),
+                "miss_margins": r5((b1 - b2)[free & ~same]),
+                "accept": {arm: {"steps": len(x), "accepted": int(x.sum())} for arm, x in acc.items()}}
+
+
+def bootstrap(cols: dict[str, np.ndarray], stat: Callable[[dict[str, np.ndarray]], np.ndarray], draws: int = BOOT,
+              seed: int = 0) -> np.ndarray:
+    """`stat` of the columns' sums over `draws` resamples of their rows (the requests) with replacement."""
+    k = len(next(iter(cols.values())))
+    idx = np.random.default_rng(seed).integers(0, k, size=(draws, k))
+    return stat({key: col[idx].sum(1) for key, col in cols.items()})
+
+
+def pair_summary(results: list[dict[str, Any]], band: str, draws: int = BOOT) -> dict[str, Any]:
+    """One pair's requests pooled (`pair`'s results): positions, the agreement share and its one-sided 95% lower bound,
+    the first misses, the margins, each arm's tokens per verify step and the difference (first arm − second) with its
+    two-sided 95% interval, and with the chain the argmax = H_fp32 counts, b, c and the difference of their shares
+    with its interval (`pairs`: a cluster bootstrap over the requests)."""
+    e = [r["bands"][band] for r in results]
+    n, agree = (np.array([x[key] for x in e], np.float64) for key in ("n", "agree"))
+    a, b = results[0]["pair"]
+    acc = {arm: (np.array([r["accept"][arm]["steps"] for r in results], np.float64),
+                 np.array([r["accept"][arm]["accepted"] for r in results], np.float64)) for arm in (a, b)}
+    tpv = {arm: float(1 + x.sum() / s.sum()) if s.sum() else None for arm, (s, x) in acc.items()}
+    out: dict[str, Any] = {
+        "pair": [a, b], "band": band, "requests": len(results), "n": int(n.sum()), "agree": int(agree.sum()),
+        "share": float(agree.sum() / n.sum()) if n.sum() else None, "lower95": None,
+        "first_miss": [r["first_miss"] for r in results], "answers": [r["answer"] for r in results],
+        "margins": [x for r in results for x in r["margins"]],
+        "miss_margins": [x for r in results for x in r["miss_margins"]], "tpv": tpv, "tpv_delta": None}
+    if n.sum():
+        d = bootstrap({"a": agree, "n": n}, lambda s: s["a"] / np.maximum(s["n"], 1), draws)
+        out["lower95"] = float(np.quantile(d, 0.05))
+    if tpv[a] is not None and tpv[b] is not None:
+        cols = {"sa": acc[a][0], "xa": acc[a][1], "sb": acc[b][0], "xb": acc[b][1]}
+        d = bootstrap(cols, lambda s: s["xa"] / np.maximum(s["sa"], 1) - s["xb"] / np.maximum(s["sb"], 1), draws)
+        out["tpv_delta"] = [tpv[a] - tpv[b], *np.quantile(d, [0.025, 0.975]).tolist()]
+    if all("fp32_a" in x for x in e) and n.sum():
+        ok_a, ok_b = (np.array([x[key] for x in e], np.float64) for key in ("fp32_a", "fp32_b"))
+        d = bootstrap({"a": ok_a, "b": ok_b, "n": n}, lambda s: (s["a"] - s["b"]) / np.maximum(s["n"], 1), draws)
+        out["fp32"] = {"fp32_a": int(ok_a.sum()), "fp32_b": int(ok_b.sum()), "b": sum(x["b"] for x in e),
+                       "c": sum(x["c"] for x in e),
+                       "delta": [float((ok_a.sum() - ok_b.sum()) / n.sum()), *np.quantile(d, [0.025, 0.975]).tolist()]}
+    return out
+
+
 # -- tables ------------------------------------------------------------------------------------------------------------
 
 
@@ -1384,8 +1502,56 @@ def target_tables(res: dict[str, Any]) -> str:
                           "disagreements", "fp32 margin there p50 / max"], rows)])
 
 
+def pair_groups(results: list[dict[str, Any]]) -> list[tuple[str, str, list[dict[str, Any]]]]:
+    """`pair` results by pair and workload (its `workload`), then the pair's every workload together ("all") when it
+    has several."""
+    out = []
+    for p in dict.fromkeys(tuple(r["pair"]) for r in results):
+        rs = [r for r in results if tuple(r["pair"]) == p]
+        wls = list(dict.fromkeys(r.get("workload") or "-" for r in rs))
+        out += [(f"{p[0]} : {p[1]}", w, [r for r in rs if (r.get("workload") or "-") == w]) for w in wls]
+        if len(wls) > 1:
+            out.append((f"{p[0]} : {p[1]}", "all", rs))
+    return out
+
+
+def pairs_tables(res: dict[str, Any]) -> str:
+    draws = int(res.get("meta", {}).get("boot", BOOT))
+    agree, fp32, drafts = [], [], []
+    for name, wl, rs in pair_groups(res["requests"]):
+        for band in ("free", "all"):
+            s = pair_summary(rs, band, draws)
+            fm = [x for x in s["first_miss"] if x is not None]
+            agree.append([name, wl, band, s["requests"], s["n"], _pct(s["agree"], s["n"]),
+                          f"{100 * s['lower95']:.1f}%" if s["lower95"] is not None else "-",
+                          f"{len(fm)} / {s['requests']}", _q(fm, 0.5), f"{_q(s['margins'], 0.1)} / "
+                          f"{_q(s['margins'], 0.5)}", f"{_q(s['miss_margins'], 0.5)} / {max(s['miss_margins']):.3f}"
+                          if s["miss_margins"] else "-"])
+            if "fp32" in s:
+                f, (d, lo, hi) = s["fp32"], s["fp32"]["delta"]
+                fp32.append([name, wl, band, s["n"], _pct(f["fp32_a"], s["n"]), _pct(f["fp32_b"], s["n"]),
+                             f"{100 * d:+.2f} [{100 * lo:+.2f}, {100 * hi:+.2f}]", f["b"], f["c"]])
+            if band == "all":
+                t, dt = s["tpv"], s["tpv_delta"]
+                drafts.append([name, wl, s["requests"], *(f"{t[a]:.3f}" if t[a] is not None else "-"
+                                                         for a in s["pair"]),
+                               f"{dt[0]:+.3f} [{dt[1]:+.3f}, {dt[2]:+.3f}]" if dt else "-"])
+    parts = ["### Top-1 agreement: the fp32 head on each arm's hidden state", "",
+             md(["first : second", "workload", "positions", "requests", "n", "agree", "lower 95%",
+                 "answers with a miss", "first miss p50", "first's margin p10 / p50",
+                 "second's margin at misses p50 / max"], agree), "",
+             "### Drafter: tokens per verify step", "",
+             md(["first : second", "workload", "requests", "first", "second", "first − second [95%]"], drafts)]
+    if fp32:
+        parts += ["", "### Against H_fp32: argmax = fp32's (points: first − second)", "",
+                  md(["first : second", "workload", "positions", "n", "first", "second", "difference [95%]",
+                      "b (first only)", "c (second only)"], fp32)]
+    return "\n".join(parts)
+
+
 SECTIONS = (("layers", "Per layer and kernel", layers_tables), ("chain", "Accumulated along the stream", chain_tables),
-            ("drafter", "Drafter", drafter_tables), ("target", "Target", target_tables))
+            ("drafter", "Drafter", drafter_tables), ("target", "Target", target_tables),
+            ("pairs", "Arm against arm", pairs_tables))
 
 
 def report(d: Path) -> str:
@@ -1418,7 +1584,8 @@ def main(argv: list[str] | None = None) -> None:
     helps = {"layers": "per layer and kernel, from each arm's own inputs", "chain": "the fp32 model from the "
              "embeddings: H_fp32 and the accumulated error", "drafter": "the fp32 drafter on each hidden source",
              "target": "the fp32 head on each hidden source", "all": "layers and chain in one pass, then drafter, "
-             "target and report"}
+             "target and report", "pairs": "an arm against another (each FP8-KV arm against its twin): the head on "
+             "both hidden states, and with --chain against H_fp32"}
     for name, text in helps.items():
         p = sub.add_parser(name, help=text, description=text, formatter_class=HelpFormatter)
         p.add_argument("arms", nargs="+", type=Path,
@@ -1430,12 +1597,20 @@ def main(argv: list[str] | None = None) -> None:
         p.add_argument("--dtype", choices=("float32", "float64"), default="float32",
                        help="the reference's dtype (the module docstring)")
         p.add_argument("--rids", type=parse_ids, help="these requests only, e.g. 0-3,7")
-        p.add_argument("--base", default="on", help="the arm whose stream[0] the chain starts from, by name or switch "
-                       "(on: on-eager, on-cache-eager, ...)")
+        if name != "pairs":
+            p.add_argument("--base", default="on", help="the arm whose stream[0] the chain starts from, by name or "
+                           "switch (on: on-eager, on-cache-eager, ...)")
         p.add_argument("--out", type=Path, help="results folder (default: results/numerics/fp32/<UTC time>)")
         if name in ("drafter", "target"):
             p.add_argument("--chain", type=Path, help="a chain's results (its --out): H_fp32 and the KV, else the "
                            "chain runs first")
+        if name == "pairs":
+            p.add_argument("--pair", action="append", default=[], metavar="FIRST:SECOND",
+                           help="arms to compare by name, e.g. on-eager:on (repeatable; default: each FP8-KV arm "
+                           "against its twin)")
+            p.add_argument("--chain", type=Path, help="a chain's results (its --out): adds each arm against H_fp32 "
+                           "(default: the head on the two hidden states alone, no chain)")
+            p.add_argument("--boot", type=int, default=BOOT, help="cluster-bootstrap draws")
         if name in ("drafter", "all"):
             p.add_argument("--k", type=int, help="drafts a round (default: the captures' k)")
     p = sub.add_parser("report", help="one markdown summary of a results folder", formatter_class=HelpFormatter)
@@ -1477,6 +1652,22 @@ def main(argv: list[str] | None = None) -> None:
         print(next(s[2] for s in SECTIONS if s[0] == name)(res), flush=True)
         log(f"wrote {out / name}.json")
 
+    if args.cmd == "pairs":
+        names = list(arms)
+        pairs = [tuple(x.split(":", 1)) for x in args.pair] if args.pair else default_pairs(names)
+        unknown = sorted({x for p in pairs for x in p if x not in names} | {":".join(p) for p in pairs if len(p) < 2})
+        if not pairs or unknown:
+            ap.error(f"no pair to compare among the arms {names}" + (f": {', '.join(unknown)}" if unknown else ""))
+        chains = {}
+        if args.chain is not None:
+            folder = args.chain / "chain" if (args.chain / "chain").is_dir() else args.chain
+            chains = {req.rid: Chain.load(folder / f"r{req.rid}.pt") for req in requests}
+        wls = workloads(args.arms)
+        results = [{**r, "workload": wls.get(req.rid)} for a, b in pairs for req in requests
+                   if a in req.caps and b in req.caps and (r := pair(ref, req, a, b, chains.get(req.rid)))]
+        meta["boot"] = args.boot
+        write("pairs", results)
+        return
     chains: dict[int, Chain | None] = {}
     if args.cmd in ("layers", "chain", "all") or getattr(args, "chain", None) is None:
         swept = sweep(ref, requests, layers=args.cmd in ("layers", "all"), chain=args.cmd != "layers", base=args.base)
