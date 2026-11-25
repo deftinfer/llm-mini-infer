@@ -42,7 +42,11 @@ METRICS = re.compile(r"^(vllm:spec_decode_\w+|vllm:iteration_tokens_total_(?:sum
 
 
 def family(model: str) -> str:
-    return "gemma" if "gemma" in model.lower() else "qwen"
+    """The cases' family: a local checkpoint's `model_type` (config.json), else a repo id's name, its last part (a
+    directory's path may hold "gemma" anywhere, a worktree's name included)."""
+    config = Path(model) / "config.json"
+    name = json.loads(config.read_text()).get("model_type", "") if config.is_file() else Path(model).name
+    return "gemma" if "gemma" in name.lower() else "qwen"
 
 
 def load_cases(path: Path, select: str, fam: str) -> tuple[dict, list[dict]]:

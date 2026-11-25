@@ -50,3 +50,12 @@ def test_the_server_gets_no_token(tmp_path, monkeypatch) -> None:
     assert proc.proc.wait(30) == 0
     proc.stop()
     assert (tmp_path / "stub.log").read_text().strip() == "[]"
+
+
+def test_the_family_comes_from_the_checkpoint_not_its_path(tmp_path) -> None:
+    qwen = tmp_path / "llm-mini-infer-gemma-work" / "model"
+    qwen.mkdir(parents=True)
+    (qwen / "config.json").write_text(json.dumps({"model_type": "qwen3_5"}))
+    assert rec.family(str(qwen)) == "qwen"
+    assert rec.family("RedHatAI/gemma-4-31B-it-FP8-block") == "gemma"
+    assert rec.family("Qwen/Qwen3.8-27B-FP8") == "qwen"
