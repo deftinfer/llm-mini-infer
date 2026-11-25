@@ -405,13 +405,6 @@ class DevCudaConfig(_Group):
     # block-FP8 checkpoint while model.max_model_len is at most 32,768 (QWEN_INVARIANT_MAX_LEN), when the token
     # budget, the chunk cap and dev.cache.page_size allow it (`_invariance_blocked`)
     batch_invariant: bool | None = None
-    # With batch invariance, the full layers' prefill split (architecture.md, "Batch invariance"): a prefill query with
-    # more keys than this splits them by a size from its position. Default: 8,192 (`kernels.attn512.PREFILL_FROM`); at
-    # model.max_model_len or more no query splits (for measurements). Gemma 4: a query takes its keys whole up to the
-    # larger of this and 16,384 (`kernels.attn512.PREFILL_KEYS`, the split size past it), so a value below 16,384
-    # changes nothing. Qwen3.8: the keys split in 2,048-key splits (`kernels.attn_window.FULL_PREFILL_KEYS`) from this
-    # value up, so at least 2,048. At most 2**31 - 1 (a 32-bit int in our kernels)
-    prefill_split_from: int | None = None
 
 
 class DevRunnerConfig(_Group):
@@ -516,6 +509,8 @@ def _moved(data: dict[str, Any], prefix: str = "") -> list[str]:
 # any) and what holds now. A file or an override that sets one is refused naming it, before the schema's own message
 RETIRED: dict[tuple[str, str | None], str] = {
     ("dev.speculative.draft_head_dtype", None): "the drafter's head has the target head's dtype",
+    ("dev.runner.cuda.prefill_split_from", None): "the full layers' prefill split starts at the kernels' threshold, "
+                                                  "kernels.attn512.PREFILL_FROM",
 }
 
 
@@ -1084,19 +1079,6 @@ def _derive_kernels(cfg: Config, hf: dict[str, Any], reasons: dict[str, str]) ->
         raise ValueError("dev.runner.cuda.always_split: needs structured output (its graphs are the grammar masks' "
                          "split)")
     _derive_batch_invariance(cfg, hf, gemma, reasons)
-    if o.prefill_split_from is not None and (o.prefill_split_from < 1 or not o.batch_invariant):
-        raise ValueError(f"dev.runner.cuda.prefill_split_from {o.prefill_split_from}: at least 1, with "
-                         "dev.runner.cuda.batch_invariant on (the split is its kernels')")
-    if o.prefill_split_from is not None and o.prefill_split_from > 2**31 - 1:
-        raise ValueError(f"dev.runner.cuda.prefill_split_from {o.prefill_split_from}: at most {2**31 - 1:,} (our "
-                         "kernels take it as a 32-bit int)")
-    if o.prefill_split_from is not None and not gemma:
-        from .kernels.attn_window import FULL_PREFILL_KEYS
-
-        if o.prefill_split_from < FULL_PREFILL_KEYS:
-            raise ValueError(f"dev.runner.cuda.prefill_split_from {o.prefill_split_from}: at least "
-                             f"{FULL_PREFILL_KEYS:,} on Qwen3.8 (its prefill split's base: a query between them would "
-                             "take one split, whole or in the splits by its tile; `kernels.attn_window.FullAttention`)")
     if cfg.engine.plan_at_boundary and cfg.runner.kind == "cuda" and not gemma:
         raise ValueError("engine.plan_at_boundary: Gemma 4 only on CUDA (the Qwen runner's prefill and mixed steps "
                          "launch breakable graphs whose eager GDN and attention breaks take 15-22 ms of host time on a "

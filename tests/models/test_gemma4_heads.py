@@ -161,27 +161,23 @@ def test_the_factory_passes_a_set_attention_kind(pair) -> None:
         make_cuda_runner(cfg)
 
 
-@pytest.mark.parametrize("split_from", [None, 4096])
-def test_the_runner_takes_its_full_layers_prefill_split(pair, split_from) -> None:
-    """dev.runner.cuda.prefill_split_from, set, is the length from which the runner splits its full layers' prefill;
-    unset, the kernels' default (`attn512.PREFILL_FROM`), with their key count."""
+def test_the_runner_takes_the_kernels_prefill_split(pair) -> None:
+    """The runner's full layers' prefill split is the kernels' default (`attn512.PREFILL_FROM`, `PREFILL_KEYS`)."""
     from llm_mini_infer import config
     from llm_mini_infer.kernels.attn512 import PREFILL_FROM, PREFILL_KEYS
     from llm_mini_infer.runner.cuda import make_cuda_runner
 
-    over = {} if split_from is None else {"dev.runner.cuda.prefill_split_from": split_from}
     cfg = config.derive(config.load(None, {"model.path": str(pair[0]), "runner.kind": "cuda",
-                                           "dev.runner.cuda.device": "cpu", **over}))
+                                           "dev.runner.cuda.device": "cpu"}))
     r = make_cuda_runner(cfg)
-    assert r.attn512_prefill == (PREFILL_FROM if split_from is None else split_from, PREFILL_KEYS)
+    assert r.attn512_prefill == (PREFILL_FROM, PREFILL_KEYS)
 
 
 def test_the_factory_passes_the_batch_invariance_switch(pair, monkeypatch) -> None:
     """`make_cuda_runner` on Gemma 4 with the switch derived on: the runner gets its parts and the switch itself, which
     it reports, so the scheduler's final chunks take their forced prefix whole (`Scheduler.forced_whole`); off, none.
-    A set dev.runner.cuda.prefill_split_from reaches its full layers' prefill split."""
+    It leaves the prefill split to the runner's defaults."""
     from llm_mini_infer import config
-    from llm_mini_infer.kernels.attn512 import PREFILL_KEYS
     from llm_mini_infer.runner.cuda import make_cuda_runner
     from llm_mini_infer.runner.cuda.gemma import GemmaRunner
     from llm_mini_infer.sched.scheduler import Scheduler
@@ -205,9 +201,4 @@ def test_the_factory_passes_the_batch_invariance_switch(pair, monkeypatch) -> No
                           grammars=Grammars(FakeGrammar(VOCAB, (EOS,))), forced_prefix=True,
                           batch_invariant=caps.batch_invariant)
         assert sched.forced_whole is on and not sched.aligned
-    assert seen["attn512_prefill"] is None  # unset: the kernels' defaults
-    cfg = config.derive(config.load(None, {"model.path": str(pair[0]), "runner.kind": "cuda",
-                                           "dev.runner.cuda.device": "cpu",
-                                           "dev.runner.cuda.prefill_split_from": 4096}))
-    make_cuda_runner(cfg)
-    assert seen["attn512_prefill"] == (4096, PREFILL_KEYS)
+    assert "attn512_prefill" not in seen  # the factory leaves it to the runner's defaults

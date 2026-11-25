@@ -397,7 +397,7 @@ def test_always_split_with_the_heads(model, k) -> None:
 def test_the_factory_passes_the_switches(model, monkeypatch) -> None:
     """`make_cuda_runner` on a Qwen with its MTP layer and structured output: every switch config.py derives on for it
     reaches the runner's constructor (PDL among them, which a CPU runner reports off whatever it is given), and the
-    runner has them; a set dev.runner.cuda.prefill_split_from reaches its full layers' prefill split."""
+    runner has them; the prefill split is left to the runner's defaults."""
     from llm_mini_infer.kernels.attn512 import PREFILL_FROM
     from llm_mini_infer.kernels.attn_window import FULL_PREFILL_KEYS
     from llm_mini_infer.runner.cuda import make_cuda_runner
@@ -427,9 +427,4 @@ def test_the_factory_passes_the_switches(model, monkeypatch) -> None:
     r = make_cuda_runner(cfg)
     assert seen["batch_invariant"] is True and r.inv and r.stats["batch_invariant"] is True
     assert r.capabilities().batch_invariant is True and r.gs.fixed_m
-    assert seen["attn_prefill"] is None and r.attn_prefill == (PREFILL_FROM, FULL_PREFILL_KEYS)
-    cfg = config.derive(config.load(None, {"model.path": str(model), "runner.kind": "cuda",
-                                           "dev.runner.cuda.device": "cpu", "dev.runner.cuda.batch_invariant": True,
-                                           "dev.runner.cuda.prefill_split_from": 1 << 20}))
-    r = make_cuda_runner(cfg)
-    assert seen["attn_prefill"] == r.attn_prefill == (1 << 20, FULL_PREFILL_KEYS)
+    assert "attn_prefill" not in seen and r.attn_prefill == (PREFILL_FROM, FULL_PREFILL_KEYS)
