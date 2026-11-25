@@ -16,6 +16,8 @@ different mask unions, so a token's column in the sparse head moves between them
   prefill row's queries past 64 keys split by 16 (`attn512_prefill`): a request whose prompt passes 64 and whose answer
   passes 512 and 1024 positions, alone and beside requests that arrive while it runs.
 - **The forced prefix** (an answer's first tokens forced): taken whole by the final chunk, alone and beside.
+- **An FP8 KV cache** (`dev.cache.kv_cache_dtype fp8`, the full layers' KV in E4M3): the text case alone and beside,
+  other bits than over BF16 KV.
 - **The dense head** (the sparse head off): its GEMM runs at each step's M, which batch invariance leaves as it is; an
   expected failure that records whether its logits' bits move.
 - **The golden:** each alone run's digest, recorded per GPU (its architecture and SM count) and tiny weights in
@@ -154,6 +156,15 @@ def test_a_requests_bits_do_not_depend_on_the_requests_beside_it(runs, case) -> 
     assert alone.heads.sparse > 0 and beside.heads.sparse > 0 and moved > 0  # columns that moved kept their bits
 
 
+def test_a_requests_bits_do_not_depend_on_the_requests_beside_it_over_an_fp8_kv_cache(runs) -> None:
+    alone, beside = runs("text", False, kv_cache_dtype="fp8"), runs("text", True, kv_cache_dtype="fp8")
+    common = same_states(alone, beside, "text")
+    n, _, differ = logits_compared(alone, beside, common)
+    assert n >= len(common) and not differ, f"{len(differ)} of {n} logits differ"
+    bf16 = runs("text", False)
+    assert any(not np.array_equal(alone.hidden[p], bf16.hidden[p]) for p in common)  # FP8 KV: other bits
+
+
 def test_a_requests_bits_do_not_depend_on_the_draft_counts(runs) -> None:
     """A draft count per step (`dev.speculative.adaptive`; forced schedules, `count_schedule`): request 0 alone at a
     fixed k, alone under a schedule, and beside requests 1-3 under others (verify rows 2, 3 and 4 wide; lowering, and
@@ -226,11 +237,13 @@ def test_the_dense_heads_logits_beside_other_requests(runs) -> None:
         raise LogitsDiffer(f"{len(differ)} of {n} logits differ, the first at (position, token) {differ[0]}")
 
 
-@pytest.mark.parametrize("case", ["text", "image", "long"])
+@pytest.mark.parametrize("case", ["text", "image", "long", "text-kvfp8"])
 def test_the_alone_runs_bits_are_the_golden(runs, case, fp8_pair, mm_pair, refresh_golden) -> None:
     """Request 0's alone run per case (the long one at `LONG`'s sizes, which its entry's name does not record: a change
-    to them changes its digest) against this GPU's entry for the case's weights."""
-    alone = runs(case, False, **(LONG if case == "long" else {}))
+    to them changes its digest; `-kvfp8`: over an FP8 KV cache) against this GPU's entry for the case's weights."""
+    base = case.removesuffix("-kvfp8")
+    alone = runs(base, False, **(LONG if base == "long" else {}),
+                 **({"kv_cache_dtype": "fp8"} if case.endswith("-kvfp8") else {}))
     entry = golden.key(case, golden.gpu(), golden.weights_digest(mm_pair if case == "image" else fp8_pair))
     golden.check(GOLDEN, entry, golden.bits_digest(alone.hidden, alone.logits, alone.images), refresh=refresh_golden,
                  stack=golden.versions(), test="tests/runner/test_batch_invariance_gpu.py")
