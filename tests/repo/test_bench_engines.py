@@ -742,7 +742,7 @@ def test_family_l_keeps_the_loads_that_fit_the_context():
     assert "decode-c1-h8k skipped" in skipped[0] and "8,448" in skipped[0] and "8,184" in skipped[0]
     kept, skipped = fits(32768)  # the "32k" loads fit a 32,768 context beside their replies
     assert kept == [*names[:7], "prefill-32k", "cached-32k"]
-    assert [n.split()[1] for n in skipped] == ["prefill-128k", "cached-128k", "arena-c32-h32k"]  # 33,088 > 32,768
+    assert [n.split()[1] for n in skipped] == ["prefill-128k", "cached-128k", "arena-c32-h32k"]  # 36,160 > 32,768
     assert fits(131072) == (names, [])
     assert fits(262144) == (names, [])
 
@@ -763,9 +763,9 @@ def test_family_l_loads_have_their_own_first_indexes_and_their_own_timeouts():
     assert "--requests" not in by["chat-c16"].args
     arena = by["arena-c32-h32k"]
     assert list(by)[-1] == "arena-c32-h32k" and first["arena-c32-h32k"] == "6000000"
-    assert arena.fixed == {"--timeout": "3600"}  # its requests queue behind a wave of 32k prefills
-    for flag, value in (("--concurrency", "32"), ("--input-tokens", "32000"), ("--max-tokens", "1024"),
-                        ("--requests", "64"), ("--warmup-requests", "0"), ("--workload", "chat")):
+    assert arena.fixed == {"--timeout": "3600"}  # a request may wait for others to finish
+    for flag, value in (("--concurrency", "32"), ("--input-tokens", "32000"), ("--max-tokens", "4096"),
+                        ("--requests", "32"), ("--warmup-requests", "0"), ("--workload", "chat")):
         assert arena.args[arena.args.index(flag) + 1] == value
     assert "--ignore-eos" in arena.args and not {"--duration", "--shared-prefix-tokens"} & set(arena.args)
 

@@ -584,14 +584,14 @@ def long_loads(context: int) -> tuple[list[LoadSpec], list[str]]:
     for each load left out. Decode: one client over a prompt of 1k, 8k and 32k tokens. Chat: family I's cell at c=16,
     and at c=64 three times, each from its own first index. Prefill: every prompt distinct, one token back, so the time
     to first token is a cold prefill. Cached: a short turn after a long shared prefix, which the warm-up requests
-    write into the cache. Arena: 32 clients over distinct "32k" prompts with replies of 1,024 tokens, a load where the
-    KV arena binds (with BF16 KV fewer of the 32 fit at once than with FP8; the server's log says how many requests of
-    a length fit); its 64 requests queue 32 at a time, so one may wait behind a wave of 32k prefills (about a million
-    tokens, minutes at a few thousand tokens a second) before its own prefill and decode, and its `--timeout`, counted
-    per request from the send, is 3,600 s. A "32k" or "128k" prompt is `LONG_TOKENS`' 32,000 or 130,000 tokens, so it
-    fits a context of 32,768 or 131,072 beside its reply. The loads with `--requests` end with their requests (run.py
-    ignores `--warmup`, `--duration` and `--tail` for them); the long ones replace FIXED's `--timeout` (a long prompt
-    takes longer than 120 s on a slow prefill)."""
+    write into the cache. Arena: one wave of 32 requests over distinct "32k" prompts with replies of 4,096 tokens, a
+    load where the KV arena binds and decoding outweighs the prefills (with BF16 KV fewer of the 32 fit at once than
+    with FP8; the server's log says how many requests of a length fit, its /metrics how many run); a request may wait
+    for others to finish before its own prefill, so its `--timeout`, counted per request from the send, is 3,600 s. A
+    "32k" or "128k" prompt is `LONG_TOKENS`' 32,000 or 130,000 tokens, so it fits a context of 32,768 or 131,072
+    beside a reply of at most 256 tokens (the arena load, with replies of 4,096, needs a context of 65,536). The loads
+    with `--requests` end with their requests (run.py ignores `--warmup`, `--duration` and `--tail` for them); the long
+    ones replace FIXED's `--timeout` (a long prompt takes longer than 120 s on a slow prefill)."""
     k32, k128 = (str(n) for n in LONG_TOKENS)
     decode = ["--workload", "chat", "--max-tokens", "256", "--ignore-eos", "--concurrency", "1",
               "--warmup-requests", "2"]
@@ -599,8 +599,8 @@ def long_loads(context: int) -> tuple[list[LoadSpec], list[str]]:
     cached = ["--workload", "chat", "--input-tokens", "128", "--max-tokens", "16", "--concurrency", "1",
               "--requests", "8", "--warmup-requests", "2"]
     long = {"--timeout": "900"}
-    arena = ["--workload", "chat", "--input-tokens", k32, "--max-tokens", "1024", "--ignore-eos", "--concurrency", "32",
-             "--requests", "64", "--warmup-requests", "0"]
+    arena = ["--workload", "chat", "--input-tokens", k32, "--max-tokens", "4096", "--ignore-eos", "--concurrency", "32",
+             "--requests", "32", "--warmup-requests", "0"]
     c64 = [LoadSpec(f"chat-c64{'' if r == 1 else f'-r{r}'}",
                     [*CHAT, "--concurrency", "64", "--first-index", str(int(FIRST["c64"][1]) + 100_000 * (r - 1))])
            for r in (1, 2, 3)]
