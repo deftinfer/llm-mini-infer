@@ -73,6 +73,12 @@ def attn_with(wrapper: Wrapper):
                                  dtype=torch.bfloat16)
 
 
+@pytest.fixture(autouse=True)
+def unpinned(monkeypatch) -> None:
+    """Pinning opens a CUDA context on a GPU host: the check's index tensors stay unpinned."""
+    monkeypatch.setattr(fl, "_pinned32", lambda a: torch.as_tensor(np.asarray(a, np.int32)))
+
+
 def test_the_0_6_18_layout_passes() -> None:
     assert fl.check_plan_info(attn_with(Wrapper())) is None
 

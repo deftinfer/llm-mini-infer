@@ -528,7 +528,9 @@ def compile_once(mode: str, schema: dict) -> None:
     assert compiled_on_threads(build(mode, schema)) == ""
 
 
-@pytest.mark.serial  # beside a second worker on CI's one core (2 vCPUs), the facets took 1.5 to 1.7 s
+# Alone on CI's runner (2 cores, 4 vCPUs, two workers): beside a second worker on an earlier 1-core runner, the
+# facets took 1.5 to 1.7 s
+@pytest.mark.serial
 def test_the_costliest_shapes_at_the_caps_compile_at_once() -> None:
     """The costliest shapes at the caps: 12 nested objects of 400 optional properties
     (Gemma's longest rules), the same with a facet on each property (formats to their cap), and an `anyOf` of 999
@@ -1054,9 +1056,9 @@ def test_a_slow_build_leaves_a_stream_smooth(tmp_path) -> None:
     """A grammar build that takes 1.5 s (held on its compile thread by a hook the test puts on the server's path: no
     schema inside the caps builds that slowly) leaves another request's stream smooth. Its longest gap stays within
     0.75 s, half the build, of the longest of two runs without it: a build on the event loop would add the whole 1.5 s.
-    A loaded host stalls a stream at times whatever runs (CI's full suite on a 2-CPU runner: 3.0 s, with the server
-    alone never), so a gap over the bound is measured again, up to three times, each with a new schema and so a new
-    build: a build on the event loop fails every one."""
+    A loaded host stalls a stream at times whatever runs (CI's full suite on an earlier 2-CPU runner: 3.0 s, with the
+    server alone never), so a gap over the bound is measured again, up to three times, each with a new schema and so
+    a new build: a build on the event loop fails every one."""
     if not env_has_model(GEMMA):
         pytest.skip(f"{GEMMA} is absent")
     hook = tmp_path / "hook"
