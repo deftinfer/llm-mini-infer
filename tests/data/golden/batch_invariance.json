@@ -90,7 +90,7 @@
    "driver": "595.112.07",
    "flashinfer": "0.7.2",
    "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
-   "kernels": "120-9c4b89df05000b80 sha256:ec8da9349f1dae0e",
+   "kernels": "120-3958d09bb29ad098 sha256:0536e5a6b9c5420b",
    "pillow": "13.0.0",
    "torch": "2.14.1+cu130"
   }
