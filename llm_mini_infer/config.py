@@ -506,7 +506,8 @@ def _moved(data: dict[str, Any], prefix: str = "") -> list[str]:
 
 
 # Dev settings, and values of one, removed after 0.8.0 (CHANGELOG.md): (the dotted name, the value refused or None for
-# any) and what holds now. A file or an override that sets one is refused naming it, before the schema's own message
+# any) and what holds now. A file or an override that sets one, in the dev group or outside it (where `_moved` no
+# longer knows it), is refused naming it, before the schema's own message
 RETIRED: dict[tuple[str, str | None], str] = {
     ("dev.speculative.draft_head_dtype", None): "the drafter's head has the target head's dtype",
     ("dev.runner.cuda.prefill_split_from", None): "the full layers' prefill split starts at the kernels' threshold, "
@@ -519,12 +520,13 @@ def _retired(data: dict[str, Any]) -> list[str]:
     """The removed dev settings and values (`RETIRED`) a file or override sets, each with what holds now."""
     out = []
     for (name, value), now in RETIRED.items():
-        *parents, leaf = name.split(".")
-        node: Any = data
-        for p in parents:
-            node = node.get(p) if isinstance(node, dict) else None
-        if isinstance(node, dict) and leaf in node and value in (None, node[leaf]):
-            out.append(f"{name}{'' if value is None else ' ' + value}: removed after 0.8.0 ({now})")
+        for given in (name, name.removeprefix("dev.")):
+            *parents, leaf = given.split(".")
+            node: Any = data
+            for p in parents:
+                node = node.get(p) if isinstance(node, dict) else None
+            if isinstance(node, dict) and leaf in node and value in (None, node[leaf]):
+                out.append(f"{given}{'' if value is None else ' ' + value}: removed after 0.8.0 ({now})")
     return out
 
 

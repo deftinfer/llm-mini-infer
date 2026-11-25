@@ -461,8 +461,8 @@ REMOVED = [  # (dotted name, a value it took, the value refused or None for any)
 def test_settings_removed_after_0_8_0_are_refused_by_name(tmp_path, monkeypatch, capsys, caplog, name, value,
                                                           only) -> None:
     """A dev setting removed after 0.8.0, or a value removed from one, fails the load from a file or an override with a
-    message that names it, says when it left and what holds now, before the schema's own message; the cli and the
-    container's entrypoint (its preflight) exit 2 with it."""
+    message that names it, says when it left and what holds now, before the schema's own message, and so does a removed
+    setting given outside the dev group; the cli and the container's entrypoint (its preflight) exit 2 with it."""
     import yaml
 
     from llm_mini_infer import cli, entrypoint
@@ -481,6 +481,11 @@ def test_settings_removed_after_0_8_0_are_refused_by_name(tmp_path, monkeypatch,
         with pytest.raises(ValueError) as err:
             config.load(path_, overrides)
         assert str(err.value) == refused
+    if only is None:  # outside the dev group (a removed value there gets the moved settings' message first)
+        outside = name.removeprefix("dev.")
+        with pytest.raises(ValueError) as err:
+            config.load(None, {outside: value})
+        assert str(err.value) == refused.replace(name, outside, 1)
     with pytest.raises(SystemExit) as exc:
         cli.main(["serve", "--model", str(tmp_path), "--set", f"{name}={value}"])
     assert exc.value.code == 2 and refused in capsys.readouterr().err
