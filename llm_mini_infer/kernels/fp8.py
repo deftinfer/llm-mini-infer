@@ -17,7 +17,6 @@ table (`table`):
 - `cutlass`: the CUTLASS SM120 blockwise kernel, vendored into our CUTLASS library (`kernels/cutlass/`), in its
   three configurations: 0 swap-AB 128×32×128, 1 ping-pong 64×128×128, 2 cooperative 128×128×128; and 3 swap-AB
   128×64×128, SGLang's tile for 128 < M ≤ 256;
-- `flashinfer`: FlashInfer's `gemm_fp8_nt_groupwise(backend="cutlass")` (one 128×128×128 configuration on SM120);
 - `torch`: `torch._scaled_mm` with 1×128 and 128×128 block scales (cuBLASLt), where torch supports it.
 The default table is set from measurements on SM120, see `DEFAULT_TABLE`. Every backend runs on the caller's stream
 with no host synchronisation, so the GEMMs are captured in the runner's CUDA graphs; the CUTLASS workspace is
@@ -55,11 +54,11 @@ FP8 = torch.float8_e4m3fn
 # SMs, on Qwen3.8 27B's shapes, confirmed on an RTX 5090): swap-AB (128 of N x 32 of M per tile) is the fastest at
 # every decode M; at M = 128 it still beats 128-row tiles on the 5,120-wide outputs (40 N tiles leave most SMs idle)
 # and on gate_up (34,816), while qkv and qkvz (one wave of 128 x 128 tiles) prefer the cooperative 128x128; ping-pong
-# 64x128 wins at M <= 256, cooperative 128x128 above. FlashInfer's one SM120 configuration is the cooperative one (no
-# faster). On Gemma 4 31B's shapes: the same picture at decode M and above 256, but its two N that Qwen has not want
-# the cooperative 128x128 earlier: gate_up (43,008) at M = 128 and 256, the full layers' qkv (18,432) at 256. Those
-# rows only cover N that Qwen's projections do not (5,120, 14,336, 16,384, 34,816), so Qwen's choices stay as above
-# (tests/runner/test_fp8.py). SGLang's swap-AB 128x64 (config 3) is never best by a clear margin.
+# 64x128 wins at M <= 256, cooperative 128x128 above. On Gemma 4 31B's shapes: the same picture at decode M and above
+# 256, but its two N that Qwen has not want the cooperative 128x128 earlier: gate_up (43,008) at M = 128 and 256, the
+# full layers' qkv (18,432) at 256. Those rows only cover N that Qwen's projections do not (5,120, 14,336, 16,384,
+# 34,816), so Qwen's choices stay as above (tests/runner/test_fp8.py). SGLang's swap-AB 128x64 (config 3) is never best
+# by a clear margin.
 BIG = 1 << 30
 DEFAULT_TABLE: list[tuple[int, int, str, int]] = [
     (96, BIG, "cutlass", 0), (128, 8192, "cutlass", 0), (128, 20480, "cutlass", 2), (128, 36864, "cutlass", 0),
@@ -84,7 +83,7 @@ class QuantAct:
 
 def scale_ld(m: int) -> int:
     """The leading dimension of a scale buffer for m tokens: packed (m). The CUTLASS kernels derive the scales' layout
-    from m; the A/B backends (FlashInfer, cuBLAS) pad their own copies."""
+    from m; the A/B backend (cuBLAS) pads its own copies."""
     return m
 
 
@@ -179,8 +178,8 @@ def use_backend(name: str) -> None:
         table([(64, BIG, "cutlass", 0), (256, BIG, "cutlass", 1), (BIG, BIG, "cutlass", 2)])
     elif name == "sglang":
         table([(128, BIG, "cutlass", 0), (256, BIG, "cutlass", 3), (BIG, BIG, "cutlass", 2)])
-    elif name in ("flashinfer", "torch"):
-        table([(BIG, BIG, name, 0)])
+    elif name == "torch":
+        table([(BIG, BIG, "torch", 0)])
     else:
         raise ValueError(f"unknown FP8 GEMM backend {name!r}")
 
@@ -220,8 +219,8 @@ def _p(t: torch.Tensor | None) -> ctypes.c_void_p:
     return ctypes.c_void_p(t.data_ptr() if t is not None else None)
 
 
-def gemm_cutlass(a: QuantAct, w: torch.Tensor, ws: torch.Tensor, config: int, out: torch.Tensor | None = None,
-                 swizzle: int | None = None) -> torch.Tensor:
+def gemm_cutlass(a: QuantAct, w: torch.Tensor, ws: torch.Tensor, config: int,
+                 out: torch.Tensor | None = None) -> torch.Tensor:
     """Our CUTLASS library. a.s must be packed (ld == m): the kernel derives its scale layout from m. It launches with
     programmatic dependent launch while our kernels do (`ops.set_pdl`)."""
     from . import ops
@@ -232,8 +231,7 @@ def gemm_cutlass(a: QuantAct, w: torch.Tensor, ws: torch.Tensor, config: int, ou
         raise ValueError(f"the CUTLASS GEMM needs packed scales (ld {a.s.shape[1]} != m {m})")
     lib = build.load_cutlass()
     sm, l2 = _device_info(a.q.device)
-    if swizzle is None:
-        swizzle = 8 if l2 and n * k > l2 else 1  # group tiles for L2 reuse when the weight exceeds the L2
+    swizzle = 8 if l2 and n * k > l2 else 1  # group tiles for L2 reuse when the weight exceeds the L2
     out = torch.empty((m, n), dtype=torch.bfloat16, device=a.q.device) if out is None else out
     wsp = cutlass_workspace(a.q.device)
     rc = lib.lmk_fp8_gemm_sm120(_p(a.q), _p(w), _p(a.s), _p(ws), _p(out), m, n, k, config, swizzle, sm,
@@ -245,8 +243,8 @@ def gemm_cutlass(a: QuantAct, w: torch.Tensor, ws: torch.Tensor, config: int, ou
 
 
 def _padded(a: QuantAct, mult: int = 4) -> QuantAct:
-    """`a`, or a copy with m rounded up to `mult` rows and packed scales (FlashInfer and cuBLAS read the scales with
-    16-byte alignment). The padding rows are zero."""
+    """`a`, or a copy with m rounded up to `mult` rows and packed scales (cuBLAS reads the scales with 16-byte
+    alignment). The padding rows are zero."""
     m, k = a.q.shape
     mp = -(-m // mult) * mult
     if mp == m and a.s.shape[1] == m:
@@ -258,18 +256,6 @@ def _padded(a: QuantAct, mult: int = 4) -> QuantAct:
     return QuantAct(q, s)
 
 
-def gemm_flashinfer(a: QuantAct, w: torch.Tensor, ws_mn: torch.Tensor) -> torch.Tensor:
-    """FlashInfer's CUTLASS groupwise GEMM in MN-major scale mode: scales [K / 128, m] for m a multiple of 4, the
-    weight scales transposed to [K / 128, N / 128]."""
-    from flashinfer.gemm import gemm_fp8_nt_groupwise
-
-    m = a.m
-    ap = _padded(a)
-    out = gemm_fp8_nt_groupwise(ap.q, w, ap.s, ws_mn, scale_major_mode="MN", out_dtype=torch.bfloat16,
-                                backend="cutlass")
-    return out[:m]
-
-
 def gemm_torch(a: QuantAct, w: torch.Tensor, ws: torch.Tensor) -> torch.Tensor:
     """torch._scaled_mm with BlockWise1x128 activations ([m, K / 128], M-major) and BlockWise128x128 weights."""
     m = a.m
@@ -278,8 +264,8 @@ def gemm_torch(a: QuantAct, w: torch.Tensor, ws: torch.Tensor) -> torch.Tensor:
     return out[:m]
 
 
-def gemm(a: QuantAct, w: torch.Tensor, ws: torch.Tensor, ws_mn: torch.Tensor | None = None,
-         out_dtype: torch.dtype = torch.bfloat16, out: torch.Tensor | None = None) -> torch.Tensor:
+def gemm(a: QuantAct, w: torch.Tensor, ws: torch.Tensor, out_dtype: torch.dtype = torch.bfloat16,
+         out: torch.Tensor | None = None) -> torch.Tensor:
     """[m, N] = the activations times the block-FP8 weight (w [N, K] e4m3, ws [N / 128, K / 128] fp32). The kernels
     write bf16; the reference (CPU, or `ops.enabled(False)`) any `out_dtype`. `out`: an [m, N] contiguous tensor to
     write into (the rows of a step's FP8 tokens, next to its PRECISE ones: `bf16_rows`)."""
@@ -293,8 +279,7 @@ def gemm(a: QuantAct, w: torch.Tensor, ws: torch.Tensor, ws_mn: torch.Tensor | N
         backend, config = _pick(a.m, w.shape[0])
         if backend == "cutlass":
             return gemm_cutlass(a, w, ws, config, out=out)
-        y = gemm_flashinfer(a, w, ws_mn if ws_mn is not None else ws.t().contiguous()) if backend == "flashinfer" \
-            else gemm_torch(a, w, ws)
+        y = gemm_torch(a, w, ws)
     if out is None:
         return y
     out.copy_(y)

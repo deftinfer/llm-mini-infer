@@ -380,7 +380,7 @@ class DevCudaConfig(_Group):
     decode_buckets: list[int] | None = None
     token_buckets: list[int] | None = None  # token counts with a breakable graph (default: default_token_buckets)
     vision_buckets: list[int] | None = None  # patch counts with a vision-tower graph ([]: eager; default: derived)
-    fp8_gemm: Literal["auto", "cutlass", "sglang", "flashinfer", "torch"] = "auto"  # block-FP8 GEMMs (kernels.fp8)
+    fp8_gemm: Literal["auto", "cutlass", "sglang", "torch"] = "auto"  # block-FP8 GEMMs (kernels.fp8)
     # The grammar-sparse head (architecture.md, "Grammar-aware heads"): on a step whose every sample token has a
     # grammar mask, the target's head scores only the union of the step's masks; other steps (a row without a mask, a
     # union over sparse_head_rows) take the dense head. Default: on with structured output
@@ -511,6 +511,7 @@ RETIRED: dict[tuple[str, str | None], str] = {
     ("dev.speculative.draft_head_dtype", None): "the drafter's head has the target head's dtype",
     ("dev.runner.cuda.prefill_split_from", None): "the full layers' prefill split starts at the kernels' threshold, "
                                                   "kernels.attn512.PREFILL_FROM",
+    ("dev.runner.cuda.fp8_gemm", "flashinfer"): "the FP8 GEMMs take auto, cutlass, sglang or torch",
 }
 
 

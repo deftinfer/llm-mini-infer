@@ -453,6 +453,7 @@ def test_deleted_settings_are_refused(tmp_path, monkeypatch, capsys, caplog, gro
 REMOVED = [  # (dotted name, a value it took, the value refused or None for any): removed after 0.8.0
     ("dev.speculative.draft_head_dtype", "fp8", None),
     ("dev.runner.cuda.prefill_split_from", 8192, None),
+    ("dev.runner.cuda.fp8_gemm", "flashinfer", "flashinfer"),  # the value alone
 ]
 
 
@@ -490,6 +491,9 @@ def test_settings_removed_after_0_8_0_are_refused_by_name(tmp_path, monkeypatch,
     logged = [r.getMessage() for r in caplog.records
               if r.name == "llm_mini_infer.entrypoint" and r.levelname == "ERROR"]
     assert exc.value.code == 2 and len(logged) == 1 and refused in logged[0]
+    if name == "dev.runner.cuda.fp8_gemm":  # the value alone left: the setting's others still load
+        for other in ("auto", "cutlass", "sglang", "torch"):
+            assert config.load(None, {name: other}).dev.runner.cuda.fp8_gemm == other
 
 
 def test_the_runner_is_cuda_unless_fake_is_set(tmp_path, monkeypatch) -> None:
