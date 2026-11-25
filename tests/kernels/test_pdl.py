@@ -12,6 +12,7 @@ from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 
 from llm_mini_infer.kernels import flashinfer, ops
@@ -134,6 +135,8 @@ def test_the_startup_check_waits_out_its_length_rewrite(monkeypatch) -> None:
         run_fixed = FlashInferAttention.run_fixed
 
     monkeypatch.setattr(torch.cuda, "synchronize", lambda device=None: None)
+    # pinning opens a CUDA context on a GPU host
+    monkeypatch.setattr(flashinfer, "_pinned32", lambda a: torch.as_tensor(np.asarray(a, np.int32)))
     assert flashinfer.check_lengths(Attn(), torch.float32) is None
     assert calls == [("fix", {"rows": 3}), ("run", {"fix": True, "enable_pdl": False}), ("run", {"fix": False})]
 

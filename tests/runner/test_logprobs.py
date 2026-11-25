@@ -19,7 +19,7 @@ from llm_mini_infer.sched.scheduler import forced_logprobs
 
 from ..support.fake_grammar import spec
 from ..support.forced_cases import structured_hybrid_workloads, structured_window_workloads
-from ..support.fuzzing import fuzz_settings, saved_on_failure, st
+from ..support.fuzzing import campaign_settings, saved_on_failure, st
 from ..support.harness import Harness, Spec
 from ..support.logprob_workload import run_both, run_logprobs_workload
 from ..support.mask_words import words_of
@@ -233,14 +233,14 @@ def logprobs_count_workloads(draw):
     return dict(kind=kind, workload=w, tops=tops)
 
 
-@fuzz_settings(150)
+@campaign_settings(150)
 @given(logprobs_workloads())
 def test_random_logprobs_workloads(w) -> None:
     with saved_on_failure("logprobs", w):
         run_logprobs_workload(w)
 
 
-@fuzz_settings(150)
+@campaign_settings(150)
 @given(logprobs_count_workloads())
 def test_random_logprobs_count_workloads(w) -> None:
     with saved_on_failure("logprobs_counts", w):

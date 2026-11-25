@@ -16,7 +16,7 @@ from hypothesis import given
 
 from llm_mini_infer.engine.messages import CHECKPOINT_SOURCES, FinishReason
 
-from ..support.fuzzing import fuzz_settings, saved_on_failure
+from ..support.fuzzing import campaign_settings, saved_on_failure
 from ..support.harness import Harness, Spec
 from ..support.sched_cases import output_of, shared, stem
 from ..support.window_workloads import (
@@ -275,14 +275,14 @@ def test_tiny_windows(window) -> None:
 # -- fuzzing -------------------------------------------------------------------------------------------------------
 
 
-@fuzz_settings(300)
+@campaign_settings(300)
 @given(window_workloads())
 def test_random_window_workloads(w) -> None:
     with saved_on_failure("window", w):
         run_window_workload(w)
 
 
-@fuzz_settings(300)
+@campaign_settings(300)
 @given(window_pressure())
 def test_random_window_pressure(w) -> None:
     with saved_on_failure("window_pressure", w):
@@ -292,14 +292,14 @@ def test_random_window_pressure(w) -> None:
 # -- the KV arena under pressure -----------------------------------------------------------------------------------
 
 
-@fuzz_settings(300)
+@campaign_settings(300)
 @given(arena_pressure())
 def test_random_arena_pressure(w) -> None:
     with saved_on_failure("arena_pressure", w):
         run_window_workload(w)
 
 
-@fuzz_settings(300)
+@campaign_settings(300)
 @given(arena_hits())
 def test_random_arena_hits(w) -> None:
     with saved_on_failure("arena_hits", w):

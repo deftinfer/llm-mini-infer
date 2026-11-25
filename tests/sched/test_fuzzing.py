@@ -1,16 +1,20 @@
 """The fuzz suites' tools: `fuzzing.st` builds each strategy once per arguments and draws what Hypothesis' own
-strategies draw; `tests/scripts/fuzz_campaign.py` starts the longest runs first."""
+strategies draw; `FUZZ_CAP` caps the campaign's suites alone; `tests/scripts/fuzz_campaign.py` starts the longest runs
+first."""
 
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 from hypothesis import HealthCheck, Phase, given, seed, settings, strategies
 
-from ..scripts.fuzz_campaign import history, longest_first
-from ..support.fuzzing import st
+from ..scripts.fuzz_campaign import SUITES, history, longest_first
+from ..support import fuzzing
+from ..support.fuzzing import campaign_settings, st
 from ..support.harness import Spec
+from ..support.paths import ROOT
 
 
 def test_strategies_are_built_once_per_arguments() -> None:
@@ -67,6 +71,19 @@ def test_a_seed_draws_what_hypothesis_own_strategies_draw() -> None:
 
     mine, own = _draws(st), _draws(Own)
     assert mine == own and len(mine) == 150
+
+
+def test_the_cap_reaches_the_campaign_suites_alone(monkeypatch) -> None:
+    """`FUZZ_CAP` caps each test of `SUITES` (`campaign_settings`), which CI's fuzz job runs at a campaign's counts; a
+    fuzz test outside them keeps its count, since CI's tests job is the one place it runs."""
+    monkeypatch.setattr(fuzzing, "LONG", False)  # a campaign's profile sets its own count
+    monkeypatch.setenv("FUZZ_CAP", "7")
+    assert campaign_settings(300).max_examples == 7 and campaign_settings(5).max_examples == 5
+    monkeypatch.delenv("FUZZ_CAP")
+    assert campaign_settings(300).max_examples == 300
+    capped = {f"{p.relative_to(ROOT).as_posix()}::{name}" for p in sorted((ROOT / "tests").rglob("test_*.py"))
+              for name in re.findall(r"^@campaign_settings\(\d+\)\n(?:.*\n)*?def (\w+)\(", p.read_text(), re.M)}
+    assert capped == set(SUITES.values())
 
 
 def test_the_campaign_orders_runs_by_the_latest_campaign_of_each_suite(tmp_path) -> None:

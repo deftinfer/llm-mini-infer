@@ -185,7 +185,9 @@ def test_the_corpus_tool_results_are_located(name) -> None:
     assert seen > 10, seen
 
 
-@pytest.mark.serial  # beside a second worker on CI's one core (2 vCPUs), 4 times the text took 9.7 times as long
+# Alone on CI's runner (2 cores, 4 vCPUs, two workers): beside a second worker on an earlier 1-core runner, 4 times
+# the text took 9.7 times as long
+@pytest.mark.serial
 def test_the_neutral_tokenization_costs_the_tokenizations_time() -> None:
     """Many short tool results, each beside an added token (benign ones included): the prompt's added tokens are placed
     in the spans by bisection, so 4 times the results take about 4 times the time; the plain tokenizer is built with

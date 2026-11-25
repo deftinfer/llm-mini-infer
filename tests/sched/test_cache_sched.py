@@ -19,20 +19,20 @@ from llm_mini_infer.cache.pools import pages_for_one_request, window_pages_for_o
 from llm_mini_infer.engine.messages import CHECKPOINT_SOURCES, FinishReason
 from llm_mini_infer.sched.plan import reserve_positions
 
-from ..support.fuzzing import fuzz_settings, saved_on_failure
+from ..support.fuzzing import campaign_settings, saved_on_failure
 from ..support.harness import Harness, Spec
 from ..support.sched_cases import VOCAB, check_plans, output_of, shared, stem
 from ..support.workloads import cache_workloads, pressure_pairs, run_cache_workload
 
 
-@fuzz_settings(300)
+@campaign_settings(300)
 @given(cache_workloads())
 def test_random_cache_workloads(w) -> None:
     with saved_on_failure("cache_sched", w):
         run_cache_workload(w)
 
 
-@fuzz_settings(300)
+@campaign_settings(300)
 @given(pressure_pairs())
 def test_random_pressure_pairs(w) -> None:
     with saved_on_failure("cache_pressure", w):
