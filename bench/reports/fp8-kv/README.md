@@ -12,12 +12,12 @@ This note measures `cache.kv_cache_dtype fp8`, Gemma 4's full-attention layers' 
 | a full page | 320 positions | 640 positions |
 | requests of 4,096 tokens at once, without shared prefixes | 48 | 52 |
 | requests of 262,144 tokens at once | 4 | 8 |
-| the arena load: most of its 32 requests running at once | 25 | 32 (for about 4 of its 5.6 minutes) |
+| the arena load: the most requests running at once | 25 | 32 (for under a minute of its 5.6 minutes: the 32 cold prefills run one after another) |
 | the arena load: preemptions | 5 | 1 |
 | the arena load: output tokens per second (2 runs) | 316.0, 316.3 | 389.6, 382.8 (+22%) |
 | the arena load: tokens per verify step | 4.30 | 5.64 |
 
-The arena load is one wave of 32 requests over distinct 32k prompts with replies of 4,096 tokens under `ignore_eos`. Each request also holds about 66 window pages whatever its length, so at short contexts FP8 adds few requests; at 262,144 it doubles them. The drafter accepts more of the FP8 arm's text on this load (the replies differ): its throughput gain is smaller than the rise in tokens per verify step, so these runs do not separate capacity from acceptance.
+The arena load is one wave of 32 requests over distinct 32k prompts with replies of 4,096 tokens under `ignore_eos`. It replaced a first version (64 requests, 1,024-token replies) whose prefills kept the arena from filling on either arm, so it showed nothing. Each request also holds about 66 window pages whatever its length, so at short contexts FP8 adds few requests; at 262,144 it doubles them. The drafter accepts more of the FP8 arm's text on this load (the replies differ): its throughput gain is smaller than the rise in tokens per verify step, so these runs do not separate capacity from acceptance.
 
 **Latency and load** (family L: three runs of each one-request cell; chat at 16 in flight one run; chat at 64 in flight over three prompt sets on three servers each, 60 s each, so one request more or less is about 0.6% of its tokens per second):
 
@@ -62,7 +62,7 @@ A verify step's time is a request's decode time over its verify steps: the engin
 
 The kernel reads half the bytes but converts each tile of 16 keys to BF16 in shared memory before the BF16 path's arithmetic (so its outputs are those of a BF16 pool of the same values), and at these shapes the conversion costs more than the bytes save.
 
-**Reading.** FP8 doubles the requests of 262,144 tokens that fit and, on a load where the arena binds, runs all 32 requests at once for most of the load (1 preemption) where BF16 runs at most 25 (5 preemptions). Per verify step the engine is as fast as with BF16 within 0.3% at 1 in flight and at 64 in flight (1.7% on a turn after a cached 128k prefix), but the conversion costs a long cold prefill 3.2% at 32k and 4.6% at 128k. The output tokens per second at 1k and 8k and in chat follow the drafts' acceptance on the text each arm generates, lower here for FP8 on those four cells; at 32k the loss is the slower prefill inside a 256-token reply. At 64 in flight the time to first token is lower with FP8 on all three prompt sets, a cause these runs do not isolate. On the same forced answers the two settings' acceptance can be compared directly (`tests.scripts.numerics_forced run --kv-cache-dtype fp8` beside a run without it, then `tests.scripts.numerics_fp32 pairs`). The setting stays off by default.
+**Reading.** FP8 doubles the requests of 262,144 tokens that fit and, on a load where the arena binds, reaches all 32 requests at once (1 preemption) where BF16 runs at most 25 (5 preemptions). Per verify step the engine is as fast as with BF16 within 0.3% at 1 in flight and at 64 in flight (1.7% on a turn after a cached 128k prefix), but the conversion costs a long cold prefill 3.2% at 32k and 4.6% at 128k. The output tokens per second at 1k and 8k and in chat follow the drafts' acceptance on the text each arm generates, lower here for FP8 on those four cells; at 32k the loss is the slower prefill inside a 256-token reply. At 64 in flight the time to first token is lower with FP8 on all three prompt sets, a cause these runs do not isolate. On the same forced answers the two settings' acceptance can be compared directly (`tests.scripts.numerics_forced run --kv-cache-dtype fp8` beside a run without it, then `tests.scripts.numerics_fp32 pairs`). The setting stays off by default.
 
 **Running it again.** On a host with this GPU, from the GPU tests' image of the commit (`tests/gpu-image.Dockerfile`), with the two models in its Hugging Face cache:
 
