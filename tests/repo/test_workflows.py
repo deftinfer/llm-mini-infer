@@ -32,9 +32,8 @@ def test_ci_runs_on_main_pull_requests_and_dispatch_and_only_reads() -> None:
     assert wf["on"] == {"push": {"branches": ["main"], "paths-ignore": ["docs/**", "**/*.md"]}, "pull_request": None,
                         "workflow_dispatch": None}
     assert wf["permissions"] == {"contents": "read"}
-    assert set(wf["jobs"]) == {"lint", "chart", "tests", "tools", "changes", "fuzz", "required"}
-    fuzz = wf["jobs"]["fuzz"]
-    assert fuzz["needs"] == "changes" and fuzz["if"] == "needs.changes.outputs.fuzz == 'true'"
+    assert set(wf["jobs"]) == {"lint", "chart", "tests", "tools", "fuzz", "required"}
+    assert not {"needs", "if"} & set(wf["jobs"]["fuzz"])  # the fuzz smoke runs on every event
     for name, job in wf["jobs"].items():
         if name == "required":  # it checks out nothing (test_the_required_check_waits_for_every_job)
             continue
@@ -44,7 +43,7 @@ def test_ci_runs_on_main_pull_requests_and_dispatch_and_only_reads() -> None:
 
 def test_the_required_check_waits_for_every_job() -> None:
     """main's ruleset requires the check `required`: it needs every other job and runs after a failure too. It passes
-    only when every other job passed, and the fuzz smoke also when it was skipped (a change without code)."""
+    only when every other job passed."""
     jobs = load("ci.yml")["jobs"]
     job = jobs["required"]
     assert set(job["needs"]) == set(jobs) - {"required"}
@@ -57,9 +56,9 @@ def test_the_required_check_waits_for_every_job() -> None:
         env = {name.upper(): results.get(name, "success") for name in job["needs"]}
         return subprocess.run(["/bin/sh", "-c", step["run"]], env=env, capture_output=True).returncode == 0
 
-    assert passes() and passes(fuzz="skipped")
+    assert passes()
     for name in job["needs"]:
-        for result in ("failure", "cancelled", *(() if name == "fuzz" else ("skipped",))):
+        for result in ("failure", "cancelled", "skipped"):
             assert not passes(**{name: result}), (name, result)
 
 
@@ -80,15 +79,12 @@ def test_ci_runs_the_checks() -> None:
     setup = next(s for s in jobs["tools"]["steps"] if s.get("uses", "").startswith("astral-sh/setup-uv@"))
     assert setup["with"]["cache-dependency-glob"] == "tools/uv.lock"
     assert "python -m tests.scripts.fuzz_campaign --examples 500 --seeds 1 2 --jobs 4" in run["fuzz"]
-    assert 'python3 .github/scripts/ci_changes.py "$BASE" "$GITHUB_SHA" >> "$GITHUB_OUTPUT"' in run["changes"]
-    checkout = next(s for s in jobs["changes"]["steps"] if s.get("uses", "").startswith("actions/checkout@"))
-    assert checkout["with"]["fetch-depth"] == 0  # the base commit is in the history
     # a failure's artifacts are where the suites write them (tests/support/paths.py): a wrong path uploads nothing
     upload = "actions/upload-artifact@"
     uploads = {name: [s["with"]["path"] for s in job["steps"] if s.get("uses", "").startswith(upload)]
                for name, job in jobs.items()}
     results = RESULTS.relative_to(ROOT).as_posix()
-    assert uploads == {"lint": [], "chart": [], "tests": [f"{results}/fuzz/failures/"], "tools": [], "changes": [],
+    assert uploads == {"lint": [], "chart": [], "tests": [f"{results}/fuzz/failures/"], "tools": [],
                        "fuzz": [f"{results}/fuzz/"], "required": []}
 
 

@@ -46,7 +46,7 @@ SKIP_FILES = {p for p in IGNORED if not (ROOT / p).is_dir()} | {
     "tests/repo/test_doc_citations.py",  # this file describes the forms it checks
 }
 # Tests that invent file names to feed a tool (a changed-files list, a repro command): not citations.
-SYNTHETIC = {"tests/repo/test_ci_changes.py", "tests/repo/test_repro_harness.py"}
+SYNTHETIC = {"tests/repo/test_repro_harness.py"}
 # Files whose bytes the image records: a wrong citation there is skipped by file:line, never edited.
 SKIP_CITATIONS: set[tuple[str, int]] = set()
 SUFFIXES = {".py", ".md", ".yaml", ".yml", ".toml", ".cu", ".cuh", ".txt"}

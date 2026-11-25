@@ -6,9 +6,6 @@
 #   a pull request                 every job, for a change to docs too: the `required` job is the check that main
 #                                  requires, and a path filter would leave it pending
 #   workflow_dispatch              every job, on any branch
-#
-# On a push or a pull request, the fuzz smoke runs only when llm_mini_infer/, tests/, the lock or this file change
-# beyond comments and docstrings (the changes job, .github/scripts/ci_changes.py).
 name: ci
 
 on:
@@ -187,30 +184,8 @@ jobs:
       - name: pytest
         run: uv run --project tools --locked pytest tools/tests -q -p no:cacheprovider
 
-  # Whether the fuzz smoke has anything to check: the push's or the pull request's files against its base, on the
-  # runner's own Python (.github/scripts/ci_changes.py); a dispatch always fuzzes
-  changes:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    outputs:
-      fuzz: ${{ steps.changes.outputs.fuzz }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-        with:
-          persist-credentials: false
-          fetch-depth: 0
-      - id: changes
-        env:
-          EVENT: ${{ github.event_name }}
-          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
-        run: |
-          if [ "$EVENT" = workflow_dispatch ]; then echo fuzz=true >> "$GITHUB_OUTPUT"; exit 0; fi
-          python3 .github/scripts/ci_changes.py "$BASE" "$GITHUB_SHA" >> "$GITHUB_OUTPUT"
-
   # Every fuzz suite, two seeds, 500 workloads each (a full campaign is 4 x 20,000, before scheduler changes merge)
   fuzz:
-    needs: changes
-    if: needs.changes.outputs.fuzz == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -234,22 +209,20 @@ jobs:
           if-no-files-found: ignore
 
   # The one check that main requires. It runs after a failure too (always()), so it always reports. It passes when every
-  # other job passed, and the fuzz smoke also when it was skipped for a change without code; it fails otherwise.
+  # other job passed, and fails otherwise.
   required:
-    needs: [lint, chart, tests, tools, changes, fuzz]
+    needs: [lint, chart, tests, tools, fuzz]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - name: every job passed (the fuzz smoke may be skipped)
+      - name: every job passed
         env:
           LINT: ${{ needs.lint.result }}
           CHART: ${{ needs.chart.result }}
           TESTS: ${{ needs.tests.result }}
           TOOLS: ${{ needs.tools.result }}
-          CHANGES: ${{ needs.changes.result }}
           FUZZ: ${{ needs.fuzz.result }}
         run: |
-          echo "lint $LINT, chart $CHART, tests $TESTS, tools $TOOLS, changes $CHANGES, fuzz $FUZZ"
-          for result in "$LINT" "$CHART" "$TESTS" "$TOOLS" "$CHANGES"; do [ "$result" = success ] || exit 1; done
-          [ "$FUZZ" = success ] || [ "$FUZZ" = skipped ]
+          echo "lint $LINT, chart $CHART, tests $TESTS, tools $TOOLS, fuzz $FUZZ"
+          for result in "$LINT" "$CHART" "$TESTS" "$TOOLS" "$FUZZ"; do [ "$result" = success ] || exit 1; done
