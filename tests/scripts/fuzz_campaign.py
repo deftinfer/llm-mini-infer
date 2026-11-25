@@ -125,7 +125,7 @@ def main() -> int:
     out = RESULTS / "fuzz" / time.strftime("%Y%m%d-%H%M%S")
     est = history(out.parent)
     out.mkdir(parents=True)
-    runs = [(s, seed) for s in args.suites for seed in args.seeds]
+    runs = [(s, seed) for s in args.suites for seed in dict.fromkeys(args.seeds)]  # a seed given twice runs once
     jobs = args.jobs or min(len(runs), os.cpu_count() or 1)
     print(f"{len(runs)} runs × {args.examples:,} workloads, {jobs} at a time; logs in {out.relative_to(ROOT)}")
     t0 = time.perf_counter()

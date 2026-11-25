@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 
 from ..scripts import plandiff as pd
+from ..support import fuzzing
 from ..support.paths import DATA
 
 BOUND = "self.soft = min(self.soft, max(grid, row_tokens // n))"
@@ -126,14 +127,20 @@ FIXED = DATA / "plandiff" / "mixed_step_bound.jsonl"
 
 
 @pytest.fixture
-def fixed_workloads(monkeypatch):
+def fixed_workloads(monkeypatch, tmp_path):
     """The base tree's draw of `arena_hits` and `gemma_images_mtp` replaced by the workloads of `FIXED`, per suite one
-    that reaches the planted bound and one that does not: no seed's draw reaches it on every platform (Hypothesis mixes
-    the literals of the modules a draw imports into it). Both trees digest them as they do drawn ones."""
+    that reaches the planted bound and one that does not: the seed whose draw reaches it in both suites differs by
+    platform (Hypothesis mixes the literals of the modules a draw imports into it). Both trees digest them as they do
+    drawn ones. The draw itself is not run for these two suites, so each line is checked to be what a draw would have
+    written: it survives the tree's loader and serializer unchanged."""
     fixed: dict[str, list[str]] = {}
     for line in FIXED.read_text().splitlines():
         row = json.loads(line)
         assert row["h"] == pd._example_hash(row["ex"]), "a stale hash in the fixed workloads"
+        saved = tmp_path / "fixed-example.json"
+        saved.write_text(json.dumps({"suite": row["suite"], "example": row["ex"]}))
+        _, ex = fuzzing.load_example(saved)
+        assert json.loads(json.dumps(fuzzing._plain(ex))) == row["ex"], "a fixed workload the serializer would change"
         fixed.setdefault(row["suite"], []).append(json.dumps({"h": row["h"], "ex": row["ex"]}))
     real = pd.run_worker
 
@@ -152,8 +159,11 @@ def test_a_planted_decision_is_flagged_with_its_fields(trees, fixed_workloads, t
     clean, planted = trees
     # Two suites that reach the bound on fixed workloads (not window_precise: its refines go in fixed pieces, which pass
     # the bound whole), and radix, which draws its own. If the fixed ones stop reaching it (the scheduler or the example
-    # format moved), draw new ones: plandiff with these trees and a seed that flags both, then per suite the smallest
-    # changed and unchanged lines of the examples-<suite>.jsonl in its --out
+    # format moved), draw new ones: unpack HEAD twice (`git archive`), make the `trees` fixture's edit in one copy,
+    # and run `python -m tests.scripts.plandiff --base <clean> --new <planted> --suites <suite> --seed <s>` per suite
+    # with seeds until it reports a change. Then take from its --out the smallest changed line of
+    # examples-<suite>.jsonl (summary.json's changed_examples names them) and the smallest unchanged one, and add the
+    # suite's name to each as "suite"
     suites = ("arena_hits", "gemma_images_mtp", "radix")
     assert fixed_workloads == suites[:2], fixed_workloads
     status, summary, report = _run(tmp_path / "unexpected", "--base", str(clean), "--new", str(planted), "--suites",
