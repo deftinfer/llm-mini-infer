@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+Breaking:
+- The dev settings `dev.speculative.draft_head_dtype` and `dev.runner.cuda.prefill_split_from` are removed, and so is the value `flashinfer` of `dev.runner.cuda.fp8_gemm`. A configuration that sets one fails the load (exit 2) with a message that names it and says what holds now: the drafter's head has the target head's dtype, the full layers' prefill split starts at the kernels' threshold (`kernels.attn512.PREFILL_FROM`), and the FP8 GEMMs take `auto`, `cutlass`, `sglang` or `torch`.
+- `/metrics` no longer serves `llm_mini_infer:spec_first_rejections_total` and `llm_mini_infer:spec_window_mask_tokens`, and the host check's report no longer has the `spec_first_rejections` key.
+
 ## 0.8.0
 
 This is the first public release of llm-mini-infer. It is an LLM inference server for Gemma 4 31B and Qwen3.8 27B. It runs on one NVIDIA SM120 GPU, such as the RTX PRO 6000 Blackwell. It ships as a container image with prebuilt kernels and as a Helm chart. The [README](README.md#quickstart) has the quickstart.
