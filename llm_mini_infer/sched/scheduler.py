@@ -170,7 +170,6 @@ def _lp_unused(n: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return (np.full(n, np.nan, np.float32), np.zeros((n, MAX_LOGPROBS), np.int32),
             np.full((n, MAX_LOGPROBS), np.nan, np.float32))
 _OUT_W = 256  # per-slot ring of generated tokens; full rows are flushed to the request (needed for recompute)
-GROW_ROWS = 4  # decode rows crossing a page boundary in one step from which `_grow_rows` takes their pages at once
 
 
 class Req:
@@ -1240,7 +1239,10 @@ class Scheduler:
                 need = (self.mirror[dec] + (self.reserve + self.ps - 1)) // self.ps - self.num_pages[dec]
                 needw = None
                 if self.window:  # each row's first query is at mirror + dev_inflight or later (MTP): slide its window
-                    self._wslide(dec, self.mirror[dec] + self.dev_inflight[dec])
+                    q = self.mirror[dec] + self.dev_inflight[dec]
+                    lo = np.maximum(q - self.window + 1, 0) // self.wps
+                    for i in np.flatnonzero(lo > self.wlo[dec]).tolist():
+                        self._wrelease(int(dec[i]), int(q[i]))
                     needw = (self.mirror[dec] + (self.reserve + self.wps - 1)) // self.wps - self.num_wpages[dec]
                     short = np.flatnonzero((need > 0) | (needw > 0))
                     ok = not short.size or self._ensure_pages(int(need[need > 0].sum()), int(needw[needw > 0].sum()))
@@ -1251,7 +1253,10 @@ class Scheduler:
                     dec, stop_running = self._decode_with_preemption(order, dec, need, needw)
                     preempted = True
                 elif short.size:
-                    self._grow_rows(dec[short], need[short], None if needw is None else needw[short])
+                    for i in short.tolist():
+                        self._grow(int(dec[i]), int(need[i]))
+                        if needw is not None:
+                            self._wgrow(int(dec[i]), int(needw[i]))
                 if len(dec):
                     row0 = b.n_sched
                     b.add_device_rows(dec, self.masked[dec] if self.n_masked else None,
@@ -3493,51 +3498,6 @@ class Scheduler:
         self.num_pages[slot] = first + n
         self.builder.add_pages(slot, first, pages)
 
-    def _grow_rows(self, slots: np.ndarray, need: np.ndarray, needw: np.ndarray | None) -> None:
-        """`_grow`, then `_wgrow`, for each of the decode rows `slots` in turn, at once (a batch whose rows cross a page
-        boundary together): one allocation, cut in the order those calls take pages off the free stack (a row's full
-        pages, then its window pages), so every page id and plan entry is theirs. Python only extends the requests'
-        page tables. Fewer than `GROW_ROWS` rows take those calls: their arrays would cost more."""
-        if len(slots) < GROW_ROWS:
-            for slot, a, c in zip(slots.tolist(), need.tolist(), [0] * len(slots) if needw is None else needw.tolist()):
-                self._grow(slot, a)
-                self._wgrow(slot, c)
-            return
-        n = np.maximum(need, 0).tolist()
-        nw = np.maximum(needw, 0).tolist() if needw is not None else [0] * len(n)
-        pages = self.kv.alloc(sum(n) + sum(nw))  # `wkv` is `kv` in window mode
-        if pages is None:
-            raise RuntimeError("page allocation failed after the capacity check")
-        fs, fi, fn, fp = [], [], [], []  # full pages: the rows' slots, first new page indices and counts; the pages
-        ws, wi, wn, wp = [], [], [], []  # window pages: the same
-        i = 0
-        for slot, a, c in zip(slots.tolist(), n, nw):
-            req = self.slot_req[slot]
-            if a:
-                got = pages[i:i + a]
-                fs.append(slot)
-                fi.append(len(req.pages))
-                fn.append(a)
-                fp += got
-                req.pages += got
-                i += a
-            if c:
-                got = pages[i:i + c]
-                ws.append(slot)
-                wi.append(len(req.wpages))
-                wn.append(c)
-                wp += got
-                req.wpages += got
-                i += c
-        if fs:
-            if self._n_unv or self._orphans:  # as at admission
-                self.cache.unverified[fp] = 0
-            self.num_pages[fs] = np.add(fi, fn)
-            self.builder.add_page_runs(fs, fi, fn, fp)
-        if ws:
-            self.num_wpages[ws] = np.add(wi, wn)
-            self.builder.add_page_runs(ws, wi, wn, wp, window=True)
-
     # -- the window pool (sliding-window models) ---------------------------------------------------------------
 
     def _wgrow(self, slot: int, n: int) -> None:
@@ -3572,31 +3532,6 @@ class Scheduler:
             self.wkv.release(old)
             self.pending_wclear.append((slot, a, lo - a))  # cleared in the runner's table too
         self.wlo[slot] = lo
-
-    def _wslide(self, slots: np.ndarray, q: np.ndarray) -> None:
-        """`_wrelease` for decode rows, at once: Python only clears the tables of the rows that cross a page boundary,
-        and their pages go back in one release, row after row, as the per-row releases free them; per row only when two
-        rows hold the same page (a window both resumed from), which the later of their releases frees."""
-        lo = np.maximum(q - self.window + 1, 0) // self.wps
-        rows = np.flatnonzero(lo > self.wlo[slots])
-        if not len(rows):
-            return
-        slots, lo = slots[rows], lo[rows]
-        old: list[list[int]] = []
-        for slot, a, b in zip(slots.tolist(), self.wlo[slots].tolist(), lo.tolist()):
-            table = self.slot_req[slot].wpages
-            got = [p for p in table[a:b] if p]
-            table[a:b] = [0] * (b - a)
-            if got:
-                old.append(got)
-                self.pending_wclear.append((slot, a, b - a))  # cleared in the runner's table too
-        flat = [p for got in old for p in got]
-        if len(set(flat)) == len(flat):
-            self.wkv.release(flat)
-        else:
-            for got in old:
-                self.wkv.release(got)
-        self.wlo[slots] = lo
 
     def _make_window(self, req: Req, c: int) -> int:
         """A window checkpoint at position c from the request's own window pages: the ones holding positions

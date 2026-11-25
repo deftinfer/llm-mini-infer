@@ -516,28 +516,6 @@ class PlanBuilder:
         self.b.wpage_id[i:i + n] = page_ids
         self.n_wpages = i + n
 
-    def add_page_runs(self, slots: list[int], first: list[int], counts: list[int], page_ids: list[int],
-                      window: bool = False) -> None:
-        """`add_pages` (`add_wpages` if `window`) for several slots in turn, at once: slot `slots[j]` gets `counts[j]`
-        pages from page index `first[j]`, the next ones of `page_ids`."""
-        b, n = self.b, len(page_ids)
-        dst = (b.wpage_slot, b.wpage_index, b.wpage_id) if window else (b.page_slot, b.page_index, b.page_id)
-        i = self.n_wpages if window else self.n_pages
-        if i + n > len(dst[2]):
-            raise RuntimeError(f"{'window ' if window else ''}page-write capacity exceeded")
-        if n == len(slots):  # a page each (rows crossing a page boundary together)
-            dst[0][i:i + n] = slots
-            dst[1][i:i + n] = first
-        else:
-            k = np.asarray(counts)
-            dst[0][i:i + n] = np.repeat(slots, k)
-            dst[1][i:i + n] = np.arange(n) + np.repeat(np.asarray(first) - (np.cumsum(k) - k), k)
-        dst[2][i:i + n] = page_ids
-        if window:
-            self.n_wpages = i + n
-        else:
-            self.n_pages = i + n
-
     def add_wkv_copy(self, src: int, dst: int) -> None:
         """KV_COPY of a whole window page."""
         b, i = self.b, self.n_wkv_copy

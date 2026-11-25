@@ -10,7 +10,6 @@ pools and that everything comes back once the cache is cleared.
 
 from __future__ import annotations
 
-import numpy as np
 import pytest
 from hypothesis import given
 
@@ -152,58 +151,19 @@ def test_decode_windows_serve_a_continuation() -> None:
     assert h.results[1].cached == 80  # the decode window at 80 (20 prompt + 60 generated)
 
 
-def test_rows_crossing_pages_together_get_the_pages_of_row_by_row_calls() -> None:
+def test_rows_crossing_pages_together_share_a_window() -> None:
     """Ten requests resume from one window (a 40-token prompt another request computed) and decode in step: every 4
     tokens their rows cross a window page boundary together, every 20 a full page's too, and past the window they give
-    back the pages of the window they share, then their own. `Scheduler._grow_rows` and `_wslide` take and give back
-    those pages at once; the plans (every page id) and the arena's free list are those of the calls row by row, and the
-    strict fake checks every row's window."""
+    back the pages of the window they share, then their own. The strict fake checks every row's window, and the
+    scheduler's accounting is checked at every turn."""
     prompt = stem(7, 40)
-
-    def run(per_row: bool) -> tuple[list, list[int], dict[str, int]]:
-        specs = [Spec(rid=0, prompt_len=0, prompt=prompt, max_tokens=2, seed=70)]
-        specs += [Spec(rid=i, prompt_len=0, prompt=prompt, max_tokens=60, seed=70 + i, arrive=8, ignore_eos=True)
-                  for i in range(1, 11)]
-        h = harness(specs, max_num_seqs=10)
-        s, seen = h.sched, {"grow": 0, "slide": 0, "shared": 0}
-        grow_rows, wslide = s._grow_rows, s._wslide
-
-        def grow(slots, need, needw):
-            seen["grow"] = max(seen["grow"], len(slots))
-            if not per_row:
-                return grow_rows(slots, need, needw)
-            for slot, a, c in zip(slots.tolist(), need.tolist(), needw.tolist()):
-                s._grow(slot, a)
-                s._wgrow(slot, c)
-
-        def slide(slots, q):
-            lo = np.maximum(q - s.window + 1, 0) // s.wps
-            rows = np.flatnonzero(lo > s.wlo[slots]).tolist()
-            held = [p for i in rows for p in s.slot_req[int(slots[i])].wpages[int(s.wlo[slots[i]]):int(lo[i])] if p]
-            seen["slide"] = max(seen["slide"], len(rows))
-            seen["shared"] += len(set(held)) < len(held)
-            if not per_row:
-                return wslide(slots, q)
-            for i in rows:
-                s._wrelease(int(slots[i]), int(q[i]))
-
-        s._grow_rows, s._wslide = grow, slide
-        pages, launch = [], h.runner.launch_forward
-
-        def record(plan):
-            pages.append([a.tolist() for a in (plan.page_slot, plan.page_index, plan.page_id, plan.wpage_slot,
-                                               plan.wpage_index, plan.wpage_id)])
-            return launch(plan)
-
-        h.runner.launch_forward = record
-        h.run(check_every_turn=True)
-        h.check()
-        assert all(h.results[i].cached == 36 for i in range(1, 11))  # in step: the prompt's end on the page grid
-        return pages, list(s.kv._free), seen
-
-    batched, free, seen = run(per_row=False)
-    assert (batched, free) == run(per_row=True)[:2]
-    assert seen["grow"] == seen["slide"] == 10 and seen["shared"]  # every row at once, shared pages among them
+    specs = [Spec(rid=0, prompt_len=0, prompt=prompt, max_tokens=2, seed=70)]
+    specs += [Spec(rid=i, prompt_len=0, prompt=prompt, max_tokens=60, seed=70 + i, arrive=8, ignore_eos=True)
+              for i in range(1, 11)]
+    h = harness(specs, max_num_seqs=10)
+    h.run(check_every_turn=True)
+    h.check()
+    assert all(h.results[i].cached == 36 for i in range(1, 11))  # in step: the prompt's end on the page grid
 
 
 def test_preemption_mid_prefill_resumes_from_its_window() -> None:
