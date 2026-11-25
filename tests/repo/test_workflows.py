@@ -92,22 +92,30 @@ def test_ci_runs_the_checks() -> None:
 
 def test_ci_shards_the_cpu_suite_over_all_of_tests() -> None:
     """The CPU suite runs in shards, each in pytest-xdist's workers by file: the named shards take test directories
-    apart, and the last takes tests/ without them, so every test runs in exactly one shard."""
+    apart, and the last takes tests/ without them, so every test runs in exactly one shard. A shard runs its two phases
+    (the workers, then the serial tests alone) in one job or in two."""
     job = load("ci.yml")["jobs"]["tests"]
     assert job["strategy"]["fail-fast"] is False  # one shard's failure leaves the others their results
-    *named, rest = job["strategy"]["matrix"]["include"]
-    assert len({s["shard"] for s in [*named, rest]}) == len(named) + 1
-    taken = [p for s in named for p in s["paths"].split()]
+    entries = job["strategy"]["matrix"]["include"]
+    assert len({s["shard"] for s in entries}) == len(entries)
+    phases: dict[str, list[str]] = {}
+    for s in entries:
+        phases.setdefault(s["paths"], []).extend(s["phases"].split())
+    # each set of directories runs each phase once: a test is in exactly one phase of one job
+    assert all(sorted(p) == ["serial", "workers"] for p in phases.values()), phases
+    *named, rest = phases
+    taken = [p for paths in named for p in paths.split()]
     assert len(set(taken)) == len(taken) and all(p.startswith("tests/") and (ROOT / p).is_dir() for p in taken)
-    assert rest["paths"].split() == ["tests", *(f"--ignore={p}" for p in taken)]
+    assert rest.split() == ["tests", *(f"--ignore={p}" for p in taken)]
     (step,) = [s for s in job["steps"] if s.get("name") == "pytest"]
-    assert step["env"] == {"PATHS": "${{ matrix.paths }}"}
+    assert step["env"] == {"PATHS": "${{ matrix.paths }}", "PHASES": "${{ matrix.phases }}"}
     # a hung run ends at `timeout`'s limits, inside the step, so the step's log is kept: the two limits, each with
     # its minute to kill and its sweep, end under the step's limit, and that under the job's
     assert step["timeout-minutes"] < job["timeout-minutes"]
     pytest = "uv run --locked pytest -q -p no:cacheprovider -ra -o faulthandler_timeout=300"
     lines = [line.strip() for line in step["run"].splitlines()]
     assert lines == [
+        'grep -m 1 "model name" /proc/cpuinfo || true',  # the runner's CPU differs by job, and a job's time with it
         "status=0",
         'stop="$RUNNER_TEMP/sample-stop" dump="$RUNNER_TEMP/sample-dump-at"',
         # the memory sampler, beside the tests, on the runner's own Python
@@ -122,15 +130,15 @@ def test_ci_shards_the_cpu_suite_over_all_of_tests() -> None:
         'timeout 30 uv run --locked python -c "from tests.support.api_util import sweep_stale; sweep_stale()"',
         "return $code",
         "}",
-        # the workers, then the serial tests alone; both run, and either one's failure fails the step
-        'guarded 840 -n 2 --dist loadfile -m "not serial" $PATHS || status=$?',
-        "guarded 480 -m serial $PATHS || [ $? -eq 5 ] || status=1",
+        # the job's phases: the workers, then the serial tests alone; each runs, and either one's failure fails the step
+        '[[ $PHASES != *workers* ]] || guarded 840 -n 2 --dist loadfile -m "not serial" $PATHS || status=$?',
+        "[[ $PHASES != *serial* ]] || guarded 480 -m serial $PATHS || [ $? -eq 5 ] || status=1",
         'touch "$stop"',
         "wait",
         "exit $status",
     ]
     # each call's limit, its minute to kill and its sweep
-    limits = [int(line.split()[1]) + 60 + 30 for line in lines if re.match(r"guarded \d+ ", line)]
+    limits = [int(m.group(1)) + 60 + 30 for line in lines if (m := re.search(r"\|\| guarded (\d+) ", line))]
     assert len(limits) == 2 and sum(limits) < step["timeout-minutes"] * 60
     assert (WORKFLOWS.parent / "scripts" / "ci_sample.py").is_file()
     assert "\ndef sweep_stale() -> None:" in (ROOT / "tests" / "support" / "api_util.py").read_text()

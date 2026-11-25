@@ -142,7 +142,7 @@ These are maintainer notes. Do them in this order:
 
 ## CI and style
 
-`.github/workflows/ci.yml` runs on pushes to main, pull requests and dispatches (`gh workflow run ci.yml --ref <branch>`). A push to main that changes documentation only starts no job. Its jobs: ruff, the Helm chart (`helm lint`, `helm template`, kubeconform), the CPU suite in three parallel shards (by directory, in two workers, then the `serial` tests alone, as `ci.yml` describes), `tools/`'s tests, and every fuzz suite on two seeds of 500 examples. The second is the run's number, so a pull request can fail on a draw its change did not cause: `--replay` (above) runs the example in the job's `fuzz` artifact. The job `required` passes when every other job passed. It is the check that main requires before a pull request merges.
+`.github/workflows/ci.yml` runs on pushes to main, pull requests and dispatches (`gh workflow run ci.yml --ref <branch>`). A push to main that changes documentation only starts no job. Its jobs: ruff, the Helm chart (`helm lint`, `helm template`, kubeconform), the CPU suite in parallel shards (by directory, in two workers, the `serial` tests alone, as `ci.yml` describes), `tools/`'s tests, and every fuzz suite on two seeds of 500 examples. The second is the run's number, so a pull request can fail on a draw its change did not cause: `--replay` (above) runs the example in the job's `fuzz` artifact. The job `required` passes when every other job passed. It is the check that main requires before a pull request merges.
 
 Dependabot (`.github/dependabot.yml`) never bumps the pinned GPU stack: a maintainer bumps it by hand and runs the GPU suite again. A security fix's commit body says which code paths the vulnerability reaches.
 

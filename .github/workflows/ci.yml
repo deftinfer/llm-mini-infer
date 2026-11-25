@@ -86,13 +86,14 @@ jobs:
             "$RUNNER_TEMP"/rendered/*.yaml deploy/helm/examples/*.yaml
 
   # The CPU suite (GPU tests skip), with the model fixtures (tests/scripts/fetch_fixtures.py: tokenizers and
-  # configurations, no weights, cached by their pins) and helm (tests/deploy/test_helm.py), in three shards by directory
-  # on their own runners; the last takes every directory the others do not name, so no new one is left out. The runner
+  # configurations, no weights, cached by their pins) and helm (tests/deploy/test_helm.py), in shards by directory on
+  # their own runners; the last takes every directory the others do not name, so no new one is left out. The runner
   # has 2 cores (4 vCPUs; its CPU model varies by job), where torch's default is 2 threads, and about 16 GB: two
   # pytest-xdist workers, a file's tests on one, so a module's server starts once. When its RAM and 3 GB of swap fill,
   # the job ends (a shutdown signal, or a hang that keeps no log), so the tests' servers start no image pool unless a
   # test asks (tests/support/api_util.py), and a test whose servers leave no room for a second worker's (an image pool,
-  # or in the structured shard a server beside its module's) carries the serial mark and runs after the workers, alone
+  # or in the structured shard a server beside its module's) carries the serial mark and runs alone: after its shard's
+  # workers, or for tests/api, whose serial tests take as long as its workers, in a job of their own
   tests:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -104,10 +105,16 @@ jobs:
         include:
           - shard: api
             paths: tests/api
+            phases: workers
+          - shard: api-serial
+            paths: tests/api
+            phases: serial
           - shard: structured
             paths: tests/structured tests/tool_calls
+            phases: workers serial
           - shard: other
             paths: tests --ignore=tests/api --ignore=tests/structured --ignore=tests/tool_calls
+            phases: workers serial
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -133,9 +140,11 @@ jobs:
       - name: pytest
         env:
           PATHS: ${{ matrix.paths }}
-        # The workers, then alone the serial tests (a timing bound that needs a whole core, servers that need the
-        # runner's memory): a shard without one collects none (pytest's exit 5). Both run, and either one's failure
-        # fails the step. faulthandler_timeout dumps every thread's stack when a test runs past 300 s. `timeout` ends
+          PHASES: ${{ matrix.phases }}
+        # The job's phases: the workers, then alone the serial tests (a timing bound that needs a whole core, servers
+        # that need the runner's memory): a shard without one collects none (pytest's exit 5). Each phase of the job
+        # runs, and either one's failure fails the step. The first line names the runner's CPU, which decides much of
+        # a job's time. faulthandler_timeout dumps every thread's stack when a test runs past 300 s. `timeout` ends
         # a run that hangs, inside the step, with the step's log kept (a job that reaches its limit keeps none). A
         # killed pytest reports nothing and stops no server: the step names the limit it ran into, and after a pytest
         # that failed, the servers whose pytest process is gone are killed, each with its process group
@@ -144,6 +153,7 @@ jobs:
         # limit ([hang]), and at the end the peaks and what was left ([end])
         timeout-minutes: 26
         run: |
+          grep -m 1 "model name" /proc/cpuinfo || true
           status=0
           stop="$RUNNER_TEMP/sample-stop" dump="$RUNNER_TEMP/sample-dump-at"
           python3 .github/scripts/ci_sample.py --watch $$ --stop "$stop" --dump-at "$dump" &
@@ -156,8 +166,8 @@ jobs:
             timeout 30 uv run --locked python -c "from tests.support.api_util import sweep_stale; sweep_stale()"
             return $code
           }
-          guarded 840 -n 2 --dist loadfile -m "not serial" $PATHS || status=$?
-          guarded 480 -m serial $PATHS || [ $? -eq 5 ] || status=1
+          [[ $PHASES != *workers* ]] || guarded 840 -n 2 --dist loadfile -m "not serial" $PATHS || status=$?
+          [[ $PHASES != *serial* ]] || guarded 480 -m serial $PATHS || [ $? -eq 5 ] || status=1
           touch "$stop"
           wait
           exit $status
@@ -187,7 +197,7 @@ jobs:
         run: uv run --project tools --locked pytest tools/tests -q -p no:cacheprovider
 
   # Every fuzz suite, 500 workloads on each of two seeds: 1, and the run's number, which draws anew on each run and
-  # again on a rerun (a full campaign is 4 x 20,000, before scheduler changes merge)
+  # the same again on a rerun (a full campaign is 4 x 20,000, before scheduler changes merge)
   fuzz:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
