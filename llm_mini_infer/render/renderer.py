@@ -154,7 +154,10 @@ class Renderer:
                 probe = self.render([{"role": "system", "content": "s"}, {"role": "user", "content": "u"},
                                      {"role": "assistant", "content": "a"}, {"role": "user", "content": "v"}])
             except TemplateError:
-                probe = self.default_template
+                try:
+                    probe = self.default_template
+                except TemplateError:
+                    probe = None  # a template list with no default: no cache hint; requests answer 400 instead
         pick = pick_split_token(self.tokenizer, probe)
         if pick is None:
             log.info("no safe split token in the chat template: prompt tokenization is not cached")
