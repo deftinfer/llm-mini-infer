@@ -10,11 +10,11 @@ import numpy as np
 from hypothesis import assume
 
 from llm_mini_infer.cache.pools import pages_for_one_request
-from llm_mini_infer.engine.messages import MASK_CLASSES, POPCOUNT_BUCKETS, FinishReason
+from llm_mini_infer.engine.messages import FinishReason
 from llm_mini_infer.grammar.engine import Grammars
-from llm_mini_infer.runner.fake import fake_generate, unpack_mask
+from llm_mini_infer.runner.fake import fake_generate
 from llm_mini_infer.sched.plan import reserve_positions
-from llm_mini_infer.sched.scheduler import RUNNING, WAITING, Inflight, Req, Scheduler
+from llm_mini_infer.sched.scheduler import RUNNING, Inflight, Req, Scheduler
 
 from .fake_grammar import FakeGrammar, spec
 from .fuzzing import event, nan_write, st
@@ -26,8 +26,7 @@ from .window_mtp import harness as window_harness
 from .workloads import GRIDS
 
 STOP, LENGTH, ABORT, ERROR = FinishReason.STOP, FinishReason.LENGTH, FinishReason.ABORT, FinishReason.ERROR
-FORCED, EOS_CLASS, CHOICE, FREE = (MASK_CLASSES.index(c) for c in ("forced", "eos", "choice", "free"))
-FAKE = Grammars(FakeGrammar(VOCAB, (EOS,)))  # the harness's grammars: the oracle's forced prefixes
+FAKE = Grammars(FakeGrammar(VOCAB, (EOS,)))  # the harness's grammars: the predictions' forced prefixes
 
 
 def forced_of(text: str) -> tuple[int, ...]:
@@ -214,99 +213,6 @@ class Probe:
         assert all(n > 0 for n, _ in self.forced.values())
 
 
-class MaskOracle:
-    """The verify-mask counters recomputed from what the fake runner verified (`launch_sample` wrapped): for every MTP
-    verify row with masks, the v drafts it verified (k, or the step's draft count: `handle.v`), its 1 + v masks, its
-    tokens and status. A row counts when its
-    request was the row's at `process` and no failure there took it (`_fail` wrapped), or when its request was
-    preempted while it was in flight and still waits for it (a held sample, delivered unless its status says NONFINITE
-    or an empty mask, which no row counts with): the masks it read are those
-    after the pending token and after each accepted draft (`n_out` of them), and its first rejected draft, one that
-    differs from the target's sample there (a draft equal to it was refused by a commit limit), falls under the class
-    of that mask: one token, the EOS alone (`eos`) or another (`forced`), every token (`free`), or a choice."""
-
-    def __init__(self, h: Harness):
-        r, s = h.runner, h.sched
-        self.k, self.vocab = s.k, r.vocab
-        self.rows: dict[int, list[tuple]] = {}
-        self.counted: dict[int, np.ndarray] = {}
-        self._failed: set[int] | None = None
-        launch, process, fail = r.launch_sample, s.process, s._fail
-
-        def launch_sample(handle: Any, n_masks: int = 0) -> None:
-            v = int(handle.v)  # the drafts the step verifies, as the scheduler's `_v` (its masks: 1 + v a row)
-            seen = [(i, r.drafts[slot, :v].copy(), r._masks[handle.mask_off[i]:handle.mask_off[i] + 1 + v].copy())
-                    for i, slot in enumerate(handle.rows[0].tolist()) if handle.mtp[i] and handle.masked[i]]
-            if seen and v < self.k:
-                event("verify rows with masks at a count below k")
-            step = handle.step_id
-            launch(handle, n_masks)
-            res = handle.result
-            st_ = res.status if res.status is not None else np.zeros(len(res.n_out), np.uint32)
-            self.rows[step] = [(i, d, m, res.tokens[i].copy(), int(res.n_out[i]), int(st_[i])) for i, d, m in seen]
-
-        def _fail(req: Req, *a: Any, **kw: Any) -> Any:
-            if self._failed is not None:
-                self._failed.add(int(s.aid[req.slot]))
-            return fail(req, *a, **kw)
-
-        def _process(inf: Inflight, *a: Any, **kw: Any) -> Any:
-            valid = s.aid[inf.slots] == inf.aids
-            held = inf.sample & np.array([(r := s._held.get(a)) is not None and r.status == WAITING
-                                          for a in inf.aids.tolist()], bool)
-            self._failed = set()
-            try:
-                return process(inf, *a, **kw)
-            finally:
-                self.counted[inf.step_id] = (valid & ~np.isin(inf.aids, list(self._failed))) | held
-                self._failed = None
-
-        r.launch_sample, s.process, s._fail = launch_sample, _process, _fail
-
-    def expected(self, vocab_sum: bool = True) -> tuple[np.ndarray, np.ndarray, int]:
-        """(first rejections by class, the masks read by popcount bucket, their popcounts summed): over the vocabulary
-        (`vocab_sum`), or over the mask words as the scheduler reads them (an all-ones mask counts its padding bits)."""
-        rej = np.zeros(len(MASK_CLASSES), np.int64)
-        hist = np.zeros(len(POPCOUNT_BUCKETS) + 1, np.int64)
-        total = 0
-        for step, rows in self.rows.items():
-            counted = self.counted.get(step)
-            if counted is None:
-                continue
-            for i, drafts, masks, toks, n, status in rows:
-                if not counted[i] or status:
-                    continue
-                acc = n - 1
-                for j in range(acc + 1):
-                    p = int(unpack_mask(masks[j], self.vocab).sum())
-                    hist[np.searchsorted(POPCOUNT_BUCKETS, p)] += 1
-                    total += p if vocab_sum else int(np.bitwise_count(masks[j].view(np.uint32)).sum())
-                if acc < len(drafts) and drafts[acc] != toks[acc]:  # a draft verified and rejected
-                    a = unpack_mask(masks[acc], self.vocab)
-                    p = int(a.sum())
-                    rej[(EOS_CLASS if a[EOS] else FORCED) if p == 1 else FREE if a.all() else CHOICE] += 1
-        return rej, hist, total
-
-    def read_classes(self) -> Counter:
-        """The masks verification read, by class (as the first rejections are classed)."""
-        out: Counter = Counter()
-        for step, rows in self.rows.items():
-            counted = self.counted.get(step)
-            for i, _, masks, _, n, status in rows:
-                if counted is not None and counted[i] and not status:
-                    for j in range(n):
-                        a = unpack_mask(masks[j], self.vocab)
-                        p = int(a.sum())
-                        out[(EOS_CLASS if a[EOS] else FORCED) if p == 1 else FREE if a.all() else CHOICE] += 1
-        return out
-
-    def check(self, s: Scheduler, vocab_sum: bool = True) -> None:
-        rej, hist, total = self.expected(vocab_sum)
-        assert s.first_rejections.tolist() == rej.tolist(), (s.first_rejections.tolist(), rej.tolist())
-        assert s.window_masks.tolist() == hist.tolist(), (s.window_masks.tolist(), hist.tolist())
-        assert s.window_masks_sum == total, (s.window_masks_sum, total)
-
-
 def run(h: Harness, failed_ok: bool = False) -> Harness:
     """A full run with every check: each turn's accounting (and `check_unrep`), the plans, the NaN invariants, the
     outputs against the predictions, and the grammars' state at the end."""
@@ -435,7 +341,7 @@ def structured_window_workloads(draw):
 @st.composite
 def structured_window_count_workloads(draw):
     """`structured_window_workloads` at k of 2 or more with a draft count per step (`mtp_workloads.with_counts`): the
-    forced prefix, the EOS-free finish and the verify-mask counters while the verified and drafted counts change."""
+    forced prefix and the EOS-free finish while the verified and drafted counts change."""
     from .mtp_workloads import with_counts
 
     w = draw(structured_window_workloads())
@@ -544,14 +450,13 @@ def run_switches_workload(w: dict) -> Harness:
     predictions (the sampled path's) wherever no injection fired; each turn's accounting and unreported tokens
     (`Probe`); the plans; the NaN invariants; the precise prefix's (`check_precise`, every turn) where it is on; no
     grammar error; the forced-prefix and EOS-free counters against what the probe saw, each zero with its switch off,
-    and neither taken by a request with stop strings; the verify-mask counters against `MaskOracle`; each injection's
-    outcome: one at a position the request samples fails it, one at a position it never samples (a forced token its
-    final chunk took, the EOS an EOS-free finish appended) does not (unless another request's NaN reached it)."""
+    and neither taken by a request with stop strings; each injection's outcome: one at a position the request samples
+    fails it, one at a position it never samples (a forced token its final chunk took, the EOS an EOS-free finish
+    appended) does not (unless another request's NaN reached it)."""
     from .harness import check_precise
 
     h = Harness(vocab=VOCAB, **w)
     probe = Probe(h)
-    oracle = MaskOracle(h) if w["mtp_k"] else None
     if h.sched.precise != "fp8":
         orig = h.core.step
 
@@ -577,8 +482,6 @@ def run_switches_workload(w: dict) -> Harness:
     assert not strings & (set(probe.forced) | probe.appended), (strings, probe.forced, probe.appended)
     if strings:
         event("a constrained request with stop strings")
-    if oracle is not None:
-        oracle.check(s)
     for sp in h.specs.values():
         pos = sp.nonfinite_after if sp.nonfinite_after is not None else sp.mask_empty_after
         r = h.results[sp.rid]
@@ -615,8 +518,6 @@ def run_switches_workload(w: dict) -> Harness:
         event("EOS-free finish gated")
     if s.num_preemptions:
         event("preempted")
-    if s.first_rejections[FORCED]:
-        event("a first rejection at a forced position")
     if s.hybrid and not s.window:
         hybrid_events(h, probe)
     return h

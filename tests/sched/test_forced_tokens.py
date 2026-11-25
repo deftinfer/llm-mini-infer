@@ -1,5 +1,5 @@
-"""The forced prefix, the EOS-free finish and the verify-mask counters (architecture.md, "Grammar-aware heads"), from
-the grammar backends through the scheduler, the validating fake runner and the frontend.
+"""The forced prefix and the EOS-free finish (architecture.md, "Grammar-aware heads"), from the grammar backends
+through the scheduler, the validating fake runner and the frontend.
 
 Both switches must change no output: with `forced_prefix` (a final prefill chunk takes the tokens its grammar forces
 at its start as decided output tokens) and `eos_free_finish` (a request whose grammar stopped finishes with the EOS
@@ -11,9 +11,8 @@ still sampled does. The fake grammar's forced runs (`fake_grammar`, `lead` and `
 `{"` and first key and its closing brace; the runs go through Gemma 4's shape (window mode, a drafter without KV, MTP
 up to k = 7), Qwen's (`gdn`: a hybrid GDN model, its state checkpoints CKPT records, its MTP layer's drafter with KV)
 and attention-only mode, with every turn's accounting checked and each request's unreported tokens (`Req.unrep`)
-followed through preemption, held samples, readmission and aborts (`Probe`). The verify-mask counters
-are compared with an oracle that reads the masks, drafts and tokens of every verify row the fake runner ran
-(`MaskOracle`). The catalog schema is checked on llguidance over Gemma 4's tokenizer with ids and counts only.
+followed through preemption, held samples, readmission and aborts (`Probe`). The catalog schema is checked on
+llguidance over Gemma 4's tokenizer with ids and counts only.
 """
 
 from __future__ import annotations
@@ -31,26 +30,20 @@ from hypothesis import given
 
 from llm_mini_infer import config
 from llm_mini_infer.cache.pools import pages_for_one_request
-from llm_mini_infer.engine.messages import MASK_CLASSES, POPCOUNT_BUCKETS, AddRequest
 from llm_mini_infer.grammar.engine import FORCED_MAX, Grammars, words
 from llm_mini_infer.runner.fake import unpack_mask
 from llm_mini_infer.sched.plan import FOLD_ALL, reserve_positions
-from llm_mini_infer.sched.scheduler import Inflight, Req, Scheduler
+from llm_mini_infer.sched.scheduler import Scheduler
 
 from ..support.catalog_schema import PATH as CATALOG_SCHEMA
 from ..support.config_cases import _gemma, _model
 from ..support.fake_grammar import FakeGrammar, spec
 from ..support.forced_cases import (
     ABORT,
-    CHOICE,
-    EOS_CLASS,
     ERROR,
-    FORCED,
-    FREE,
     LENGTH,
     MODES,
     STOP,
-    MaskOracle,
     Probe,
     end_of,
     forced_of,
@@ -1094,157 +1087,11 @@ def verify_specs(lead: int, tail: int, ignore: bool = True) -> list[Spec]:
     return out
 
 
-@pytest.mark.parametrize("k", [1, 3, 5, 7])
-@pytest.mark.parametrize("accept_p", [0.0, 0.6, 1.0])
-def test_verify_mask_counters_are_the_verify_rows(k, accept_p) -> None:
-    """The verify-mask counters equal `MaskOracle`'s count of what verification read, under every combination of the
-    switches: the masks read per popcount bucket, and each verify row's first rejected draft by the class of the mask
-    its target sample was drawn under. The fake drafts unmasked, so forced positions reject their drafts: lead runs
-    while their tokens are sampled (the forced prefix takes them away: fewer such rejections), tail runs always; the
-    EOS-only mask after a document (lo == hi, no tail) is counted as `eos`, never `forced`; ignore_eos past a grammar's
-    end reads unconstrained masks (`free`). (The popcounts' sum is compared over the mask words here, as the scheduler
-    sums them; `test_window_mask_sum_counts_vocabulary_tokens` checks it over the vocabulary.)"""
-    by: dict[tuple, np.ndarray] = {}
-    for lead, tail in ((2, 0), (3, 2)):
-        for fp, ef in COMBOS:
-            h = make("window16", verify_specs(lead, tail), k, forced_prefix=fp, eos_free_finish=ef, max_num_seqs=4,
-                     accept_p=accept_p)
-            o = MaskOracle(h)
-            run(h)
-            o.check(h.sched)
-            assert h.sched.window_masks.sum() > 0 and o.read_classes()[FREE] > 0
-            by[(lead, tail, fp, ef)] = h.sched.first_rejections.copy()
-    for fp, ef in COMBOS:
-        assert by[(3, 2, fp, ef)][FORCED] > 0  # the closing runs: sampled, never drafted
-        assert by[(2, 0, False, ef)][FORCED] > 0 and by[(2, 0, True, ef)][FORCED] == 0  # no verify row reads them
-        assert by[(2, 0, fp, False)][EOS_CLASS] >= by[(2, 0, fp, True)][EOS_CLASS]
-    assert by[(2, 0, False, False)][EOS_CLASS] > 0
-
-
-@pytest.mark.parametrize("k", [3, 5])
-def test_window_mask_sum_counts_vocabulary_tokens(k) -> None:
-    """`window_masks_sum` (the histogram's sum: "tokens the grammar masks of MTP verify rows allowed") counts the tokens
-    each mask verification read allows. An unconstrained mask (a grammar ended under ignore_eos) allows the vocabulary,
-    1,000 tokens here; its 32 int32 words hold 1,024 bits, and the 24 past the vocabulary are no tokens."""
-    specs = [Spec(rid=0, prompt_len=0, prompt=stem(107, 20), max_tokens=40, seed=0xD07, ignore_eos=True,
-                  grammar=spec(107, 5, 5, lead=1, tail=1))]
-    h = make("window16", specs, k, forced_prefix=True, eos_free_finish=True, accept_p=0.6)
-    o = MaskOracle(h)
-    run(h)
-    rej, hist, total = o.expected()
-    assert h.sched.first_rejections.tolist() == rej.tolist() and h.sched.window_masks.tolist() == hist.tolist()
-    assert h.sched.window_masks_sum == total, (h.sched.window_masks_sum, total)
-
-
-def test_verify_mask_records_on_hand_set_rows() -> None:
-    """`fill_masks`'s records and `_rejections` on hand-set rows of one plan (k = 3), against masks computed from deep
-    copies of the rows' matchers: a grammar with one forced token at its start and one before its end (lo == hi = 4),
-    its EOS 991 (bit 31 of its word: int32's sign bit, read through the uint32 view). A row along the document
-    (classes forced, choice, choice, forced); one past its closing token (choice, forced, the EOS alone, then a mask
-    nobody reads: the EOS alone too); one whose grammar terminated (every token); one whose first draft its grammar
-    rejects (forced, then unread); an unmasked row and one whose request left (no record). Verification: a choice draft
-    rejected, the EOS position's draft rejected (`eos`, not `forced`), a terminated row's (`free`), a forced
-    position's (`forced`), and a draft equal to its target sample but refused by a commit limit, which is no
-    rejection; the masks read are those up to each row's accepted drafts."""
-    k, eos = 3, 991
-    g = Grammars(FakeGrammar(VOCAB, (eos,)))
-    c = g.compile(spec(5, 4, 4, lead=1, tail=1))
-
-    def at(n: int) -> Any:
-        m = g.matcher(c)
-        for _ in range(n):
-            a = m.allowed()
-            a[eos] = False
-            assert m.consume_tokens([int(np.flatnonzero(a)[len(np.flatnonzero(a)) // 3])])
-        return m
-
-    def nxt(m: Any, salt: int = 0) -> int:  # a token the state allows (not the EOS)
-        a = m.allowed()
-        a[eos] = False
-        nz = np.flatnonzero(a)
-        return int(nz[(salt * 37) % len(nz)])
-
-    m0, m2 = at(0), at(2)
-    f0 = nxt(m0)
-    a1 = at(1)
-    c1, c1b = nxt(a1, 1), nxt(a1, 2)
-    a2 = at(1)
-    assert a2.consume_tokens([c1])
-    c2 = nxt(a2, 3)
-    t2 = nxt(m2, 4)
-    s3 = m2.deep_copy()
-    assert s3.consume_tokens([t2])
-    f3 = nxt(s3)
-    bad = int(np.flatnonzero(~m0.allowed())[7])
-    sched = Scheduler(max_num_seqs=8, max_num_batched_tokens=1024, max_model_len=1024, page_size=16, num_pages=64,
-                      num_state_slots=9, eos_token_ids=(eos,), mtp_k=k, grammars=g)
-    rows = [  # (matcher, drafts, ignore_eos, left)
-        (at(0), [f0, c1, c2], False, False),
-        (at(2), [t2, f3, 7], False, False),
-        (None, [11, 12, 13], True, False),
-        (at(0), [bad, 3, 4], False, False),
-        (at(1), [c1, 5, 6], False, False),  # unmasked below: no record
-        (at(1), [c1, 5, 6], False, True),  # its request left since the plan
-        (at(1), [c1b, 8, 9], False, False),
-    ]
-    for slot, (m, d, ignore, left) in enumerate(rows, 1):
-        msg = AddRequest(rid=slot, frontend=0, prompt=np.zeros(4, np.int32), max_tokens=64, temperature=0.0,
-                         top_p=1.0, top_k=0, min_p=0.0, seed=slot, stop_token_ids=[], ignore_eos=ignore)
-        req = Req(msg, slot, slot, 1024)
-        req.matcher = m
-        sched.slot_req[slot], sched.aid[slot] = (None, 0) if left else (req, 1000 + slot)
-        sched.drafts[slot] = d
-    n = len(rows)
-    inf = Inflight(step_id=1, slots=np.arange(1, n + 1, dtype=np.int64), aids=1000 + np.arange(1, n + 1),
-                   sample=np.ones(n, bool), device=np.ones(n, bool), n_tokens=0,
-                   masked=np.asarray([0, 1, 2, 3, 5, 6]))
-    buf = np.zeros((n * (1 + k), words(VOCAB)), np.int32)
-    sched.fill_masks(inf, buf)
-
-    def pops(m: Any, d: list[int]) -> list[int]:
-        """The popcounts of a verify row's masks: at its state, then after each draft its grammar takes (until one it
-        rejects or its end); the rest, which verification never reads, allow the EOS alone."""
-        m, out = m.deep_copy(), []
-        out.append(int(m.allowed().sum()))
-        for t in d:
-            if m.is_stopped() or t == eos or not m.allowed()[t]:
-                break
-            assert m.consume_tokens([t])
-            out.append(int(m.allowed().sum()))
-        return out + [1] * (1 + k - len(out))
-
-    full = VOCAB  # an unconstrained mask counts the vocabulary, not its words' padding bits
-    want_pop = [pops(m, d) if m is not None else [full] * (1 + k) for m, d, _, _ in rows]
-    want_pop[4] = want_pop[5] = [-1] * (1 + k)
-    assert want_pop[0] == [1, *want_pop[0][1:3], 1] and want_pop[1][1:] == [1, 1, 1] and want_pop[3] == [1] * 4
-    assert inf.wpop.tolist() == want_pop, inf.wpop.tolist()
-    F, E, C, X = FORCED, EOS_CLASS, CHOICE, FREE
-    assert inf.wcls.tolist()[:4] == [[F, C, C, F], [C, F, E, E], [X] * 4, [F, E, E, E]] and inf.wcls[6, 0] == C
-    assert inf.wdraft.tolist() == [[f0, c1, c2], [t2, f3, 7], [11, 12, 13], [bad, 3, 4], [-1] * 3, [-1] * 3,
-                                   [c1b, 8, 9]]
-    tokens = np.full((n, 1 + k), -1, np.int32)
-    acc = np.asarray([1, 2, 1, 0, 0, 0], np.int64)  # rows 0-4 and 6 verified (row 5 left: not passed)
-    tokens[0, :2] = [f0, c1b]  # its second draft rejected: a choice
-    tokens[1, :3] = [t2, f3, eos]  # the closing token accepted, the EOS the target's sample: an eos rejection
-    tokens[2, :2] = [11, 99]  # unconstrained
-    tokens[3, 0] = f0  # the forced token, not the drafted one
-    tokens[4, 0] = 1  # unmasked: no record
-    tokens[6, 0] = c1b  # equal to its draft: refused by a commit limit, no rejection
-    sched._rejections(inf, np.asarray([0, 1, 2, 3, 4, 6]), acc, tokens)
-    assert sched.first_rejections.tolist() == [1, 1, 1, 1]
-    read = [*want_pop[0][:2], *want_pop[1][:3], *want_pop[2][:2], want_pop[3][0], want_pop[6][0]]
-    assert sched.window_masks.tolist() == np.bincount(np.searchsorted(POPCOUNT_BUCKETS, read),
-                                                      minlength=len(POPCOUNT_BUCKETS) + 1).tolist()
-
-
 def test_the_counters_reach_metrics() -> None:
-    """The forced prefix's, the EOS-free finish's and the verify-mask counters through a step's stats
-    (`EngineLoop._stats`, across the IPC encoding) to a frontend's /metrics:
-    llm_mini_infer:grammar_forced_requests_total and _forced_tokens_total,
-    llm_mini_infer:grammar_eos_free_finishes_total{in_flight}, llm_mini_infer:grammar_eos_free_gated_total,
-    llm_mini_infer:spec_first_rejections_total{mask} and the llm_mini_infer:spec_window_mask_tokens histogram (its
-    bucket counts cumulated, its sum and count the scheduler's), after a run that took forced prefixes, finished
-    requests EOS-free with and without their row in flight and gated one."""
+    """The forced prefix's and the EOS-free finish's counters through a step's stats (`EngineLoop._stats`, across the
+    IPC encoding) to a frontend's /metrics: llm_mini_infer:grammar_forced_requests_total and _forced_tokens_total,
+    llm_mini_infer:grammar_eos_free_finishes_total{in_flight} and llm_mini_infer:grammar_eos_free_gated_total, after a
+    run that took forced prefixes, finished requests EOS-free with and without their row in flight and gated one."""
     import asyncio
     import shutil
 
@@ -1261,7 +1108,6 @@ def test_the_counters_reach_metrics() -> None:
     run(h)
     s = h.sched
     assert s.forced_requests and s.eos_free[1] and s.eos_free_gated
-    assert s.first_rejections[[FORCED, EOS_CLASS, CHOICE]].all()
     path = ipc.ipc_dir()
     loop = EngineLoop(Config(), EngineCore(s, h.runner), path)
     try:
@@ -1282,20 +1128,12 @@ def test_the_counters_reach_metrics() -> None:
         shutil.rmtree(path, ignore_errors=True)
     assert (stats.grammar_forced_requests, stats.grammar_forced_tokens) == (s.forced_requests, s.forced_tokens)
     assert stats.grammar_eos_free == s.eos_free.tolist() and stats.grammar_eos_free_gated == s.eos_free_gated
-    assert stats.spec_first_rejections == s.first_rejections.tolist()
-    assert stats.spec_window_mask_counts == s.window_masks.tolist() and stats.spec_window_mask_sum == s.window_masks_sum
     base = 'model_name="m",engine="0"'
     lines = [f"llm_mini_infer:grammar_forced_requests_total{{{base}}} {float(s.forced_requests)}",
              f"llm_mini_infer:grammar_forced_tokens_total{{{base}}} {float(s.forced_tokens)}",
              f'llm_mini_infer:grammar_eos_free_finishes_total{{{base},in_flight="no"}} {float(s.eos_free[0])}',
              f'llm_mini_infer:grammar_eos_free_finishes_total{{{base},in_flight="yes"}} {float(s.eos_free[1])}',
-             f"llm_mini_infer:grammar_eos_free_gated_total{{{base}}} {float(s.eos_free_gated)}",
-             *(f'llm_mini_infer:spec_first_rejections_total{{{base},mask="{c}"}} {float(n)}'
-               for c, n in zip(MASK_CLASSES, s.first_rejections.tolist())),
-             *(f'llm_mini_infer:spec_window_mask_tokens_bucket{{{base},le="{b}"}} {n}'
-               for b, n in zip((*POPCOUNT_BUCKETS, "+Inf"), np.cumsum(s.window_masks).tolist())),
-             f"llm_mini_infer:spec_window_mask_tokens_sum{{{base}}} {float(s.window_masks_sum)}",
-             f"llm_mini_infer:spec_window_mask_tokens_count{{{base}}} {int(s.window_masks.sum())}"]
+             f"llm_mini_infer:grammar_eos_free_gated_total{{{base}}} {float(s.eos_free_gated)}"]
     for line in lines:
         assert line in page, line
 
@@ -1319,8 +1157,7 @@ def test_random_structured_hybrid_workloads(w) -> None:
 @campaign_settings(200)
 @given(structured_window_count_workloads())
 def test_random_structured_window_count_workloads(w) -> None:
-    """Gemma 4's structured workloads with a draft count per step: every check of theirs, the verify-mask counters
-    against `MaskOracle` at each step's count."""
+    """Gemma 4's structured workloads with a draft count per step: every check of theirs, at each step's count."""
     with saved_on_failure("structured_window_counts", w):
         run_switches_workload(w)
 

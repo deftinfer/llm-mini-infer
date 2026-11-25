@@ -839,8 +839,8 @@ def in_flight(events: list[tuple[float, int]], t0: float, t1: float) -> dict[str
 def engine_delta(a: dict[str, float], b: dict[str, float], completed: int) -> dict[str, Any]:
     """What the server did over the measured window: acceptance per position, GPU idle due to the CPU, the grammar-aware
     heads (the steps by head, the masks' unions: `union_sizes`, the draft universe), the forced prefix, the EOS-free
-    finishes, the MTP verify rows' first rejections by mask, FlashInfer's kept plans, failed requests and grammar
-    errors. A count that `counted` checks is None, not 0, when the server does not export its counter."""
+    finishes, FlashInfer's kept plans, failed requests and grammar errors. A count that `counted` checks is None, not
+    0, when the server does not export its counter."""
     def d(name: str, **match: str) -> float:
         return total(b, name, **match) - total(a, name, **match)
 
@@ -900,7 +900,6 @@ def engine_delta(a: dict[str, float], b: dict[str, float], completed: int) -> di
     forced = out["forced_tokens"]
     out["forced_tokens_per_request"] = round(forced / completed, 2) if completed and forced is not None else None
     out["eos_free_finishes"] = delta_by("llm_mini_infer:grammar_eos_free_finishes_total", "in_flight")  # no, yes
-    out["spec_first_rejections"] = delta_by("llm_mini_infer:spec_first_rejections_total", "mask")
     out["plans_kept"] = round(d("llm_mini_infer:attention_plans_kept_total"))
     out["plans_kept_since_start"] = round(total(b, "llm_mini_infer:attention_plans_kept_total"))
     return out

@@ -110,11 +110,6 @@ ABORT_DISCONNECT, ABORT_STOP, ABORT_FAILED, ABORT_SHUTDOWN = range(4)
 # EngineStats.lost_tokens order: why an admission recomputed what the prefix cache held for it (`cache.radix`, Lost
 # tokens; `precise`: `sched.scheduler._count_lost`)
 LOST_CAUSES = ("writing", "checkpoint", "page", "precise")
-# For EngineStats.spec_first_rejections and spec_window_mask_counts: a grammar mask's class, by what it allows: one
-# token the grammar forces, the EOS alone (the end of a document), a choice of several, or every token (unconstrained: a
-# grammar ended under ignore_eos); and the bucket bounds of the popcounts of the masks verification read
-MASK_CLASSES = ("forced", "eos", "choice", "free")
-POPCOUNT_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128, 256)
 
 
 class EngineStats(_Msg):
@@ -214,16 +209,11 @@ class EngineStats(_Msg):
     dropped_samples: int = 0  # sample rows computed for requests that had left (a stop, an abort, a preemption)
     # the forced prefix and the EOS-free finish (cumulative): requests whose final prefill chunk took their grammar's
     # forced prefix, and its tokens; EOS-free finishes [no row of the request in flight, its row in flight], and the
-    # ones the gate left to the step in flight; MTP verify rows' first rejected draft by the class of its sample's mask
-    # (MASK_CLASSES), and the popcounts of the masks verification read (bucket counts over POPCOUNT_BUCKETS, the last
-    # one +Inf; sum)
+    # ones the gate left to the step in flight
     grammar_forced_requests: int = 0
     grammar_forced_tokens: int = 0
     grammar_eos_free: list[int] = []
     grammar_eos_free_gated: int = 0
-    spec_first_rejections: list[int] = []
-    spec_window_mask_counts: list[int] = []
-    spec_window_mask_sum: int = 0
     # backpressure: admissions of a frontend paused while it lags behind its outputs (cumulative; gauge), and the loop
     # turns that blocked on the poll because the only work waited for paused frontends (cumulative)
     backpressure_pauses: int = 0
