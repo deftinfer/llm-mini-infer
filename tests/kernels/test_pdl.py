@@ -201,13 +201,16 @@ def test_every_pdl_launch_waits_first() -> None:
     serialized = set(re.findall(r"\b(\w+_kernel)\s*(?:<[^<>;]*>)?\s*<<<", src))
     assert serialized == SERIALIZED and not serialized & launched.keys()
     assert launched.keys() | serialized == set(defined)
-    templated = re.findall(r"template\s*<\s*bool\s+kTrigger\s*>\s*__global__\s[^;{]*?\b(\w+_kernel)\s*\(", src)
+    # a second flag after kTrigger: another variant of the kernel (gemma.cu's FP8 KV store)
+    templated = re.findall(r"template\s*<\s*bool\s+kTrigger\s*(?:,\s*bool\s+\w+\s*)?>\s*__global__\s[^;{]*?"
+                           r"\b(\w+_kernel)\s*\(", src)
     assert set(templated) == TRIGGER_ON_FLAG
     for name, args in sorted(launched.items()):
         wait, trigger = _first_statements(src, name)
         assert wait == "lmk_pdl_wait();", (name, wait)
-        if name in TRIGGER_ON_FLAG:
-            assert args == {f"lmk_pdl_flag() ? {name}<true> : {name}<false>"}, (name, args)
+        if name in TRIGGER_ON_FLAG:  # the trigger by the flag's value, any other flag as it is
+            launch = rf"lmk_pdl_flag\(\) \? {name}<true(|, [^<>]*)> : {name}<false\1>"
+            assert all(re.fullmatch(launch, a) for a in args), (name, args)
             assert trigger == "if (kTrigger) lmk_pdl_trigger();", (name, trigger)
         else:
             assert trigger == "lmk_pdl_trigger();", (name, trigger)

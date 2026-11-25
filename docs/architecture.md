@@ -146,7 +146,8 @@ llm-mini-infer's prefix cache is a radix tree over token ids. It holds KV pages 
 
 Gemma 4's sliding layers need only each request's last `sliding_window` positions. Their KV lives in **window pages** that are released as soon as a row's window has passed them, and the full layers' KV lives in **full pages** shared through the prefix cache.
 
-- **One KV arena.** Both kinds of page have equal bytes: a window page holds a page size of positions (16) of every sliding layer, and a full page as many positions of the full layers as fill the same bytes (320 on Gemma 4 31B). One free list and one reference count serve both, so the split follows the load and nothing fragments. Window pages keep FlashInfer's per-layer layout. A page reused as the other kind loses its contents.
+- **One KV arena.** Both kinds of page have equal bytes: a window page holds a page size of positions (16) of every sliding layer, and a full page as many positions of the full layers as fill the same bytes (320 on Gemma 4 31B; 640 with `cache.kv_cache_dtype fp8`, which keeps the full layers' one stored plane in FP8 E4M3 at scale 1.0, the sliding layers in BF16). One free list and one reference count serve both, so the split follows the load and nothing fragments. Window pages keep FlashInfer's per-layer layout. A page reused as the other kind loses its contents.
+- **FP8 full layers** (`cache.kv_cache_dtype fp8`, off by default). A full page holds twice the positions, so a long request takes about half the arena's pages; a short one gains less, since each request also holds its window pages whatever its length. The stored value is V = k / rms(k), at most the square root of 512 in magnitude, so a scale of 1.0 never saturates; the store rounds the BF16 value it would write. The attention reads each value as stored, so outputs can change; `tests.scripts.numerics_forced run --kv-cache-dtype fp8` measures how much against BF16 ([development.md](development.md#numerics)). Converting each tile costs attention time: `tests.scripts.numerics_kernels attn-timing --parts gemma-full --kv-dtype fp8` times it against a run at `bf16`. Gemma 4 with `attention_k_eq_v` on a BF16 runner only.
 - **Window checkpoints** play the hybrid state checkpoint's role: the request's own window pages, held by reference, taken at the same points. A hit shares pages of both kinds and copies the partial last page of each.
 - **Under pressure,** in order: the cached windows of unlocked nodes (least recently used first), then cached full pages, then duplicate tree pages, then the windows on paths that running requests hold, and only then a preemption. In each pass, demoted windows go first ([Eviction](#eviction)). Unlocked windows go first because they are most of the cache's bytes. Windows on held paths go last because evicting them frees almost nothing (their pages are shared) and forces the shared prefix to be recomputed.
 
@@ -241,7 +242,7 @@ Plain `nn.Module`s that get their batch metadata from a per-step context (`model
 
 | Function | Kernel |
 |---|---|
-| Attention | FlashInfer for head dims up to 256 (prefill, decode, Gemma 4's sliding window). Gemma 4's full layers (head dim 512: FlashInfer's SM120 path for it would need a separate V plane) run `attn512`, our split-KV kernel with BF16 tensor cores that builds K from the stored V in registers |
+| Attention | FlashInfer for head dims up to 256 (prefill, decode, Gemma 4's sliding window). Gemma 4's full layers (head dim 512: FlashInfer's SM120 path for it would need a separate V plane) run `attn512`, our split-KV kernel with BF16 tensor cores that builds K from the stored V in registers, over BF16 pages or FP8 ones (each tile converted once to the BF16 tile in shared memory: the BF16 path's bits for the same values) |
 | Batch-invariant attention | `attn_window`, our kernel for Gemma 4's sliding layers and, with no window, Qwen3.8's full layers ([Batch invariance](#batch-invariance)) |
 | GDN prefill | FlashInfer's chunked GDN kernel on its per-sequence route at every step (its context-parallel route is no more accurate and slower at the default budget's chunk sizes), reading and writing each row's state slot in place |
 | GDN decode and MTP verify | vLLM's fused GDN decode kernel, adapted into our library, and our verify kernel on its arithmetic |
@@ -256,7 +257,7 @@ Plain `nn.Module`s that get their batch metadata from a per-step context (`model
 
 ### FP8
 
-Block-FP8 checkpoints (one scale per 128 × 128 block) load through one path for both formats: Hugging Face's `fp8` method (Qwen3.8) and compressed-tensors `FP8_BLOCK` (Gemma 4). Every projection the checkpoint quantizes is an FP8 GEMM; embeddings, norms, the vision towers and the KV cache stay BF16. Activations are quantized dynamically per token and per 128-group by the kernels that produce them. The GEMM library needs an SM 12.x GPU; on a CPU the torch reference runs.
+Block-FP8 checkpoints (one scale per 128 × 128 block) load through one path for both formats: Hugging Face's `fp8` method (Qwen3.8) and compressed-tensors `FP8_BLOCK` (Gemma 4). Every projection the checkpoint quantizes is an FP8 GEMM; embeddings, norms, the vision towers and the KV cache stay BF16 (Gemma 4's full layers' KV in FP8 with `cache.kv_cache_dtype fp8`: [sliding-window models](#sliding-window-models)). Activations are quantized dynamically per token and per 128-group by the kernels that produce them. The GEMM library needs an SM 12.x GPU; on a CPU the torch reference runs.
 
 ### Sampling
 

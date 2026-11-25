@@ -65,7 +65,7 @@ its markdown tables):
   whose argmax is H_fp32's, the share whose argmax is the reference token, the top-1 margins (Gemma's softcapped) and
   H_fp32's margins where the arm disagrees.
 - `pairs`: an arm against another on the same references (by default each FP8-KV arm, `numerics_forced --kv-dtype`,
-  against its BF16 twin: its name without `-kv8[all][s]`), from the fp32 head on each one's hidden state
+  against its BF16 twin: its name without `-kv8[all][s]` or `-kvfp8`), from the fp32 head on each one's hidden state
   alone, at the positions predicting the answer both computed: the top-1 agreement and its first miss in each answer,
   the margins, and each arm's tokens per verify step; with `--chain` also each one's argmax = H_fp32's share, their
   discordant positions (b: only the first agrees with H_fp32; c: only the second) and the difference. "free" counts the
@@ -120,7 +120,7 @@ MEASURES = ("mixer", "mlp", "layer")
 ROWS = 4096  # rows of a position-wise computation (an MLP) at a time
 HEAD_CHUNK = 16384  # vocabulary rows of the fp32 head at a time
 CAPTURE = re.compile(r"r(\d+)\.pt")
-KV_TAG = re.compile(r"-kv8(?:all)?s?(?=-|$)")  # numerics_forced's FP8-KV arms (`arm_name`)
+KV_TAG = re.compile(r"-kv(?:8(?:all)?s?|fp8)(?=-|$)")  # numerics_forced's FP8-KV arms (`arm_name`)
 BOOT = 10_000  # cluster-bootstrap draws (`pairs`)
 
 

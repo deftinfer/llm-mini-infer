@@ -12,7 +12,7 @@ from llm_mini_infer.sched.scheduler import Scheduler
 from llm_mini_infer.vision import family as vf
 
 from .mtp_common import EOS, seq
-from .tiny_gemma import gemma_cpu_runner, gemma_pools
+from .tiny_gemma import TINY_FULL_RATIO, gemma_cpu_runner, gemma_pools
 
 W = 8
 
@@ -32,8 +32,9 @@ class Run:
         target, assistant = pair
         if draft_counts:
             runner_kw["draft_counts"] = draft_counts
+        fp8 = runner_kw.get("kv_cache_dtype") == "fp8"  # the full layers' KV in FP8: twice the positions a full page
         pc = gemma_pools(max_num_seqs=max_num_seqs, budget=budget, page_size=wps, num_pages=num_pages,
-                         max_model_len=max_model_len, mtp_k=k)
+                         max_model_len=max_model_len, mtp_k=k, full=2 * TINY_FULL_RATIO * wps if fp8 else 0)
         self.r = make(target, pc, mtp_k=k, assistant=assistant if k else None, **runner_kw)
         self.k = k
         caps = self.r.capabilities()

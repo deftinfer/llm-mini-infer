@@ -1909,10 +1909,14 @@ class _TimedGemmaFull(_TimedPart):
                        **self.prefill(prefill_keys))
 
     def build(self, case: AttnCase, seed: int) -> None:
+        from llm_mini_infer.kernels.gemma_ops import kv_fp8
+
         from ..support.kernel_cases import _full_case, _Layer, _Pools
 
         rows = [(int(m), int(u)) for m, u in zip(case.nq, case.ub)]
         fkv, self.table, self.q, kw, _, _ = _full_case(rows, self.H, self.HKV, PS, seed)
+        if self.args.kv_dtype == "fp8":  # the kernel reads E4M3 bytes (`cache.kv_cache_dtype fp8`)
+            fkv = kv_fp8(fkv)
         self.pool, self.pools, self.layer = fkv, _Pools(fkv[None], PS), _Layer(kw)
 
     def off(self, case: AttnCase, mode: str) -> Callable[[], Any]:
@@ -1990,7 +1994,8 @@ def cmd_attn_timing(args: argparse.Namespace) -> int:
     for rows of `--max-model-len` + 1 + k keys. Steps (`timing_cases`, exact KV lengths): one prefill row of each of
     `--short-chunks` queries over each of `--histories` positions; one of `--long-chunk` over each of
     `--long-histories`; per `--decode-rows` count, verify rows of 1 + k queries (`--k`) over each of
-    `--decode-histories`. The plan is
+    `--decode-histories`. `--kv-dtype fp8`: Gemma 4's full layers over an FP8 pool (`cache.kv_cache_dtype fp8`;
+    time it beside a run at bf16 for the FP8 path's cost or gain). The plan is
     made once per path, outside the timed region, and only the kernels' launches are timed: eagerly, and for the
     verify rows in their decode bucket (`bucket`: its plan, run eagerly; `graph`: replayed from a CUDA graph, the
     padding rows on the null page). Per step, path and mode: the median, p10 and p90 in microseconds and the ratio of
@@ -2001,6 +2006,8 @@ def cmd_attn_timing(args: argparse.Namespace) -> int:
     torch = _cuda(library=True)
     from llm_mini_infer.runner.cuda.runner import default_decode_buckets
 
+    if args.kv_dtype == "fp8" and set(names(args.parts)) - {"gemma-full"}:
+        raise SystemExit("--kv-dtype fp8: --parts gemma-full only (the FP8 KV is built for Gemma 4's full layers)")
     out = _out(args)
     dev = torch.device(DEV, torch.cuda.current_device())
     k = args.k
@@ -2130,6 +2137,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-num-seqs", type=int, default=128, help="decode rows at most (the graph buckets)")
     p.add_argument("--iters", type=int, default=50, help="timed calls a variant")
     p.add_argument("--warmup", type=int, default=5, help="untimed calls before them")
+    p.add_argument("--kv-dtype", default="bf16", choices=("bf16", "fp8"),
+                   help="the full layers' KV pool (fp8: gemma-full only)")
     return ap
 
 

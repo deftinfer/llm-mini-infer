@@ -7,10 +7,11 @@ The step path is the Qwen runner's without what only hybrid models need (state s
 helpers; the sampler, the graph capture, the FP8 path, the image path and the grammar-aware heads are the shared
 `runner.cuda` modules.
 
-- **One KV arena** (`_Arena`) holds both kinds of page. The slot tables (`_Tables`) hold a page table per kind
-  (`page_table` for the full layers, per sub-page of the arena; `wpage_table` for the sliding layers' window pages),
-  `seq_len`, the pending token and the sampling parameters. Slot 0 is padding: both rows stay zero (the null pages).
-  FREE clears both; window PAGES entries of 0 clear released pages.
+- **One KV arena** (`_Arena`) holds both kinds of page (the full layers' in FP8 with `kv_cache_dtype`). The slot
+  tables (`_Tables`) hold a page table per kind (`page_table` for the full layers, per sub-page of the arena;
+  `wpage_table` for the sliding layers' window pages), `seq_len`, the pending token and the sampling parameters. Slot
+  0 is padding: both rows stay zero (the null pages). FREE clears both; window PAGES entries of 0 clear released
+  pages.
 - **Plan effects** (eager, before the body): FREE, ADMIT, PAGES of both kinds, KV_COPY of both, ENCODE. STATE_COPY,
   CKPT and FOLD are refused: window models resume from KV alone (their checkpoints are scheduler-side windows), and
   the assistant's rollback is a truncation.
@@ -145,11 +146,18 @@ class _Arena:
     [f·groups, (f + 1)·groups), viewed as [groups·num_pages, sub, Hf, Df], a paged cache of `sub`-position sub-pages
     whose sub-page j·num_pages + p is chunk p of its slab j. A full page p of the scheduler (`page_size` = groups·sub
     positions: 320) is those `groups` sub-pages, chunk p of every slab: the same bytes as window page p. The full
-    layers' page table is therefore kept per sub-page (`expand`), and our kernels read it as a page size of `sub`."""
+    layers' page table is therefore kept per sub-page (`expand`), and our kernels read it as a page size of `sub`.
+
+    **FP8 full layers** (`full_dtype` float8_e4m3fn: `cache.kv_cache_dtype fp8`). The buffer keeps its dtype and the
+    window pages theirs; the full layers view its bytes as `uint8` (one E4M3 value each: torch's index ops are not all
+    defined on float8, so readers convert at the edges), so a chunk holds twice the positions (`sub` 128, a full page
+    640 on Gemma 4 31B). `layout` counts in bytes for that reason."""
 
     def __init__(self, cfg: Gemma4Config, window_page_size: int, num_pages: int, dtype: torch.dtype,
-                 device: torch.device):
-        self.groups, self.sub, self.chunk = self.layout(cfg, window_page_size)
+                 device: torch.device, full_dtype: torch.dtype | None = None):
+        if full_dtype not in (None, dtype, torch.float8_e4m3fn):
+            raise ValueError(f"the full layers' KV in {full_dtype}: the buffer's dtype ({dtype}) or float8_e4m3fn")
+        self.groups, self.sub, self.chunk = self.layout(cfg, window_page_size, dtype.itemsize, full_dtype)
         self.num_pages, self.window_page_size = num_pages, window_page_size
         self.page_size = self.groups * self.sub
         ns, nf = len(cfg.sliding_layers), len(cfg.full_layers)
@@ -157,23 +165,28 @@ class _Arena:
         self.wkv = self.mem.view(ns, num_pages, 2, window_page_size, cfg.sliding_kv_heads, cfg.sliding_head_dim)
         shape = (self.sub, cfg.full_kv_heads, cfg.full_head_dim) if cfg.k_eq_v else \
             (2, self.sub, cfg.full_kv_heads, cfg.full_head_dim)
-        self.fkv = self.mem.view(nf, self.groups * num_pages, *shape)
+        full = self.mem if full_dtype in (None, dtype) else self.mem.view(torch.uint8)
+        self.fkv = full.view(nf, self.groups * num_pages, *shape)
 
     @staticmethod
-    def layout(cfg: Gemma4Config, window_page_size: int) -> tuple[int, int, int]:
-        """(groups, sub, chunk elements): see the class docstring; raises when the two kinds cannot share pages."""
+    def layout(cfg: Gemma4Config, window_page_size: int, itemsize: int = 2,
+               full_dtype: torch.dtype | None = None) -> tuple[int, int, int]:
+        """(groups, sub, chunk elements) for a buffer of `itemsize`-byte elements and the full layers' KV in
+        `full_dtype` (None: the buffer's): see the class docstring; raises when the two kinds cannot share pages."""
         ns, nf = len(cfg.sliding_layers), len(cfg.full_layers)
         chunk = 2 * window_page_size * cfg.sliding_kv_heads * cfg.sliding_head_dim
-        per_pos = (1 if cfg.k_eq_v else 2) * cfg.full_kv_heads * cfg.full_head_dim
-        if not ns or not nf or ns % nf or chunk % per_pos:
+        per_pos = (1 if cfg.k_eq_v else 2) * cfg.full_kv_heads * cfg.full_head_dim * \
+            (full_dtype.itemsize if full_dtype is not None else itemsize)
+        if not ns or not nf or ns % nf or chunk * itemsize % per_pos:
             raise ValueError(f"one KV arena needs the sliding layers ({ns}) to divide among the full layers ({nf}) and "
-                             f"a window page's share of a sliding layer ({chunk} elements) to hold whole positions of "
-                             f"a full layer ({per_pos} elements each)")
-        return ns // nf, chunk // per_pos, chunk
+                             f"a window page's share of a sliding layer ({chunk * itemsize} bytes) to hold whole "
+                             f"positions of a full layer ({per_pos} bytes each)")
+        return ns // nf, chunk * itemsize // per_pos, chunk
 
     @staticmethod
-    def full_page_size(cfg: Gemma4Config, window_page_size: int) -> int:
-        groups, sub, _ = _Arena.layout(cfg, window_page_size)
+    def full_page_size(cfg: Gemma4Config, window_page_size: int, itemsize: int = 2,
+                       full_dtype: torch.dtype | None = None) -> int:
+        groups, sub, _ = _Arena.layout(cfg, window_page_size, itemsize, full_dtype)
         return groups * sub
 
     def expand(self, idx: np.ndarray, page: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -309,7 +322,8 @@ class GemmaRunner(Runner):
                  attn512_split_keys: int = 0, attn512_prefill: tuple[int, int] | None = None,
                  head_fixed_m: bool = False, encode_per_image: bool = False, window_split_keys: int = 0,
                  batch_invariant: bool = False, sync_check: str | None = None, memory_history: str | None = None,
-                 logprobs: bool = False, penalties: bool = False, draft_counts: tuple[int, ...] = ()):
+                 logprobs: bool = False, penalties: bool = False, draft_counts: tuple[int, ...] = (),
+                 kv_cache_dtype: str = "auto"):
         """`mtp_k` > 0 drafts that many tokens per step with the MTP `assistant` (its checkpoint directory;
         `draft_vocab`, `draft_fp8`: its head, `runner.cuda.draft_head`). `sparse_head`, `sparse_head_rows`,
         `draft_universe`: the grammar-aware heads (`runner.cuda.heads`; with `grammar` only, the universe with MTP).
@@ -327,7 +341,9 @@ class GemmaRunner(Runner):
         default). `memory_history`: a file for the snapshot of an eager tower call after startup (`memory_report`).
         `logprobs`: takes LOGPROBS rows, its head's logits kept for them (`runner.cuda.logprobs`). `penalties`: takes
         admissions with penalties and a logit bias (`runner.cuda.penalties`). `draft_counts`: the counts below k a plan
-        may verify and draft (`Capabilities.draft_counts`; decode graphs and attention backends for each)."""
+        may verify and draft (`Capabilities.draft_counts`; decode graphs and attention backends for each).
+        `kv_cache_dtype`: auto, the runner's dtype for every layer's KV; fp8, the full layers' in FP8 E4M3 at scale
+        1.0 (`_Arena`; a BF16 runner and an `attention_k_eq_v` checkpoint)."""
         if always_split and not grammar:
             raise ValueError("always-split graphs need the grammar masks' split (structured output)")
         self.device = torch.device(device)
@@ -343,6 +359,15 @@ class GemmaRunner(Runner):
         self.model_dir = Path(model_dir)
         self.cfg = cfg = Gemma4Config.from_dir(self.model_dir)
         self.window = cfg.sliding_window
+        if kv_cache_dtype not in ("auto", "fp8"):
+            raise ValueError(f"KV cache dtype {kv_cache_dtype!r}: auto or fp8")
+        # The full layers' KV dtype (None: the runner's): FP8 needs the one stored plane (bounded: no scale) and BF16
+        # around it, the dtype our kernels and the references convert to
+        self.kv_dtype = torch.float8_e4m3fn if kv_cache_dtype == "fp8" else None
+        if self.kv_dtype is not None and not cfg.k_eq_v:
+            raise ValueError("an FP8 KV cache needs Gemma 4's attention_k_eq_v (its full layers' one stored plane)")
+        if self.kv_dtype is not None and self.dtype != torch.bfloat16:
+            raise ValueError(f"an FP8 KV cache needs a BF16 runner, not {self.dtype}")
         self.S, self.B = max_num_seqs, max_num_batched_tokens
         self.logprobs = logprobs
         self.penalties = penalties
@@ -452,7 +477,8 @@ class GemmaRunner(Runner):
             "load_s": round(time.perf_counter() - t1, 2), "init_s": round(t1 - t0, 2),
             "weight_bytes": sum(p.numel() * p.element_size() for p in self.model.parameters()),
             "attention": self.attn_kind, "dtype": str(self.dtype).removeprefix("torch."), "graphs": self.use_graphs,
-            "mtp_k": self.k, "window": self.window, "draft_query_next": self.draft_next})
+            "mtp_k": self.k, "window": self.window, "draft_query_next": self.draft_next,
+            "full_kv_dtype": str(self.kv_dtype or self.dtype).removeprefix("torch.")})
         log.info("model loaded in %.1f s: %.2f GiB of weights (%s%s), attention %s (sliding window %d), CUDA graphs "
                  "%s%s",
                  self.stats["load_s"], self.stats["weight_bytes"] / 2**30, self.stats["dtype"],
@@ -488,7 +514,7 @@ class GemmaRunner(Runner):
 
     @property
     def kv_bytes_per_token(self) -> int:
-        return self.cfg.kv_bytes_per_token(FULL, self.dtype.itemsize)
+        return self.cfg.kv_bytes_per_token(FULL, (self.kv_dtype or self.dtype).itemsize)
 
     @property
     def window_kv_bytes_per_token(self) -> int:
@@ -562,7 +588,7 @@ class GemmaRunner(Runner):
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         s, b, wps = self.S, self.B, 16
-        fps = _Arena.full_page_size(self.cfg, wps)
+        fps = self.full_page_size(wps)
         rows = max(1, min(s, b // 4))
         per = b // rows
 
@@ -658,7 +684,7 @@ class GemmaRunner(Runner):
 
     def full_page_size(self, window_page_size: int) -> int:
         """The full pages' positions in an arena of window pages of `window_page_size` (as many bytes)."""
-        return _Arena.full_page_size(self.cfg, window_page_size)
+        return _Arena.full_page_size(self.cfg, window_page_size, self.dtype.itemsize, self.kv_dtype)
 
     def configure(self, pools: PoolConfig) -> None:
         if pools.mtp_k != self.k:
@@ -684,9 +710,9 @@ class GemmaRunner(Runner):
             if self.memory_history and self.mm:
                 free = torch.cuda.mem_get_info(self.device)[0]
                 self.stats["eager_tower"] = memory_report.eager_tower_snapshot(self.img, self.memory_history, free)
-        log.info("KV arena: %d pages, window pages of %d positions or full pages of %d (sub-pages of %d); warm-up "
+        log.info("KV arena: %d pages, window pages of %d positions or full pages of %d (sub-pages of %d%s); warm-up "
                  "%.1f s%s", pools.num_pages, pools.window_page_size, pools.page_size, self.arena.sub,
-                 self.stats["warmup_s"],
+                 ", FP8 E4M3" if self.kv_dtype is not None else "", self.stats["warmup_s"],
                  f"; {len(self._graphs)} CUDA graphs captured in {self.stats['capture_s']:.1f} s"
                  if self.use_graphs else "")
         timings = {k: v for k, v in self.stats.items() if k.endswith("_s")}
@@ -705,7 +731,7 @@ class GemmaRunner(Runner):
         self.ps, self.fps = pc.window_page_size, pc.page_size  # window pages; full pages (the scheduler's)
         slots = pc.max_num_seqs + 1
         self.reserve = reserve_positions(2, self.k)
-        self.arena = _Arena(cfg, self.ps, pc.num_pages, dt, dev)
+        self.arena = _Arena(cfg, self.ps, pc.num_pages, dt, dev, self.kv_dtype)
         self.sub = self.arena.sub  # the full layers' table and kernels address sub-pages of this many positions
         self.max_pages = -(-(pc.max_model_len + self.reserve) // self.ps) + 1  # window pages per slot
         self.max_fpages = -(-(pc.max_model_len + self.reserve) // self.fps) + 1  # full pages per slot
