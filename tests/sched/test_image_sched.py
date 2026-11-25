@@ -15,7 +15,7 @@ from llm_mini_infer.cache.pools import pages_for_one_request
 from llm_mini_infer.engine.messages import FinishReason
 from llm_mini_infer.sched.plan import reserve_positions
 
-from ..support.fuzzing import fuzz_settings, saved_on_failure, st
+from ..support.fuzzing import campaign_settings, saved_on_failure, st
 from ..support.harness import Harness, Spec
 from ..support.sched_cases import VOCAB, check_plans
 from ..support.workloads import image_prompt, image_workloads, run_image_workload, text
@@ -316,7 +316,7 @@ def test_a_rolled_back_reservation_leaves_the_encoder_cache_as_it_was(data) -> N
         assert cache_state(a) == cache_state(b)
 
 
-@fuzz_settings(300)
+@campaign_settings(300)
 @given(image_workloads())
 def test_random_image_workloads(w) -> None:
     with saved_on_failure("images", w):

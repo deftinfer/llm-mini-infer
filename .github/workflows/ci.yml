@@ -96,6 +96,8 @@ jobs:
   tests:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    env:
+      FUZZ_CAP: "20"  # the campaign's fuzz suites run 20 examples each here: the fuzz job runs them in full
     strategy:
       fail-fast: false
       matrix:
@@ -184,7 +186,8 @@ jobs:
       - name: pytest
         run: uv run --project tools --locked pytest tools/tests -q -p no:cacheprovider
 
-  # Every fuzz suite, two seeds, 500 workloads each (a full campaign is 4 x 20,000, before scheduler changes merge)
+  # Every fuzz suite, 500 workloads on each of two seeds: 1, and the run's number, which draws anew on each run and
+  # again on a rerun (a full campaign is 4 x 20,000, before scheduler changes merge)
   fuzz:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -200,7 +203,7 @@ jobs:
       - name: environment
         run: uv sync --locked
       - name: fuzz smoke
-        run: uv run --locked python -m tests.scripts.fuzz_campaign --examples 500 --seeds 1 2 --jobs 4
+        run: uv run --locked python -m tests.scripts.fuzz_campaign --examples 500 --seeds 1 $GITHUB_RUN_NUMBER --jobs 4
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         if: failure()
         with:

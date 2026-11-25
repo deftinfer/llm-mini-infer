@@ -16,13 +16,13 @@ from llm_mini_infer.engine.messages import FinishReason
 from llm_mini_infer.sched.plan import MASKED, SAMPLE, STATE_ZERO, PlanBuilder, StepPlan
 from llm_mini_infer.sched.scheduler import Admit, Scheduler
 
-from ..support.fuzzing import fuzz_settings, saved_on_failure
+from ..support.fuzzing import campaign_settings, saved_on_failure
 from ..support.harness import EOS, Harness, Spec
 from ..support.sched_cases import check_plans
 from ..support.workloads import run_workload, workloads
 
 
-@fuzz_settings(300)
+@campaign_settings(300)
 @given(workloads())
 def test_random_workloads(w) -> None:
     with saved_on_failure("scheduler", w):

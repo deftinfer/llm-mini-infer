@@ -78,7 +78,9 @@ def test_ci_runs_the_checks() -> None:
     assert "uv run --project tools --locked pytest tools/tests -q -p no:cacheprovider" in run["tools"]
     setup = next(s for s in jobs["tools"]["steps"] if s.get("uses", "").startswith("astral-sh/setup-uv@"))
     assert setup["with"]["cache-dependency-glob"] == "tools/uv.lock"
-    assert "python -m tests.scripts.fuzz_campaign --examples 500 --seeds 1 2 --jobs 4" in run["fuzz"]
+    # seed 1 and the run's number: a new draw each run, the same on a rerun
+    assert 'python -m tests.scripts.fuzz_campaign --examples 500 --seeds 1 $GITHUB_RUN_NUMBER --jobs 4' in run["fuzz"]
+    assert jobs["tests"]["env"] == {"FUZZ_CAP": "20"}  # the campaign's suites capped there (tests/support/fuzzing.py)
     # a failure's artifacts are where the suites write them (tests/support/paths.py): a wrong path uploads nothing
     upload = "actions/upload-artifact@"
     uploads = {name: [s["with"]["path"] for s in job["steps"] if s.get("uses", "").startswith(upload)]

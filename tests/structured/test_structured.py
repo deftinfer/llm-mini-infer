@@ -24,7 +24,7 @@ from llm_mini_infer.sched.scheduler import NEVER_ENDS, could_end, end_drafts
 
 from ..support.fake_grammar import FakeGrammar, spec
 from ..support.fixtures import QWEN
-from ..support.fuzzing import fuzz_settings, saved_on_failure
+from ..support.fuzzing import campaign_settings, saved_on_failure
 from ..support.harness import EOS, Harness, Spec
 from ..support.sched_cases import VOCAB
 from ..support.structured_cases import SCHEMA, masked_rows, run, run_structured_workload, structured_workloads
@@ -377,7 +377,7 @@ def test_a_grammar_the_engine_rejects_fails_only_its_request() -> None:
 # -- the targeted fuzz suite -------------------------------------------------------------------------------------------
 
 
-@fuzz_settings(300)
+@campaign_settings(300)
 @given(structured_workloads())
 def test_random_structured_workloads(w) -> None:
     with saved_on_failure("structured", w):

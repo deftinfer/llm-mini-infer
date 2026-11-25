@@ -1,6 +1,7 @@
 """Settings and strategies (`st`) shared by the fuzz suites (`SUITES` in `tests/scripts/fuzz_campaign.py`).
 
-- **CI** (the default profile): each suite runs its own few hundred examples, and Hypothesis shrinks a failure.
+- **CI** (the default profile): each suite runs its own few hundred examples, and Hypothesis shrinks a failure. CI's
+  tests job runs at most `FUZZ_CAP` examples of a campaign suite (`campaign_settings`): its fuzz job runs every suite.
 - **Long campaigns** (`HYPOTHESIS_PROFILE=long`): `FUZZ_EXAMPLES` examples per test (default 20,000), no shrinking
   and no example database. Hypothesis can spend over 5 minutes shrinking a livelock before giving up, so a campaign
   saves every failing example as JSON instead (under `FUZZ_FAILURES`, default `results/fuzz/failures`), and
@@ -92,6 +93,12 @@ def fuzz_settings(ci_examples: int) -> settings:
     common: dict[str, Any] = {"deadline": None,
                               "suppress_health_check": [HealthCheck.too_slow, HealthCheck.data_too_large]}
     return settings(**common) if LONG else settings(max_examples=ci_examples, **common)
+
+
+def campaign_settings(ci_examples: int) -> settings:
+    """`@campaign_settings(n)`, for a suite of `SUITES`: `fuzz_settings(n)`, n capped at `FUZZ_CAP` when it is set."""
+    cap = os.environ.get("FUZZ_CAP")
+    return fuzz_settings(min(ci_examples, int(cap)) if cap and not LONG else ci_examples)
 
 
 def event(name: str) -> None:

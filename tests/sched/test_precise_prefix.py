@@ -31,7 +31,7 @@ from llm_mini_infer.sched.scheduler import (
     derive_refine_chunk_tokens,
 )
 
-from ..support.fuzzing import fuzz_settings, saved_on_failure
+from ..support.fuzzing import campaign_settings, saved_on_failure
 from ..support.harness import EOS, Harness, Spec, check_precise
 from ..support.precise_cases import (
     check_refine_plans,
@@ -964,7 +964,7 @@ def test_the_derived_piece_does_not_depend_on_k(tmp_path) -> None:
 # -- fuzzing ---------------------------------------------------------------------------------------------------------
 
 
-@fuzz_settings(300)
+@campaign_settings(300)
 @given(precise_workloads())
 def test_random_precise_workloads(w) -> None:
     with saved_on_failure("precise", w):
@@ -980,7 +980,7 @@ def test_the_cache_suite_runs_under_the_precise_prefix() -> None:
                             num_pages=200, checkpoint_slots=4, precise="reuse"))
 
 
-@fuzz_settings(300)
+@campaign_settings(300)
 @given(window_precise_workloads())
 def test_random_window_precise_workloads(w) -> None:
     with saved_on_failure("window_precise", w):
