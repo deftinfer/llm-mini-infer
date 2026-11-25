@@ -33,10 +33,19 @@
 // reaches the product) and masked to −inf. A row whose split holds none of its keys keeps m = −inf and l = 0, and the
 // merge skips it.
 //
+// **FP8 pools** (`FP8`: `cache.kv_cache_dtype fp8`). The plane holds E4M3 bytes (kv_fp8.cuh). A tile of 16 keys is
+// then 8 KiB. It lands by cp.async in one of two unswizzled 8 KiB stages, and each tile is converted once, exactly,
+// into the swizzled BF16 tile that the BF16 path loads directly (FlashInfer 0.7.2's FP8 prefill does the same). Both
+// fit in the BF16 path's two 16 KiB stages: the landing stages share the second, the BF16 tile is the first (the Q tile
+// aliases it). Shared memory, and so the CTAs an SM holds, stay the same. Everything after the conversion is the BF16
+// path's code, so an FP8 pool gives the bits of a BF16 pool holding the same values. The conversion's barrier replaces
+// the one that ends a tile on the BF16 path, which the FP8 path does not need (see the loop).
+//
 // Programmatic dependent launch (common.cuh): each kernel here waits for its predecessor as its first statement, then
 // lets the next kernel launch. The launcher adds the attribute while the library's flag is on (the runner's
 // `dev.runner.cuda.pdl`).
 #include "common.cuh"
+#include "kv_fp8.cuh"
 
 namespace {
 
@@ -48,6 +57,8 @@ constexpr int ROWS = 16;  // query rows per tile
 constexpr int KT = 16;    // keys per KV tile
 constexpr int CHUNKS = D / 8;  // 16-byte chunks per key row
 constexpr int TILE_BYTES = KT * D * 2;
+constexpr int CHUNKS8 = D / 16;     // 16-byte chunks per key row of an FP8 pool
+constexpr int LAND_BYTES = KT * D;  // an FP8 tile
 constexpr float LOG2E = 1.4426950408889634f;
 constexpr int MAX_SPLITS = LMK_MAX_SPLITS;  // the merge's lanes (kernels/attn512.py MAX_SPLITS)
 
@@ -111,7 +122,9 @@ constexpr int CS_STRIDE = 72;
 constexpr int CS_CHUNKS = ROT_STAGED * 2 / 16;  // 16-byte chunks of a staged row
 
 struct Smem {
-  alignas(128) unsigned char kv[2][TILE_BYTES];  // two stages of V-plane tiles [KT keys][D]; the Q tile aliases stage 0
+  // two stages of V-plane tiles [KT keys][D]; the Q tile aliases stage 0. FP8 pools: stage 0 is the converted BF16
+  // tile, stage 1 the two FP8 landing stages [KT keys][D bytes]
+  alignas(128) unsigned char kv[2][TILE_BYTES];
   float s[WARPS][ROWS][KT];                     // partial scores
   alignas(16) bf16 cs[2][2][KT][CS_STRIDE];     // two stages of cos and sin of the tile's keys, dims [0, ROT_STAGED)
 };
@@ -134,7 +147,7 @@ __device__ __forceinline__ void k_pair(uint32_t u0, uint32_t u1, float w0a, floa
   }
 }
 
-template <bool SPLIT>
+template <bool SPLIT, bool FP8>
 __global__ void __launch_bounds__(THREADS, 2)
     attn512_kernel(const bf16* __restrict__ q, int H, int G, int Hkv, const bf16* __restrict__ kv, int64_t page_stride,
                    int page_size, const int* __restrict__ page_table, int64_t pt_stride, const bf16* __restrict__ kw,
@@ -235,19 +248,38 @@ __global__ void __launch_bounds__(THREADS, 2)
   const bool page_tiles = page_size % KT == 0;  // a tile (its first key a multiple of KT) lies in one page
   auto load_tile = [&](int ti, int stage) {
     const int kbase = k_begin + ti * KT;
-    const bf16* tbase = page_tiles ? kv + (int64_t)pt[kbase / page_size] * page_stride +
-                                         (int64_t)(kbase % page_size) * Hkv * D : kv;  // the tile's page, found once
-    for (int c = tid; c < KT * CHUNKS; c += THREADS) {
-      const int r = c / CHUNKS, ch = c % CHUNKS;
-      const int key = kbase + r;
-      const bool ok = key < k_end;
-      const bf16* src = kv;
-      if (ok) {
-        src = page_tiles ? tbase + ((int64_t)r * Hkv + it.kvh) * D + ch * 8
-                         : kv + (int64_t)pt[key / page_size] * page_stride +
-                               ((int64_t)(key % page_size) * Hkv + it.kvh) * D + ch * 8;
+    if constexpr (FP8) {  // the same offsets in bytes (the pool view's elements), into an unswizzled landing stage
+      const unsigned char* kv8 = reinterpret_cast<const unsigned char*>(kv);
+      const unsigned char* tbase = page_tiles ? kv8 + (int64_t)pt[kbase / page_size] * page_stride +
+                                                    (int64_t)(kbase % page_size) * Hkv * D : kv8;
+      unsigned char* land = sm.kv[1] + stage * LAND_BYTES;
+      for (int c = tid; c < KT * CHUNKS8; c += THREADS) {
+        const int r = c / CHUNKS8, ch = c % CHUNKS8;
+        const int key = kbase + r;
+        const bool ok = key < k_end;
+        const unsigned char* src = kv8;
+        if (ok) {
+          src = page_tiles ? tbase + ((int64_t)r * Hkv + it.kvh) * D + ch * 16
+                           : kv8 + (int64_t)pt[key / page_size] * page_stride +
+                                 ((int64_t)(key % page_size) * Hkv + it.kvh) * D + ch * 16;
+        }
+        cp_async16(smem_u32(land + r * D + ch * 16), src, ok);  // zero-fill: E4M3 0x00 is +0
       }
-      cp_async16(smem_u32(sm.kv[stage] + swz(r, ch)), src, ok);
+    } else {
+      const bf16* tbase = page_tiles ? kv + (int64_t)pt[kbase / page_size] * page_stride +
+                                           (int64_t)(kbase % page_size) * Hkv * D : kv;  // the tile's page, found once
+      for (int c = tid; c < KT * CHUNKS; c += THREADS) {
+        const int r = c / CHUNKS, ch = c % CHUNKS;
+        const int key = kbase + r;
+        const bool ok = key < k_end;
+        const bf16* src = kv;
+        if (ok) {
+          src = page_tiles ? tbase + ((int64_t)r * Hkv + it.kvh) * D + ch * 8
+                           : kv + (int64_t)pt[key / page_size] * page_stride +
+                                 ((int64_t)(key % page_size) * Hkv + it.kvh) * D + ch * 8;
+        }
+        cp_async16(smem_u32(sm.kv[stage] + swz(r, ch)), src, ok);
+      }
     }
     if (staged) {  // keys past k_end load zeros: their scores are masked and their V rows are zero
       for (int c = tid; c < KT * 2 * CS_CHUNKS; c += THREADS) {
@@ -270,7 +302,23 @@ __global__ void __launch_bounds__(THREADS, 2)
       cp_wait<0>();
     }
     __syncthreads();
-    const unsigned char* tile = sm.kv[stage];
+    const unsigned char* tile;
+    if constexpr (FP8) {
+      // The landed FP8 tile into the BF16 tile, each thread 8 dims (8 bytes, one swizzled 16-byte chunk) at a time;
+      // the previous tile's readers passed the barrier that ended its iteration
+      const unsigned char* land = sm.kv[1] + stage * LAND_BYTES;
+      for (int c = tid; c < KT * CHUNKS; c += THREADS) {
+        const int r = c / CHUNKS, ch = c % CHUNKS;
+        const uint2 b = *reinterpret_cast<const uint2*>(land + r * D + ch * 8);
+        const uint4 v = make_uint4(lmk_kv_bf16x2(b.x), lmk_kv_bf16x2(b.x >> 16), lmk_kv_bf16x2(b.y),
+                                   lmk_kv_bf16x2(b.y >> 16));
+        *reinterpret_cast<uint4*>(sm.kv[0] + swz(r, ch)) = v;
+      }
+      __syncthreads();
+      tile = sm.kv[0];
+    } else {
+      tile = sm.kv[stage];
+    }
     const int kbase = k_begin + ti * KT;
     // -- partial S over this warp's dims --
     float s[2][4];
@@ -390,7 +438,10 @@ __global__ void __launch_bounds__(THREADS, 2)
       mma(o[2 * nb], pa, v0, v1);
       mma(o[2 * nb + 1], pa, v2, v3);
     }
-    __syncthreads();  // the next tile rewrites the stage and the score buffer
+    // The next tile rewrites the stage and the score buffer. FP8 pools need no barrier here: the next load writes the
+    // other landing stage and cos/sin stage, read before this tile's conversion barrier and score barrier, and the
+    // conversion and the scores follow the next tile's first barrier
+    if constexpr (!FP8) __syncthreads();
   }
 
   // -- epilogue --
@@ -488,8 +539,8 @@ __global__ void attn512_merge_kernel(int H, int G, const Row* __restrict__ rows,
 // rows: int32 [n_rows, 4] (slot, first token in q/out, n_query, KV length after the step). items: int32 [n_items, 4]
 // (row, tile, KV head, split | n << 16), grouped by (row, tile, KV head) with a group's n splits consecutive (row −1:
 // padding). groups: int32 [n_groups, 2] (first item, n) of each group (first −1: padding). q and out are [T, H, 512].
-// kv is a layer's V plane [pages, page_size, Hkv, 512]. cos and sin are [max_pos, 256] (the kernel reads only dims <
-// rot).
+// kv is a layer's V plane [pages, page_size, Hkv, 512], in BF16 or, with `kv_fp8` 1, E4M3 bytes (its page stride
+// then counts bytes). cos and sin are [max_pos, 256] (the kernel reads only dims < rot).
 //
 // `split` 0: every group has one split (the kernel does not read the items' n; no merge, `groups` unused). `split` 1:
 // o_part [n_items, 16, 512] fp32 and ml_part [n_items, 16, 2] fp32 hold the partials of groups of more than one split
@@ -503,7 +554,29 @@ __global__ void attn512_merge_kernel(int H, int G, const Row* __restrict__ rows,
 //
 // The kernel stages each tile's cos and sin rows in shared memory when rot <= 64, and looks up a tile's page once when
 // the page size is a multiple of 16. Other shapes read both per key and give the same bits.
-LMK_API int lmk_attn512(const void* q, int H, int Hkv, const void* kv, int64_t page_stride, int page_size,
+namespace {
+template <bool SPLIT, bool FP8>
+int attn512_launch(const void* q, int H, int G, int Hkv, const void* kv, int64_t page_stride, int page_size,
+                   const void* page_table, int64_t pt_stride, const void* k_weight, const void* cos, const void* sin,
+                   int rot, float scale, const void* rows, const void* items, int n_items, int split_keys, int n_dec,
+                   int whole, int prefill_keys, const void* order, void* out, void* o_part, void* ml_part,
+                   cudaStream_t stream) {
+  const int smem = (int)sizeof(Smem);
+  static bool init = false;
+  if (!init) {
+    cudaFuncSetAttribute(attn512_kernel<SPLIT, FP8>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    init = true;
+  }
+  return lmk_launch(attn512_kernel<SPLIT, FP8>, dim3(n_items), dim3(THREADS), smem, stream, (const bf16*)q, H, G, Hkv,
+                    (const bf16*)kv, page_stride, page_size, (const int*)page_table, pt_stride, (const bf16*)k_weight,
+                    (const bf16*)cos, (const bf16*)sin, rot, scale, (const Row*)rows, (const Item*)items,
+                    (const int*)order, SPLIT ? split_keys : 0, SPLIT ? n_dec : 0, SPLIT ? whole : 0,
+                    SPLIT ? prefill_keys : 0, (bf16*)out, SPLIT ? (float*)o_part : (float*)nullptr,
+                    SPLIT ? (float*)ml_part : (float*)nullptr);
+}
+}  // namespace
+
+LMK_API int lmk_attn512(const void* q, int H, int Hkv, const void* kv, int64_t page_stride, int page_size, int kv_fp8,
                         const void* page_table, int64_t pt_stride, const void* k_weight, const void* cos,
                         const void* sin, int rot, float scale, const void* rows, const void* items, int n_items,
                         const void* groups, int n_groups, int split, int split_keys, int n_dec, int whole,
@@ -512,43 +585,27 @@ LMK_API int lmk_attn512(const void* q, int H, int Hkv, const void* kv, int64_t p
   if (n_items <= 0) return 0;
   const int G = H / Hkv;
   if (H % Hkv || ROWS % G || rot > HALF || rot % 2 || split < 0 || split > 1 || (split && n_groups <= 0) ||
-      split_keys < 0 || split_keys % KT || (split_keys && (prefill_keys < KT || prefill_keys % KT || whole < 0)))
+      split_keys < 0 || split_keys % KT || (split_keys && (prefill_keys < KT || prefill_keys % KT || whole < 0)) ||
+      kv_fp8 < 0 || kv_fp8 > 1)
     return -1;
-  const int smem = (int)sizeof(Smem);
-  if (!split) {
-    static bool init = false;
-    if (!init) {
-      cudaFuncSetAttribute(attn512_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-      init = true;
-    }
-    return lmk_launch(attn512_kernel<false>, dim3(n_items), dim3(THREADS), smem, stream, (const bf16*)q, H, G, Hkv,
-                      (const bf16*)kv, page_stride, page_size, (const int*)page_table, pt_stride,
-                      (const bf16*)k_weight, (const bf16*)cos, (const bf16*)sin, rot, scale, (const Row*)rows,
-                      (const Item*)items, (const int*)order, 0, 0, 0, 0, (bf16*)out, (float*)nullptr,
-                      (float*)nullptr);
-  }
-  static bool init_s = false;
-  if (!init_s) {
-    cudaFuncSetAttribute(attn512_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    init_s = true;
-  }
-  const int st = lmk_launch(attn512_kernel<true>, dim3(n_items), dim3(THREADS), smem, stream, (const bf16*)q, H, G,
-                            Hkv, (const bf16*)kv, page_stride, page_size, (const int*)page_table, pt_stride,
-                            (const bf16*)k_weight, (const bf16*)cos, (const bf16*)sin, rot, scale, (const Row*)rows,
-                            (const Item*)items, (const int*)order, split_keys, n_dec, whole, prefill_keys,
-                            (bf16*)out, (float*)o_part, (float*)ml_part);
-  if (st) return st;
+  auto launch = !split ? (kv_fp8 ? attn512_launch<false, true> : attn512_launch<false, false>)
+                       : (kv_fp8 ? attn512_launch<true, true> : attn512_launch<true, false>);
+  const int st = launch(q, H, G, Hkv, kv, page_stride, page_size, page_table, pt_stride, k_weight, cos, sin, rot, scale,
+                        rows, items, n_items, split_keys, n_dec, whole, prefill_keys, order, out, o_part, ml_part,
+                        stream);
+  if (st || !split) return st;
   return lmk_launch(attn512_merge_kernel, dim3(n_groups * ROWS), dim3(128), 0, stream, H, G, (const Row*)rows,
                     (const Item*)items, (const int2*)groups, (const float*)o_part, (const float*)ml_part, (bf16*)out);
 }
 
-// Returns the number of split-kernel CTAs that fit on one SM at once (shared memory and registers allow it), or −1. The
-// wave-aware split fills one wave of them.
-LMK_API int lmk_attn512_occupancy() {
+// Returns the number of split-kernel CTAs (over BF16 pools, or FP8 ones with `kv_fp8` 1) that fit on one SM at once
+// (shared memory and registers allow it), or −1. The wave-aware split fills one wave of them.
+LMK_API int lmk_attn512_occupancy(int kv_fp8) {
   int n = 0;
   const int smem = (int)sizeof(Smem);
-  if (cudaFuncSetAttribute(attn512_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem) != cudaSuccess ||
-      cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, attn512_kernel<true>, THREADS, smem) != cudaSuccess) {
+  auto kernel = kv_fp8 ? attn512_kernel<true, true> : attn512_kernel<true, false>;
+  if (cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem) != cudaSuccess ||
+      cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, kernel, THREADS, smem) != cudaSuccess) {
     cudaGetLastError();
     return -1;
   }

@@ -5,7 +5,8 @@
 - **window pages** `wkv` [n_sliding, pages, 2, page_size, Hs, Ds]: the sliding layers' K and V planes (FlashInfer's
   NHD layout per layer), held for the positions a request's next queries can see;
 - **full pages** `fkv` [n_full, pages', full_page_size, Hf, Df] (one plane, V, with `attention_k_eq_v`; [.., 2, ..]
-  without): every position of every request, shared through the prefix cache.
+  without): every position of every request, shared through the prefix cache. In the runner's dtype, or uint8 bytes
+  of FP8 E4M3 values (`cache.kv_cache_dtype fp8`: `gemma_ops.kv_fp8` stores, `kv_read` reads).
 In the runner both are views of one arena (`runner.cuda.gemma._Arena`), whose full pages it addresses through sub-pages
 of `full_page_size` positions; the backends need only the two views. Page 0 of each is the null page: CUDA-graph
 padding rows write their KV there.
@@ -182,7 +183,7 @@ class TorchSlidingAttention:
 class TorchFullAttention:
     """Reference full attention of a k_eq_v layer: per row, gather the stored V plane of every position, derive K =
     RoPE(V ⊙ k_norm.weight) at the keys' positions (`gemma_ops.k_from_v`), causal SDPA. Without k_eq_v the pool has K
-    and V planes."""
+    and V planes. An FP8 pool (uint8 bytes) is dequantized into the queries' dtype first (`gemma_ops.kv_read`)."""
 
     name = "torch"
 
@@ -206,11 +207,11 @@ class TorchFullAttention:
             kpos = torch.arange(length, device=q.device)
             if self.k_eq_v:
                 hkv, d = kv.shape[2], kv.shape[3]
-                vals = kv[pages].reshape(-1, hkv, d)[:length]
+                vals = gops.kv_read(kv[pages].reshape(-1, hkv, d)[:length], q.dtype)
                 keys = gops.k_from_v(vals, layer.k_norm.weight, cos[kpos], sin[kpos])
             else:
                 hkv, d = kv.shape[3], kv.shape[4]
-                keys = kv[:, 0][pages].reshape(-1, hkv, d)[:length]
-                vals = kv[:, 1][pages].reshape(-1, hkv, d)[:length]
+                keys = gops.kv_read(kv[:, 0][pages].reshape(-1, hkv, d)[:length], q.dtype)
+                vals = gops.kv_read(kv[:, 1][pages].reshape(-1, hkv, d)[:length], q.dtype)
             qpos = torch.arange(length - n, length, device=q.device)
             out[s:s + n] = gops.attention_ref(q[s:s + n], keys, vals, qpos, kpos)

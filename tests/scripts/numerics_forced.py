@@ -11,6 +11,8 @@ the model and process-wide flags).
         [--rids 0,3]
     python3 -m tests.scripts.numerics_forced run --refs <dir>/refs.json --arm on --no-graphs --taps --core-layers 3,31
     python3 -m tests.scripts.numerics_forced run --refs <dir>/refs.json --arm on --kv-dtype fp8 [--concurrency 8]
+    python3 -m tests.scripts.numerics_forced run --refs <dir>/refs.json --arm on --kv-cache-dtype fp8
+    python3 -m tests.scripts.numerics_forced same <dir>/on-kvfp8 <dir>/on-kv8
     (Gemma 4: --model RedHatAI/gemma-4-31B-it-FP8-block --assistant google/gemma-4-31B-it-assistant)
 
 **The engine** (`Engine`) is the server's, in-process: the runner, its pools sized as `engine.process` sizes them from
@@ -23,8 +25,10 @@ the EOS-free finish, the precise prefix (`runner.cuda.fp8_cold_prefill` reuse; i
 mixed-step bound derived from the profile's step costs (off with `--memory-gb`), images on where the checkpoint has a
 tower. An arm sets `dev.runner.cuda.batch_invariant` (`on`, `off`; Gemma 4's five runner switches together, as
 `make_cuda_runner` sets them), the prefix cache (`--cache`; Qwen's checkpoint slots as the server sizes them) and CUDA
-graphs (`--no-graphs`: every step eager), and with `--kv-dtype` the KV an FP8 pool would hold (below). Its name, and
-its folder under `--out`: `<switch>[-kv8|-kv8all][-cache][-eager]` (`arm_name`), e.g. `on`, `off-cache`, `on-kv8-eager`.
+graphs (`--no-graphs`: every step eager), and with `--kv-dtype` the KV an FP8 pool would hold (below), or with
+`--kv-cache-dtype fp8` the real FP8 pool (`cache.kv_cache_dtype`: Gemma 4's full layers). Its name, and its folder
+under `--out`: `<switch>[-kv8|-kv8all|-kvfp8][-cache][-eager]` (`arm_name`), e.g. `on`, `off-cache`, `on-kv8-eager`,
+`on-kvfp8`.
 
 **References** (`refs`; `build_requests`, `make_refs`): each request's prompt as the server builds it (the chat template
 with thinking off, `Renderer.encode`, the frontend's image expansion), answered greedily by the engine under the
@@ -61,7 +65,13 @@ pool: the arm's tokens, hidden states and acceptance are that design's, the draf
 The scale is 1.0 unless `--kv-scales` sets per-layer powers of two (exact too); Gemma 4's full layers store k / rms(k)
 per head, at most sqrt(512) = 22.6, never saturated. run.json's `kv_fake_quant`: the settings and, per layer and plane,
 the values written, those saturated and the largest magnitude (and the power-of-two scales that would keep them in
-range).
+range). The real pool (`--kv-cache-dtype fp8`, arm `-kvfp8`) stores the same rounding of the same BF16 values
+(`gemma_ops.kv_fp8`) and its kernel reads them as this arm's attention does, so on the same references `on-kvfp8`
+should equal `on-kv8` bit for bit (`same`: hidden states and acceptance per request), except where the full page of
+twice the positions changes what a prefix-cache hit reuses (`-cache` arms). The fake-quant refuses an FP8 pool.
+
+**Bit for bit** (`same A B`): per request, whether it is in both arm folders and its tokens, the positions with a hidden
+state, the hidden states there and the acceptance at every verify step are the same; exit 1 when any request is not.
 
 **The capture** (one dict per request; the shape the fp32 analysis reads):
 - `model` ("qwen" | "gemma"), `model_dir`, `assistant_dir`, `arm`, `settings` (the engine's: the `Options`, the pools,
@@ -127,6 +137,7 @@ import json
 import logging
 import math
 import os
+import re
 import sys
 import tempfile
 import time
@@ -208,9 +219,13 @@ class HelpFormatter(argparse.RawDescriptionHelpFormatter):
         return f"{h} (default: %(default)s)"
 
 
-def arm_name(switch: str, cache: bool, graphs: bool, kv_dtype: str | None = None, kv_scaled: bool = False) -> str:
-    """`<switch>[-kv8|-kv8all][-cache][-eager]`, `s` after the KV tag when per-layer scales other than 1 are set."""
+def arm_name(switch: str, cache: bool, graphs: bool, kv_dtype: str | None = None, kv_scaled: bool = False,
+             kv_cache_dtype: str = "auto") -> str:
+    """`<switch>[-kv8|-kv8all|-kvfp8][-cache][-eager]`: `-kv8` the fake-quant (`s` after it when per-layer scales other
+    than 1 are set), `-kvfp8` the real FP8 pool."""
     kv = "" if kv_dtype is None else "-kv8" + ("all" if kv_dtype == "fp8-all" else "") + ("s" if kv_scaled else "")
+    if kv_cache_dtype == "fp8":
+        kv += "-kvfp8"
     return switch + kv + ("-cache" if cache else "") + ("" if graphs else "-eager")
 
 
@@ -290,6 +305,7 @@ class Options:
     pdl: bool = True
     always_split: bool = True
     check: bool = False
+    kv_cache_dtype: str = "auto"  # cache.kv_cache_dtype: fp8, Gemma 4's full layers in a real FP8 pool
 
 
 # -- prompts -----------------------------------------------------------------------------------------------------------
@@ -522,10 +538,13 @@ class Engine:
 
             self.runner: Any = GemmaRunner(
                 model_dir, assistant=assistant, attn512_split_keys=FULL_SPLIT_KEYS if inv else 0,
-                window_split_keys=SPLIT_KEYS if inv else 0, head_fixed_m=inv, encode_per_image=inv, **kw)
+                window_split_keys=SPLIT_KEYS if inv else 0, head_fixed_m=inv, encode_per_image=inv,
+                kv_cache_dtype=opts.kv_cache_dtype, **kw)
         else:
             from llm_mini_infer.runner.cuda.runner import CudaRunner
 
+            if opts.kv_cache_dtype != "auto":
+                raise ValueError("--kv-cache-dtype fp8: Gemma 4's full layers only (Qwen3.8's is not built)")
             self.runner = CudaRunner(model_dir, **kw)
         r = self.runner
         caps = r.capabilities()
@@ -1034,6 +1053,8 @@ class Recorder:
 
             r.attn.run = qwen_run
         elif full:
+            from llm_mini_infer.kernels.gemma_ops import kv_read
+
             mods = {id(layers[i].self_attn): i for i in full}
             run, pools = r.attn_f.run, r.pools
 
@@ -1045,6 +1066,7 @@ class Recorder:
                     page, off = meta.f_page.index_select(0, js), meta.f_off.index_select(0, js)
                     kv = pools.fkv[layer.index]
                     planes = {"v": kv[page, off]} if layer.k_eq_v else {"k": kv[page, 0, off], "v": kv[page, 1, off]}
+                    planes = {n: kv_read(x, q.dtype) for n, x in planes.items()}  # an FP8 pool's, dequantized
                     self._put_attn(i, {"q": q.index_select(0, js), **planes, "o": out.index_select(0, js)})
                 return res
 
@@ -1234,6 +1256,8 @@ class KvFakeQuant:
             raise RuntimeError(f"more than {self.SLOTS} KV layers")
         real = (page != 0)[:, None, None]
         scales = self.scales.get((kind, index), (1.0, 1.0))
+        if any(plane.dtype == torch.uint8 for plane in planes.values()):
+            raise ValueError("the KV fake-quant rounds a BF16 pool: this one is FP8 already (--kv-cache-dtype fp8)")
         for j, plane in planes.items():
             x = plane[page, off]
             a = torch.where(real, x.abs().float(), 0.0)
@@ -1352,6 +1376,9 @@ def run_arm(refs: dict[str, Any] | str | Path, *, switch: str, cache: bool = Fal
     if kv_dtype == "fp8-all" and model_kind(model_dir) != "gemma":
         raise ValueError("--kv-dtype fp8-all adds Gemma 4's sliding layers: fp8 rounds every layer of this model")
     opts = opts or Options(max_model_len=refs.get("settings", {}).get("max_model_len", MAX_LEN))
+    if kv_dtype is not None and opts.kv_cache_dtype != "auto":
+        raise ValueError("--kv-dtype rounds a BF16 pool's KV as an FP8 pool would hold it; with --kv-cache-dtype fp8 "
+                         "the pool is FP8 already")
     opts = replace(opts, draft_universe=False, draft_vocab=opts.draft_vocab or 0,
                    soft_tokens=refs.get("options", {}).get("soft_tokens", opts.soft_tokens))
     want = set(rids) if rids is not None else None
@@ -1359,7 +1386,7 @@ def run_arm(refs: dict[str, Any] | str | Path, *, switch: str, cache: bool = Fal
     if want is not None and want - {q["rid"] for q in reqs}:
         raise ValueError(f"no reference for rids {sorted(want - {q['rid'] for q in reqs})}")
     kvq = KvFakeQuant(kv_dtype, opts.device, kv_scales) if kv_dtype is not None else None
-    arm = arm_name(switch, cache, graphs, kv_dtype, kvq is not None and kvq.scaled)
+    arm = arm_name(switch, cache, graphs, kv_dtype, kvq is not None and kvq.scaled, opts.kv_cache_dtype)
     folder = Path(out) if out else src.parent if src else results_dir("forced")
     (folder / arm).mkdir(parents=True, exist_ok=True)
     _, eos = grammar_eos(model_dir)
@@ -1557,6 +1584,9 @@ def _engine_args(p: argparse.ArgumentParser) -> None:
     g.add_argument("--always-split", action=argparse.BooleanOptionalAction, default=True,
                    help="forward and sampling graphs apart at every step (dev.runner.cuda.always_split)")
     g.add_argument("--check", action="store_true", help="compare the device tables with the host's every step")
+    g.add_argument("--kv-cache-dtype", default="auto", choices=("auto", "fp8"),
+                   help="cache.kv_cache_dtype: fp8 stores Gemma 4's full layers' KV in a real FP8 pool (arm "
+                        "-kvfp8; --kv-dtype emulates one in a BF16 pool)")
     g.add_argument("--cache", action="store_true", help="the prefix cache on (Qwen: with checkpoint slots)")
     g.add_argument("--graphs", action=argparse.BooleanOptionalAction, default=True,
                    help="CUDA graphs (--no-graphs: every step eager, which taps need)")
@@ -1568,7 +1598,7 @@ def _options(args: argparse.Namespace, **kw: Any) -> Options:
                    budget=args.budget, max_num_seqs=args.max_num_seqs, page_size=args.page_size,
                    memory_gb=args.memory_gb, num_pages=args.num_pages, ckpt_slots=args.ckpt_slots,
                    row_tokens=args.row_tokens, precise=args.precise, pdl=args.pdl, sparse_head=args.sparse_head,
-                   always_split=args.always_split, check=args.check, **kw)
+                   always_split=args.always_split, check=args.check, kv_cache_dtype=args.kv_cache_dtype, **kw)
 
 
 def cmd_refs(args: argparse.Namespace) -> None:
@@ -1604,6 +1634,56 @@ def cmd_run(args: argparse.Namespace) -> None:
                   assistant=args.assistant, kv_dtype=args.kv_dtype,
                   kv_scales=load_kv_scales(args.kv_scales) if args.kv_scales else None)
     print(run_tables(res), flush=True)
+
+
+def same(a: str | Path, b: str | Path) -> list[dict[str, Any]]:
+    """Two arms' forced runs request by request (the module docstring, bit for bit): for each `r<rid>.pt` in either
+    folder, whether it is in both (`missing`: the folder without it), whether the tokens, the positions with a hidden
+    state (`hvalid`), the hidden states there and the acceptance at every verify step (its drafts accepted and their
+    positions) are the same, and where the hidden states differ, the rows and the largest difference. `ok`: all of
+    them, over at least one position."""
+    import torch
+
+    def runs(folder: str | Path) -> dict[int, Path]:
+        return {int(m[1]): f for f in Path(folder).glob("r*.pt") if (m := re.fullmatch(r"r(\d+)\.pt", f.name))}
+
+    fa, fb = runs(a), runs(b)
+    out = []
+    for rid in sorted(fa.keys() | fb.keys()):
+        if rid not in fa or rid not in fb:
+            out.append({"rid": rid, "missing": str(b if rid in fa else a), "ok": False})
+            continue
+        ca, cb = (torch.load(f, map_location="cpu", weights_only=True) for f in (fa[rid], fb[rid]))
+        tokens = torch.equal(ca["tokens"], cb["tokens"])
+        masks = tokens and torch.equal(ca["hvalid"], cb["hvalid"])
+        v = ca["hvalid"] if masks else torch.zeros(0, dtype=torch.bool)
+        ha, hb = (ca["hidden"][v], cb["hidden"][v]) if masks else (torch.zeros(0), torch.zeros(0))
+        rows = (ha != hb).flatten(1).any(1) if len(ha) else torch.zeros(0, dtype=torch.bool)
+        accept = torch.equal(ca["accept"], cb["accept"]) and torch.equal(ca["accept_pos"], cb["accept_pos"])
+        hidden = masks and not bool(rows.any())
+        out.append({"rid": rid, "missing": None, "tokens": tokens, "masks": masks, "positions": int(v.sum()),
+                    "hidden": hidden, "rows": int(rows.sum()),
+                    "max_diff": float((ha.float() - hb.float()).abs().max()) if bool(rows.any()) else 0.0,
+                    "accept": accept, "ok": tokens and hidden and accept and int(v.sum()) > 0})
+    return out
+
+
+def cmd_same(args: argparse.Namespace) -> None:
+    res = same(args.a, args.b)
+    if not res:
+        raise SystemExit(f"no request in {args.a} or {args.b}")
+    for r in res:
+        if r["missing"]:
+            print(f"r{r['rid']}: not in {r['missing']}")
+            continue
+        hidden = ("same" if r["hidden"] else f"differ ({r['rows']} rows, max {r['max_diff']:.4g})" if r["masks"]
+                  else "at other positions")
+        print(f"r{r['rid']}: {r['positions']} positions, tokens {'same' if r['tokens'] else 'differ'}, hidden "
+              f"{hidden}, accept {'same' if r['accept'] else 'differ'}")
+    bad = [r["rid"] for r in res if not r["ok"]]
+    print(f"{len(res) - len(bad)} of {len(res)} requests bit for bit the same" + (f"; not: {bad}" if bad else ""))
+    if bad:
+        raise SystemExit(1)
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -1644,6 +1724,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     p.add_argument("--out", type=Path, default=None, help="the run's folder, <out>/<arm>/ (default: refs.json's)")
     _engine_args(p)
     p.set_defaults(fn=cmd_run)
+    p = sub.add_parser("same", help="two arms' runs bit for bit (tokens, hidden states, acceptance)",
+                       formatter_class=HelpFormatter)
+    p.add_argument("a", type=Path, help="an arm's folder (<out>/<arm>)")
+    p.add_argument("b", type=Path, help="another arm's folder")
+    p.set_defaults(fn=cmd_same)
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s: %(message)s")
     args.fn(args)

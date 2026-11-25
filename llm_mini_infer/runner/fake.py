@@ -228,12 +228,13 @@ def fake_generate(prompt: Iterable[int], seed: int, n: int, vocab: int, avoid: I
     return out
 
 
-def model_geometry(model_dir: str | Path) -> dict[str, int]:
+def model_geometry(model_dir: str | Path, kv_cache_dtype: str = "auto") -> dict[str, int]:
     """Sizes from an HF `config.json`, as a real runner would report them, for realistic pool sizing.
 
     KV per token covers every full-attention layer plus the MTP drafter's (BF16 K and V); a state slot holds the
     FP32 recurrent state and BF16 conv state of every linear-attention (GDN) layer plus the MTP hidden vector.
-    For Qwen3.8-27B this gives 1,114,112 B per 16-token page and 153,954,304 B per slot.
+    For Qwen3.8-27B this gives 1,114,112 B per 16-token page and 153,954,304 B per slot. `kv_cache_dtype` fp8 (Gemma 4
+    only, as `cache.kv_cache_dtype`): its full layers' KV at one byte a value.
     """
     cfg = json.loads((Path(model_dir) / "config.json").read_text())
     tc = cfg.get("text_config", cfg)
@@ -241,10 +242,13 @@ def model_geometry(model_dir: str | Path) -> dict[str, int]:
         from ..models.gemma4.model import FULL, SLIDING, Gemma4Config
 
         g = Gemma4Config.from_hf(cfg)
-        return {"kv_bytes_per_token": g.kv_bytes_per_token(FULL, 2), "state_slot_bytes": 0,
+        full = 1 if kv_cache_dtype == "fp8" else 2
+        return {"kv_bytes_per_token": g.kv_bytes_per_token(FULL, full), "state_slot_bytes": 0,
                 "window_kv_bytes_per_token": g.kv_bytes_per_token(SLIDING, 2), "window": g.sliding_window,
                 "vocab_size": g.vocab_size, "max_positions": g.max_position_embeddings,
                 "bidirectional_images": g.bidirectional == "vision" and bool(cfg.get("vision_config"))}
+    if kv_cache_dtype != "auto":  # config.derive refuses it first
+        raise ValueError(f"KV cache dtype {kv_cache_dtype}: Gemma 4's full layers only")
     n_layers = int(tc.get("num_hidden_layers", 0))
     types = tc.get("layer_types")
     if not types:
@@ -1030,12 +1034,14 @@ def load_model(seconds: float) -> None:
 
 def make_fake_runner(model_dir: str | Path, opts: Any, mtp_k: int = 0, encoder_rows: int = 0,
                      encoder_budget: int = 0, logprobs: bool = True, penalties: bool = True,
-                     draft_counts: Iterable[int] | None = None) -> FakeRunner:
-    """Build from the model's config.json (geometry), `dev.runner.fake` options, the MTP depth, (images) the encoder
-    cache's rows and the encoder's budget, and whether it takes LOGPROBS rows and penalties."""
+                     draft_counts: Iterable[int] | None = None, kv_cache_dtype: str = "auto") -> FakeRunner:
+    """Build from the model's config.json (geometry at `kv_cache_dtype`), `dev.runner.fake` options, the MTP depth,
+    (images) the encoder cache's rows and the encoder's budget, and whether it takes LOGPROBS rows and penalties."""
     if opts.load_s:
         load_model(opts.load_s)
-    geo = model_geometry(model_dir) if (Path(model_dir) / "config.json").exists() else {}
+    geo = model_geometry(model_dir, kv_cache_dtype) if (Path(model_dir) / "config.json").exists() else {}
+    if kv_cache_dtype != "auto" and not geo.get("window"):
+        raise ValueError(f"KV cache dtype {kv_cache_dtype}: Gemma 4's full layers only")
     vocab = opts.vocab_size or geo.get("vocab_size") or 32000
     eos_at: dict[int, list[int]] = {}
     for seed, pos in opts.eos:

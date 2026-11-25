@@ -79,6 +79,22 @@
    "torch": "2.14.1+cu130"
   }
  },
+ "text-kvfp8/sm_120-188sm/c7e6cbcaae8f0e97": {
+  "hidden": "c59a5d6004acfa6c25527fc6c47a6c9735ae5689c9fb644fdd26f6964fee6255",
+  "images": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "logits": "f16b77128a0f86a55024419881b5413f03dac9412efc780e4c1f6326ed0e3de1",
+  "versions": {
+   "cublas": "13.1.1.3",
+   "cuda": "13.0",
+   "cutlass": "cutlass-120a-da5aebbd96ce381f sha256:f3e7d12493d607e2",
+   "driver": "595.112.07",
+   "flashinfer": "0.7.2",
+   "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+   "kernels": "120-3958d09bb29ad098 sha256:0536e5a6b9c5420b",
+   "pillow": "13.0.0",
+   "torch": "2.14.1+cu130"
+  }
+ },
  "text/sm_120-188sm/c7e6cbcaae8f0e97": {
   "hidden": "f99fb2594f9661c210724e9d1a58881f1c39e7028db3526e6880e6ab6dd69a4f",
   "images": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",

@@ -107,6 +107,25 @@ def test_size_arena_refuses_or_caps_a_request_it_cannot_hold() -> None:
     assert sz.max_model_len == (200 - 1 - 194 - 1) * 320 - 2 + 1
 
 
+def test_an_fp8_arena_holds_twice_the_full_positions_a_page(caplog) -> None:
+    """With the full layers' KV in FP8 (`cache.kv_cache_dtype fp8`: 20 KiB a position) a full page is 640
+    positions, the window pages unchanged. In 4,000 pages a request of 32,768 tokens then holds 52 full pages and 66
+    window pages (118, against 169 in BF16), so 33 fit at once against 23, and 8 of 262,144 against 4; a length the
+    arena caps is about twice as long."""
+    assert arena_full_page_size(16, 20_480, 819_200) == 640
+    kw = dict(memory_bytes=0, window_kv_bytes_per_token=819_200, window=1024, window_page_size=16, max_num_seqs=64,
+              max_num_batched_tokens=2048)
+    for kv, page, at_32k, at_262k in ((40_960, 320, 23, 4), (20_480, 640, 33, 8)):
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="llm_mini_infer.cache.pools"):
+            sz = size_arena(**kw, kv_bytes_per_token=kv, max_model_len=262_144, num_pages=4000, reference_len=32_768)
+        msg = next(r.message for r in caplog.records if r.message.startswith("KV arena"))
+        assert sz.page_size == page and f"full page of {page} positions" in msg
+        assert f"about {at_32k} requests of 32,768 tokens at once ({at_262k} at max_model_len 262,144)" in msg
+        capped = size_arena(**kw, kv_bytes_per_token=kv, max_model_len=4096, num_pages=200, cap_max_model_len=True)
+        assert capped.max_model_len == (200 - 1 - 194 - 1) * page - 1
+
+
 def test_a_pool_that_does_not_fit_names_the_settings_that_size_it(caplog) -> None:
     """The errors name the settings that size the state pool: dev.cache.num_state_slots when set (max_num_seqs and
     checkpoint_slots then change nothing), max_num_seqs and checkpoint_slots otherwise, max_num_seqs alone without

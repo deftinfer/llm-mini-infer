@@ -126,6 +126,7 @@ Each row gives vLLM's setting (its default) and the server's (its default):
 | `--default-chat-template-kwargs` (none) | `model.chat_template_kwargs` (`{}`) |
 | `--mm-processor-kwargs` `max_soft_tokens` (the checkpoint's) | `images.max_soft_tokens` (the checkpoint's, else 280), server-wide only |
 | `--gpu-memory-utilization` (0.92) | `runner.cuda.memory_utilization` (0.9) |
+| `--kv-cache-dtype fp8` with `--kv-cache-dtype-skip-layers sliding_window` (`auto`) | `cache.kv_cache_dtype fp8` (`auto`): Gemma 4 only, E4M3 at scale 1.0 |
 | `--enable-request-id-headers` (off) | `server.request_id_header` (`true`) |
 | `--enable-auto-tool-choice`, `--tool-call-parser` (unset) | `tool_calls.parser` (the model family's) |
 | `--reasoning-parser` (unset) | `reasoning.parser` (the model family's) |
