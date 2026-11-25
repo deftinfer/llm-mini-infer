@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 from hypothesis import given
 
-from llm_mini_infer.engine.messages import FinishReason
+from llm_mini_infer.engine.messages import ABORT_DISCONNECT, ABORT_SHUTDOWN, FinishReason
 from llm_mini_infer.sched.plan import MASKED, SAMPLE, STATE_ZERO, PlanBuilder, StepPlan
 from llm_mini_infer.sched.scheduler import Admit, Scheduler
 
@@ -127,7 +127,20 @@ def test_aborts_free_everything() -> None:
     h = Harness(specs=specs, max_num_seqs=2, max_tokens=16)
     h.run()
     h.check()
-    assert h.sched.num_aborts == 4 and h.sched.aborts == [4, 0, 0]  # the harness's aborts are disconnects
+    assert h.sched.num_aborts == 4 and h.sched.aborts == [4, 0, 0, 0]  # the harness's aborts are disconnects
+
+
+def test_abort_all_counts_shutdowns_separately() -> None:
+    specs = [Spec(rid=i, prompt_len=8, max_tokens=10, seed=20_000 + i) for i in range(3)]
+    h = Harness(specs=specs)
+    for spec in specs:
+        h.add(spec)
+
+    h.sched.abort_all()
+
+    assert h.sched.num_aborts == 3 and not h.sched.reqs
+    assert h.sched.aborts[ABORT_DISCONNECT] == 0
+    assert h.sched.aborts[ABORT_SHUTDOWN] == 3
 
 
 def test_priority_orders_admission_but_never_preempts() -> None:

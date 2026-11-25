@@ -94,6 +94,7 @@ from ..cache.pools import PagePool, SlotPool, StatePool, WindowStore, window_pag
 from ..cache.radix import KEY_DTYPE, Match, Node, RadixCache, Spans, is_precise, lost_tokens, precise_ns
 from ..engine.messages import (
     ABORT_REASONS,
+    ABORT_SHUTDOWN,
     CHECKPOINT_SOURCES,
     LOST_CAUSES,
     MASK_CLASSES,
@@ -1170,7 +1171,7 @@ class Scheduler:
         """Engine-side abort of everything (shutdown): the frontends get a finish row for each request."""
         for req in list(self.reqs.values()):
             self._extra.append((req.frontend, req.rid, reason))
-            self.abort(req.frontend, [req.rid])
+            self.abort(req.frontend, [req.rid], ABORT_SHUTDOWN)
 
     @property
     def num_running(self) -> int:

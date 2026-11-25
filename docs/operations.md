@@ -211,6 +211,8 @@ The supervisor's grace period (`docker stop -t`, `stop_grace_period`, `terminati
 | `llm_mini_infer:vision_plan_waits_total` | vision plans that waited for a free buffer: a lost overlap with the previous step, never a wrong plan. It rises under batch invariance when the steps in flight encode more than four images |
 | `llm_mini_infer:gc_seconds_total{process,generation}`, `engine_phase_seconds_total{phase}` | time in Python's collector against wall time; a pause of 10 ms or more is also logged. Where the engine loop's time goes |
 
+`engine_aborts_total` uses `disconnect` when a client leaves and `stop` when a stop string ends a request. It uses `failed` for frontend failures and `shutdown` when the engine stops requests during shutdown.
+
 With several frontends, each one keeps its own request metrics and the per-step histograms of the steps that sent it outputs (`vllm:iteration_tokens_total`, `llm_mini_infer:engine_step_*`), so a scrape sees one frontend's share. The engine's other metrics are the same in all.
 
 ## Caches
