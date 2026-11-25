@@ -8,9 +8,16 @@ Norms, the sandwich, GELU and the q/k/v store round at the references' points, s
 order). The head-512 attention (`csrc/attn512.cu`, K derived from the stored V plane) and FlashInfer's sliding window
 (from each row's first window page) are compared with fp32 attention over the same BF16 inputs, within BF16's rounding
 of P and of the output.
+
+**FP8 pools** (`dev.cache.kv_cache_dtype fp8`): the store's and the read's conversions against the references on every
+input; the store's bytes the E4M3 rounding of its BF16 store; and every attn512 test runs twice (`kv8_twice`), the
+second time over FP8 pools (the `kv8` fixture: its cases' V planes on the E4M3 grid, the kernel reading their bytes),
+where every eager run also runs over the BF16 pool of the same values and must give the same bits.
 """
 
 from __future__ import annotations
+
+import sys
 
 import numpy as np
 import pytest
@@ -199,7 +206,169 @@ def test_qkv_store(d, k_eq_v) -> None:
     pool.check(b1, b2, page, off)
 
 
+def test_the_fp8_kv_conversions_are_the_references() -> None:
+    """The kernels' FP8 KV conversions (csrc/kv_fp8.cuh, `gemma_ops.kv_cast`) against the torch references the CPU runs
+    (`kv_fp8`, `kv_read`, on the CPU) on every input: the store of all 65,536 BF16 bit patterns byte for byte (±inf and
+    overflows saturate to ±448), a NaN stored as a NaN (its sign may differ); the read of all 256 bytes bit for bit, the
+    two NaN bytes read as NaN."""
+    x = torch.arange(1 << 16, dtype=torch.int32, device=DEV).to(torch.int16).view(BF)
+    got, want = gops.kv_cast(x, True).cpu(), gops.kv_fp8(x.cpu())
+    x = x.cpu()
+    nan = x.isnan()
+    assert int(nan.sum()) == 254 and torch.equal(got[~nan], want[~nan])
+    assert bool(gops.kv_read(got[nan], BF).isnan().all())
+    assert gops.kv_read(got[x.isinf()], BF).tolist() == [448.0 if v > 0 else -448.0 for v in x[x.isinf()].tolist()]
+    b = torch.arange(256, dtype=torch.int32, device=DEV).to(torch.uint8)
+    got, want = gops.kv_cast(b, False).cpu(), gops.kv_read(b.cpu(), BF)
+    ok = ~want.isnan()
+    assert int((~ok).sum()) == 2 and bool(got[~ok].isnan().all())
+    assert torch.equal(got[ok].view(torch.int16), want[ok].view(torch.int16))
+
+
+def test_qkv_store_fp8() -> None:
+    """A full layer's store (k_eq_v, head 512) into an FP8 pool (bytes, its page stride past its page's size): q as into
+    a BF16 pool, each written slot the E4M3 bytes of what the kernel stores into the BF16 pool there (`kv_fp8`), every
+    other byte, guards included, as it was."""
+    torch.manual_seed(2)
+    h, hkv, ps, d = 8, 2, 16, 512
+    page, off = kv_slots(ps)
+    t = len(page)
+    qkv = torch.randn(t, (h + hkv) * d, device=DEV, dtype=BF) * 4
+    qkv[-1] = qkv[-2]  # the padding tokens
+    qw, kw = torch.randn(d, device=DEV, dtype=BF) * 0.3 + 1, torch.randn(d, device=DEV, dtype=BF) * 0.3 + 1
+    pos = torch.randint(0, 4000, (t,), device=DEV)
+    pos[-2:] = 0
+    cos, sin = _rope_tables(d, 64)
+    kw_args = dict(heads=h, kv_heads=hkv, head_dim=d, k_eq_v=True, q_w=qw, k_w=kw, eps=1e-6, positions=pos,
+                   cos_cache=cos, sin_cache=sin, kv_page=page, kv_off=off)
+    bf = torch.zeros(10, ps, hkv, d, dtype=BF, device=DEV)
+    size = ps * hkv * d
+    backing = torch.full((64 + 10 * (size + 64),), 0x55, dtype=torch.uint8, device=DEV)
+    f8 = backing.as_strided((10, ps, hkv, d), (size + 64, hkv * d, d, 1), 64)
+    q_bf = gops.qkv_store(qkv, kv_layer=bf, **kw_args)
+    q_f8 = gops.qkv_store(qkv, kv_layer=f8, **kw_args)
+    assert torch.equal(q_bf.view(torch.int16), q_f8.view(torch.int16))
+    assert torch.equal(f8[page, off], gops.kv_fp8(bf[page, off]))
+    mask = torch.zeros_like(backing, dtype=torch.bool)
+    mask.as_strided(f8.shape, f8.stride(), 64)[page, off] = True
+    assert bool((backing[~mask] == 0x55).all()), "the kernel wrote outside its slots"
+
+
+def test_attn512_fp8_keeps_its_occupancy() -> None:
+    """The FP8 path's kernel holds as many CTAs an SM as the BF16 path's (the same shared memory; the wave split's
+    counts follow it)."""
+    lib = build.load()
+    assert lib.lmk_attn512_occupancy(1) == lib.lmk_attn512_occupancy(0) >= 1
+
+
 # -- the head-512 attention ------------------------------------------------------------------------------------------
+
+
+def on_e4m3_grid(x: torch.Tensor) -> torch.Tensor:
+    """x rounded in place to the values an FP8 pool holds (`kv8`), in its dtype again."""
+    return x.copy_(gops.kv_read(gops.kv_fp8(x), x.dtype))
+
+
+class _Fp8Pools:
+    """`_Pools` over an FP8 pool (`kv8`): the given BF16 planes rounded in place to the E4M3 grid, so a test's
+    references read the values the kernel does, and their E4M3 bytes as the kernel's pool (`bf16`: the BF16 one)."""
+
+    def __init__(self, fkv: torch.Tensor, ps: int):
+        self.bf16 = on_e4m3_grid(fkv)
+        self.fkv, self.page_size = gops.kv_fp8(fkv), ps
+
+
+@pytest.mark.parametrize("splits", [1, 5])
+def test_attn512_fp8_never_reads_past_the_keys(splits) -> None:
+    """Every slot no row's keys reach, past a row's KV length in its last page and on the pages no row holds, poisoned:
+    NaN in a BF16 pool, the E4M3 NaN byte (0x7F) in an FP8 one. Both give finite outputs and the same bits, with each
+    group whole or split (keys past a split's end, and a tile's past the row's, are zero-filled, never read)."""
+    from llm_mini_infer.kernels import attn512 as am
+
+    rows = [(6, 2701), (6, 37), (1, 1303), (40, 419)]
+    ps = 16
+    fkv, table, q, kw, cos, sin = _full_case(rows, 32, 4, ps, seed=13)
+    on_e4m3_grid(fkv)
+    used = torch.zeros(fkv.shape[:2], dtype=torch.bool, device=DEV)
+    for r, (_, kv) in enumerate(rows):
+        for k in range(-(-kv // ps)):
+            used[int(table[r + 1, k]), :min(ps, kv - k * ps)] = True
+    p8 = gops.kv_fp8(fkv)
+    fkv[~used] = float("nan")
+    p8[~used] = 0x7F
+    nq, kv = np.asarray([r[0] for r in rows]), np.asarray([r[1] for r in rows])
+    starts = np.concatenate([[0], np.cumsum(nq)[:-1]])
+    rr = torch.as_tensor(np.stack([np.arange(1, len(rows) + 1), starts, nq, kv], axis=1).astype(np.int32), device=DEV)
+    items, groups = am.plan_items(nq, 8, 4, splits)
+    it, gt = torch.as_tensor(items, device=DEV), torch.as_tensor(groups, device=DEV)
+    o_part, ml = torch.empty(len(items), 16, 512, device=DEV), torch.empty(len(items), 16, 2, device=DEV)
+    outs = []
+    for pool in (p8, fkv):
+        got = torch.full_like(q, float("nan"))
+        ops._check(build.load().lmk_attn512(
+            ops._p(q), 32, 4, ops._p(pool), pool.stride(0), ps, int(pool.dtype == torch.uint8), ops._p(table),
+            table.stride(0), ops._p(kw), ops._p(cos), ops._p(sin), 64, 1.0, ops._p(rr), ops._p(it), len(items),
+            ops._p(gt), len(groups), int(splits > 1), 0, 0, 0, 0, ops._p(None), ops._p(got), ops._p(o_part),
+            ops._p(ml), ops._stream(q)), "attn512")
+        torch.cuda.synchronize()
+        outs.append(got)
+    assert bool(torch.isfinite(outs[0]).all()) and torch.equal(outs[0].view(torch.int16), outs[1].view(torch.int16))
+
+
+# The attn512 tests that launch the kernel themselves (no `Attn512.run` to twin): they compare the two pools in place
+DIRECT_LAUNCHES = {"test_attn512_split_counts_agree", "test_attn512_staged_tables_change_no_bit"}
+
+
+@pytest.fixture
+def kv8(request, monkeypatch):
+    """Off: the attn512 tests as they are. On: over FP8 pools. The cases' V planes are rounded to the E4M3 grid
+    (`_full_case`, `_split_case`, `_Pools`), the kernel reads their bytes, and every eager `Attn512.run` (not one a CUDA
+    graph captures: the tests compare their replays with the eager runs and the references) also runs over the BF16
+    pool of the same values, which must give the FP8 run's bits; a test of `Attn512` twins at least one run."""
+    if not request.param:
+        yield False
+        return
+    from llm_mini_infer.kernels import attn512 as am
+
+    mod = sys.modules[__name__]
+    full_case, split_case, run = mod._full_case, mod._split_case, am.Attn512.run
+
+    def rounded_full_case(*a, **kw):
+        fkv, *rest = full_case(*a, **kw)
+        return (on_e4m3_grid(fkv), *rest)
+
+    def rounded_split_case(*a, **kw):
+        case = split_case(*a, **kw)
+        on_e4m3_grid(case.fkv)
+        return case
+
+    twins = []
+
+    def twin(self, meta, layer, q, out) -> None:
+        if not isinstance(self.pools, _Fp8Pools) or torch.cuda.is_current_stream_capturing():
+            return run(self, meta, layer, q, out)
+        twins.append(1)
+        bf = out.clone()
+        run(self, meta, layer, q, out)
+        p8, self.pools.fkv = self.pools.fkv, self.pools.bf16
+        try:
+            run(self, meta, layer, q, bf)
+        finally:
+            self.pools.fkv = p8
+        assert torch.equal(out.view(torch.int16), bf.view(torch.int16)), "an FP8 pool's bits differ from BF16's"
+
+    monkeypatch.setattr(mod, "_full_case", rounded_full_case)
+    monkeypatch.setattr(mod, "_split_case", rounded_split_case)
+    monkeypatch.setattr(mod, "_Pools", _Fp8Pools)
+    monkeypatch.setattr(am.Attn512, "run", twin)
+    yield True
+    assert twins or request.function.__name__ in DIRECT_LAUNCHES, "no eager run over an FP8 pool was twinned"
+
+
+def kv8_twice(f):
+    """The test over BF16 pools, then over FP8 pools (`kv8`)."""
+    return pytest.mark.usefixtures("kv8")(
+        pytest.mark.parametrize("kv8", [False, True], ids=["bf16", "fp8"], indirect=True)(f))
 
 
 def _full_ref(rows, fkv, table, q, kw, cos, sin, ps):
@@ -224,6 +393,7 @@ def _full_ref(rows, fkv, table, q, kw, cos, sin, ps):
     ([(8, 8), (8, 33), (8, 257), (8, 5000)], 32, 4, 16),  # at k = 7: 4 tiles
     ([(6, 6), (6, 300), (1, 1000), (37, 200)], 32, 4, 24),  # pages of 24: a tile may cross one (its keys' own pages)
 ])
+@kv8_twice
 def test_attn512_matches_reference(rows, h, hkv, ps) -> None:
     from llm_mini_infer.kernels.attn512 import Attn512
 
@@ -247,11 +417,12 @@ def test_attn512_matches_reference(rows, h, hkv, ps) -> None:
 
 
 @pytest.mark.parametrize("qo", [1, 6, 8])
-def test_attn512_split_counts_agree(qo) -> None:
+@kv8_twice
+def test_attn512_split_counts_agree(qo, kv8) -> None:
     """The same rows of `qo` queries (decode rows; verify rows at k = 5 and 7: 3 and 4 tiles of 16 rows per KV head)
     with 1 to 31 splits per group, the wave split's odd counts among them, and with a split count of each row's own
     (one row's groups whole, the others split; padding items and groups that exit): the reference within BF16
-    rounding, and each split count within BF16 rounding of the others."""
+    rounding, and each split count within BF16 rounding of the others. Over an FP8 pool, each the BF16 pool's bits."""
     from llm_mini_infer.kernels import attn512 as am
 
     rows = [(qo, 3000), (qo, 50), (qo, qo)]
@@ -271,12 +442,18 @@ def test_attn512_split_counts_agree(qo) -> None:
         split = int(per_row.max() > 1)
         o_part = torch.empty(len(items), 16, 512, device=DEV)
         ml = torch.empty(len(items), 16, 2, device=DEV)
-        got = torch.full_like(q, float("nan"))
-        ops._check(build.load().lmk_attn512(
-            ops._p(q), 32, 4, ops._p(fkv), fkv.stride(0), 16, ops._p(table), table.stride(0), ops._p(kw), ops._p(cos),
-            ops._p(sin), 64, 1.0, ops._p(rr), ops._p(it), len(items), ops._p(gt), len(groups), split, 0, 0, 0, 0,
-            ops._p(None), ops._p(got), ops._p(o_part), ops._p(ml), ops._stream(q)), "attn512")
-        torch.cuda.synchronize()
+        outs = []
+        for pool in (gops.kv_fp8(fkv), fkv) if kv8 else (fkv,):
+            got = torch.full_like(q, float("nan"))
+            ops._check(build.load().lmk_attn512(
+                ops._p(q), 32, 4, ops._p(pool), pool.stride(0), 16, int(pool.dtype == torch.uint8), ops._p(table),
+                table.stride(0), ops._p(kw), ops._p(cos), ops._p(sin), 64, 1.0, ops._p(rr), ops._p(it), len(items),
+                ops._p(gt), len(groups), split, 0, 0, 0, 0, ops._p(None), ops._p(got), ops._p(o_part), ops._p(ml),
+                ops._stream(q)), "attn512")
+            torch.cuda.synchronize()
+            outs.append(got)
+        got = outs[0]
+        assert all(torch.equal(got.view(torch.int16), o.view(torch.int16)) for o in outs[1:]), splits
         assert torch.isfinite(got).all(), splits
         assert (got.float() - want.float()).abs().max().item() < 2e-2, splits
         if first is None:
@@ -288,12 +465,14 @@ def test_attn512_split_counts_agree(qo) -> None:
 
 @pytest.mark.parametrize("ps", [16, 64, 24])
 @pytest.mark.parametrize("splits", [1, 3])
-def test_attn512_staged_tables_change_no_bit(ps, splits) -> None:
+@kv8_twice
+def test_attn512_staged_tables_change_no_bit(ps, splits, kv8) -> None:
     """Each tile's cos and sin rows staged in shared memory (rotations of up to 64 dims, Gemma 4's) and its page read
     once (pages of a multiple of 16 positions) give the bits of the tables and pages read per key, the same items each
     time: the same KV in pages of 8 positions (a tile's keys on two pages, read per key), a rotation of 66 dims (the
     tables read directly: its two extra dims turn by angle 0, as Gemma 4's proportional RoPE's do), and both (tables
-    and pages read per key). Pages of 24 positions: a tile can cross one, and its page is read per key."""
+    and pages read per key). Pages of 24 positions: a tile can cross one, and its page is read per key. Over an FP8
+    pool (its bytes in the same pages), the same bits, the BF16 pool's."""
     from llm_mini_infer.kernels import attn512 as am
 
     rows = [(6, 2700), (6, 33), (1, 1300), (40, 400)]
@@ -310,21 +489,27 @@ def test_attn512_staged_tables_change_no_bit(ps, splits) -> None:
     it, gt = torch.as_tensor(items, device=DEV), torch.as_tensor(groups, device=DEV)
     o_part = torch.empty(len(items), 16, 512, device=DEV)
     ml = torch.empty(len(items), 16, 2, device=DEV)
+    configs = [(fkv, ps, table, 64), (fkv8, 8, table8, 64), (fkv, ps, table, 66), (fkv8, 8, table8, 66)]
+    if kv8:  # the FP8 bytes in the same pages, and the BF16 pool last
+        p8 = gops.kv_fp8(fkv)
+        configs = [(p8, ps, table, 64), (p8.view(-1, 8, *p8.shape[2:]), 8, table8, 64), (p8, ps, table, 66),
+                   (p8.view(-1, 8, *p8.shape[2:]), 8, table8, 66), configs[0]]
     outs = []
-    for pool, size, pt, rot in ((fkv, ps, table, 64), (fkv8, 8, table8, 64), (fkv, ps, table, 66),
-                                (fkv8, 8, table8, 66)):
+    for pool, size, pt, rot in configs:
         got = torch.full_like(q, float("nan"))
         ops._check(build.load().lmk_attn512(
-            ops._p(q), 32, 4, ops._p(pool), pool.stride(0), size, ops._p(pt), pt.stride(0), ops._p(kw), ops._p(cos),
-            ops._p(sin), rot, 1.0, ops._p(rr), ops._p(it), len(items), ops._p(gt), len(groups), int(splits > 1), 0, 0,
-            0, 0, ops._p(None), ops._p(got), ops._p(o_part), ops._p(ml), ops._stream(q)), "attn512")
+            ops._p(q), 32, 4, ops._p(pool), pool.stride(0), size, int(pool.dtype == torch.uint8), ops._p(pt),
+            pt.stride(0), ops._p(kw), ops._p(cos), ops._p(sin), rot, 1.0, ops._p(rr), ops._p(it), len(items),
+            ops._p(gt), len(groups), int(splits > 1), 0, 0, 0, 0, ops._p(None), ops._p(got), ops._p(o_part),
+            ops._p(ml), ops._stream(q)), "attn512")
         torch.cuda.synchronize()
         outs.append(got)
     assert torch.isfinite(outs[0]).all()
-    assert all(torch.equal(outs[0], o) for o in outs[1:])
+    assert all(torch.equal(outs[0].view(torch.int16), o.view(torch.int16)) for o in outs[1:])
 
 
 @pytest.mark.parametrize(("bucket", "reals"), [(8, (1, 3, 8, 5, 5, 2, 8)), (24, (16, 18, 17, 24, 18))])
+@kv8_twice
 def test_attn512_waves_replay_their_real_rows(bucket, reals) -> None:
     """A decode bucket's graph, captured once, replayed with 1 to `bucket` real rows (the rest padding rows on the null
     page): each replay splits the real rows' groups to fill the wave (the item and group tables rewritten when the real
@@ -360,6 +545,9 @@ def test_attn512_waves_replay_their_real_rows(bucket, reals) -> None:
         got.fill_(float("nan"))
         g.replay()
         torch.cuda.synchronize()
+        again = torch.full_like(q, float("nan"))  # the replay's tables, eagerly (over FP8 pools, twinned with BF16)
+        a.run(meta, _Layer(kw), q, again)
+        assert torch.equal(got.view(torch.int16), again.view(torch.int16)), real
         n = real * qo
         want = _full_ref([(qo, kv) for kv in kvs[:real]], fkv, table, q[:n].contiguous(), kw, cos, sin, ps)
         err = (got[:n].float() - want.float()).abs()
@@ -465,6 +653,7 @@ UPPER_BOUND_ROWS = [(4, 3), (1, 3), (6, 5), (8, 7), (1, 14)]
 
 
 @pytest.mark.parametrize(("qo", "spread"), UPPER_BOUND_ROWS)
+@kv8_twice
 def test_attn512_rows_planned_for_upper_bounds(qo, spread) -> None:
     """Rows of `qo` queries (a verify row: 1 + k) planned for an upper bound of their KV length (`spread` above the
     lowest), run with the true lengths written into the device row table (`fix_len`), eagerly and in a decode bucket's
@@ -509,8 +698,13 @@ def test_attn512_rows_planned_for_upper_bounds(qo, spread) -> None:
         got.fill_(float("nan"))
         g.replay()
         check(true)
+        again = torch.full_like(q, float("nan"))  # the replay's tables, eagerly (over FP8 pools, twinned with BF16)
+        a.run(meta, _Layer(kw), q, again)
+        torch.cuda.synchronize()
+        assert torch.equal(got.view(torch.int16), again.view(torch.int16))
 
 
+@kv8_twice
 def test_attn512_fixed_split_is_batch_invariant() -> None:
     """The fixed split (`split_keys`; answer reproducibility): a query at a given position gives the same bits alone
     or beside other rows, at any offset of its verify window (which positions share its tile), planned for its true
@@ -684,6 +878,7 @@ def _split_run(case, a, rows: list[tuple[int, int, int, int]], *, bucket: int = 
     return {p0 + j: out[start + j].clone() for j in range(nq)}, meta.full_plan[4]
 
 
+@kv8_twice
 def test_attn512_query_sizes_are_batch_invariant() -> None:
     """The fixed split sizes each query's splits from its own position (`split_keys` · 2^m, doubling where its keys
     pass 32 splits; 16 keys here, so past 512, 1,024, ... keys): a verify row's queries at positions across a size
@@ -732,6 +927,7 @@ def test_attn512_query_sizes_are_batch_invariant() -> None:
             assert (row.float() - want.float()).abs().max().item() < 2e-2, (end, p)
 
 
+@kv8_twice
 def test_attn512_prefill_split_is_chunk_invariant() -> None:
     """A prefill query takes its keys whole up to `prefill_from` and splits them past it at absolute multiples of its
     own size (`prefill_keys` · 2^m): one prompt's positions 40..700 (`prefill_from` 64, 16 keys a split, 32 past 512,
@@ -774,6 +970,7 @@ def test_attn512_prefill_split_is_chunk_invariant() -> None:
     assert (base.float() - want.float()).abs().max().item() < 2e-2
 
 
+@kv8_twice
 def test_attn512_prefill_below_the_threshold_is_unsplit() -> None:
     """The prefill split changes no bit of a query whose keys are at most `prefill_from` (p + 1 <= 64): positions
     41..63 of a prompt equal the unsplit path's (an instance whose `prefill_from` is past the prompt), though the tile
@@ -804,6 +1001,7 @@ def test_attn512_prefill_below_the_threshold_is_unsplit() -> None:
         assert (got[p].float() - want[p - p0].float()).abs().max().item() < 2e-2, p
 
 
+@kv8_twice
 def test_attn512_at_the_default_split_sizes() -> None:
     """The fixed split at the module's sizes (`SPLIT_KEYS` 256, `PREFILL_FROM` 8,192, `PREFILL_KEYS` 16,384), where
     the other tests scale them down: a verify row's queries across the decode size boundaries at 8,192 and 16,384 keys

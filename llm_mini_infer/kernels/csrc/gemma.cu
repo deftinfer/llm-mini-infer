@@ -11,6 +11,7 @@
 // Programmatic dependent launch (PDL, common.cuh): each kernel waits for its predecessor first, then lets the next
 // kernel launch. The launchers add the attribute while the library's flag is on.
 #include "common.cuh"
+#include "kv_fp8.cuh"
 #include "quant.cuh"
 
 namespace {
@@ -325,7 +326,9 @@ constexpr int kMaxHeadDim = 512;
 // `ps_kv` and shape [page_size, Hkv, D] (k_eq_v) or [2, page_size, Hkv, D].
 // `kTrigger`: FlashInfer's sliding attention follows this kernel and launches with PDL by default. So this kernel
 // lets the next launch start only while the library's flag is on (common.cuh).
-template <bool kTrigger>
+// `kFp8` (k_eq_v only): the plane holds E4M3 bytes, each the BF16 value stored otherwise rounded (kv_fp8.cuh); the KV
+// layer view's offsets count bytes.
+template <bool kTrigger, bool kFp8>
 __global__ void g4_qkv_kernel(const bf16* __restrict__ qkv, int64_t qs, int k_eq_v, const bf16* __restrict__ qw,
                               const bf16* __restrict__ kw, const int64_t* __restrict__ pos,
                               const bf16* __restrict__ cos, const bf16* __restrict__ sin, bf16* __restrict__ q_out,
@@ -364,6 +367,13 @@ __global__ void g4_qkv_kernel(const bf16* __restrict__ qkv, int64_t qs, int k_eq
     dst = q_out + (t * H + h) * D;
   } else {
     const int64_t base = kv_page[t] * ps_kv + (kv_off[t] * Hkv + h) * D;
+    if constexpr (kFp8) {  // the one plane, in bytes
+      uint8_t* v8 = reinterpret_cast<uint8_t*>(kv) + base;
+#pragma unroll
+      for (int j = 0; j < kMaxHeadDim / 32; ++j)
+        if (j < per) v8[lane + 32 * j] = lmk_kv_e4m3(f2bf(fmul(x[j], inv)));
+      return;
+    }
     dst = kv + base;  // K plane (unused with k_eq_v)
     vdst = k_eq_v ? kv + base : kv + base + (int64_t)page_size * Hkv * D;
   }
@@ -449,18 +459,46 @@ LMK_API int lmk_gelu_tanh_mul(const void* gu, int64_t gu_stride, void* out, int6
                     gu_stride, (bf16*)out, T, I);
 }
 
+// `kv_fp8` 1: the KV layer holds E4M3 bytes (k_eq_v only), its page stride in bytes.
 LMK_API int lmk_g4_qkv(const void* qkv, int64_t qkv_stride, int k_eq_v, const void* q_weight, const void* k_weight,
                        const void* positions, const void* cos, const void* sin, void* q_out, void* kv_layer,
-                       int64_t kv_page_stride, int page_size, const void* kv_page, const void* kv_off, int64_t T,
-                       int H, int Hkv, int D, float eps, cudaStream_t stream) {
+                       int64_t kv_page_stride, int page_size, int kv_fp8, const void* kv_page, const void* kv_off,
+                       int64_t T, int H, int Hkv, int D, float eps, cudaStream_t stream) {
   if (T <= 0) return 0;
-  if (D % 64 || D > kMaxHeadDim) return -1;
+  if (D % 64 || D > kMaxHeadDim || kv_fp8 < 0 || kv_fp8 > 1 || (kv_fp8 && !k_eq_v)) return -1;
   const int64_t n = T * (H + Hkv);
-  return lmk_launch(lmk_pdl_flag() ? g4_qkv_kernel<true> : g4_qkv_kernel<false>, dim3((unsigned)((n + 7) / 8)),
-                    dim3(256), 0, stream, (const bf16*)qkv, qkv_stride, k_eq_v, (const bf16*)q_weight,
-                    (const bf16*)k_weight, (const int64_t*)positions, (const bf16*)cos, (const bf16*)sin,
-                    (bf16*)q_out, (bf16*)kv_layer, kv_page_stride, page_size, (const int64_t*)kv_page,
-                    (const int64_t*)kv_off, T, H, Hkv, D, eps);
+#define LMK_G4_QKV(FP8)                                                                                        \
+  lmk_launch(lmk_pdl_flag() ? g4_qkv_kernel<true, FP8> : g4_qkv_kernel<false, FP8>, dim3((unsigned)((n + 7) / 8)), \
+             dim3(256), 0, stream, (const bf16*)qkv, qkv_stride, k_eq_v, (const bf16*)q_weight,                 \
+             (const bf16*)k_weight, (const int64_t*)positions, (const bf16*)cos, (const bf16*)sin, (bf16*)q_out, \
+             (bf16*)kv_layer, kv_page_stride, page_size, (const int64_t*)kv_page, (const int64_t*)kv_off, T, H,  \
+             Hkv, D, eps)
+  if (kv_fp8) return LMK_G4_QKV(true);
+  return LMK_G4_QKV(false);
+#undef LMK_G4_QKV
+}
+
+// For the tests: the FP8 KV's store and read conversions (kv_fp8.cuh) over n values, BF16 to E4M3 bytes
+// (`to_fp8` 1) or E4M3 bytes to BF16 (0; n even).
+namespace {
+__global__ void g4_kv_cast_kernel(const void* __restrict__ in, void* __restrict__ out, int64_t n, int to_fp8) {
+  lmk_pdl_wait();  // PDL: wait for the predecessor (common.cuh)
+  lmk_pdl_trigger();
+  const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (to_fp8) {
+    if (i < n) static_cast<uint8_t*>(out)[i] = lmk_kv_e4m3(static_cast<const bf16*>(in)[i]);
+  } else if (2 * i < n) {
+    static_cast<uint32_t*>(out)[i] = lmk_kv_bf16x2(static_cast<const uint16_t*>(in)[i]);
+  }
+}
+}  // namespace
+
+LMK_API int lmk_g4_kv_cast(const void* in, void* out, int64_t n, int to_fp8, cudaStream_t stream) {
+  if (n <= 0) return 0;
+  if (!to_fp8 && n % 2) return -1;
+  const int64_t threads = to_fp8 ? n : n / 2;
+  return lmk_launch(g4_kv_cast_kernel, dim3((unsigned)((threads + 255) / 256)), dim3(256), 0, stream, in, out, n,
+                    to_fp8);
 }
 
 // The quantizing producers. Each returns -1 for a shape or alignment it does not take. The Python wrappers then run

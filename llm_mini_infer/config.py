@@ -1108,9 +1108,6 @@ def _derive_kv_cache_dtype(cfg: Config, text: dict[str, Any], gemma: bool, reaso
             raise ValueError(f"{name}: needs a BF16 runner, not {dtype}"
                              f"{' (dev.runner.cuda.dtype auto on the CPU)' if o.dtype == 'auto' else ''}: set "
                              "dev.runner.cuda.dtype bfloat16")
-        if on_cuda and o.fused_ops:
-            raise ValueError(f"{name}: our FP8 attention kernel is not built yet; on CUDA it needs "
-                             "dev.runner.cuda.fused_ops false and dev.runner.cuda.attention torch (the references)")
     reasons["dev.cache.kv_cache_dtype"] = ("fp8: Gemma 4's full-attention layers in FP8 E4M3 at scale 1.0, full pages "
                                            "of twice the positions; the sliding layers in BF16")
 

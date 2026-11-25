@@ -136,6 +136,16 @@ def kv_fp8(x: torch.Tensor) -> torch.Tensor:
     return x.float().clamp(-E4M3_MAX, E4M3_MAX).to(torch.float8_e4m3fn).view(torch.uint8)
 
 
+def kv_cast(x: torch.Tensor, to_fp8: bool) -> torch.Tensor:
+    """The kernels' own FP8 KV conversions (csrc/kv_fp8.cuh; tests): BF16 values to E4M3 bytes as the FP8 store rounds
+    them, or E4M3 bytes to BF16 as the FP8 attention reads them. x contiguous on CUDA."""
+    if x.dtype != (torch.bfloat16 if to_fp8 else torch.uint8) or not x.is_contiguous() or not x.is_cuda:
+        raise ValueError(f"kv_cast: a contiguous CUDA tensor of {'bfloat16' if to_fp8 else 'uint8'}, not {x.dtype}")
+    out = torch.empty(x.shape, dtype=torch.uint8 if to_fp8 else torch.bfloat16, device=x.device)
+    _check(build.load().lmk_g4_kv_cast(_p(x), _p(out), x.numel(), int(to_fp8), _stream(x)), "g4_kv_cast")
+    return out
+
+
 def kv_read(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     """Values read from a KV pool, in `dtype`: an FP8 pool's bytes (uint8) dequantized (exact into BF16), any other
     pool's as they are."""
@@ -162,16 +172,18 @@ def qkv_store(qkv: torch.Tensor, *, heads: int, kv_heads: int, head_dim: int, k_
     (`kv_page`, `kv_off`) per token: K = RoPE(k_norm(k)) and V = v_norm(v) (no weight), or with `k_eq_v` (a full
     layer) V = v_norm(k) alone, the plane the attention derives K from (models/gemma4/model.py). `kv_layer` is a layer's
     view of its pool: [pages, 2, page_size, Hkv, D] (K and V planes), or [pages, page_size, Hkv, D] with `k_eq_v`; a
-    uint8 view is an FP8 pool, which stores each value as `kv_fp8` rounds it. Returns q [T, H, D]."""
+    uint8 view is an FP8 pool, which stores each value as `kv_fp8` rounds it (the kernel: with `k_eq_v`). Returns q
+    [T, H, D]."""
     t = qkv.shape[0]
     h, hkv, d = heads, kv_heads, head_dim
+    fp8 = kv_layer.dtype == torch.uint8
     if use_kernels(qkv) and qkv.stride(-1) == 1 and qkv.dtype == torch.bfloat16 and d % 64 == 0 and d <= 512 and \
-            kv_layer.dtype == qkv.dtype:
+            (kv_layer.dtype == qkv.dtype or (fp8 and k_eq_v)):
         q_out = torch.empty((t, h, d), dtype=qkv.dtype, device=qkv.device)
         _check(build.load().lmk_g4_qkv(
             _p(qkv), qkv.stride(0), int(k_eq_v), _p(q_w), _p(k_w), _p(positions), _p(cos_cache), _p(sin_cache),
-            _p(q_out), _p(kv_layer), kv_layer.stride(0), kv_layer.shape[-3], _p(kv_page), _p(kv_off), t, h, hkv, d,
-            eps, _stream(qkv)), "g4_qkv")
+            _p(q_out), _p(kv_layer), kv_layer.stride(0), kv_layer.shape[-3], int(fp8), _p(kv_page), _p(kv_off), t, h,
+            hkv, d, eps, _stream(qkv)), "g4_qkv")
         return q_out
     q = qkv[:, :h * d].reshape(t, h, d)
     k = qkv[:, h * d:(h + hkv) * d].reshape(t, hkv, d)
@@ -197,7 +209,7 @@ def q_rope(q: torch.Tensor, *, heads: int, head_dim: int, q_w: torch.Tensor, eps
         q_out = torch.empty((t, h, d), dtype=q.dtype, device=q.device)
         _check(build.load().lmk_g4_qkv(
             _p(q), q.stride(0), 0, _p(q_w), _p(None), _p(positions), _p(cos_cache), _p(sin_cache), _p(q_out),
-            _p(None), 0, 0, _p(None), _p(None), t, h, 0, d, eps, _stream(q)), "g4_qkv")
+            _p(None), 0, 0, 0, _p(None), _p(None), t, h, 0, d, eps, _stream(q)), "g4_qkv")
         return q_out
     cos, sin = cos_cache[positions], sin_cache[positions]
     return rope(_rms(q.reshape(t, h, d).float(), eps) * q_w.float(), cos, sin).to(q.dtype)

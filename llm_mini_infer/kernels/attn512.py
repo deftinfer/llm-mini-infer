@@ -35,6 +35,10 @@ captured launches read static row, item and group tables of a bucket's capacity 
 each replay `plan_graph` rewrites the row table, and the item and group tables when they changed: its real rows under
 the wave split, its rows' split counts under the fixed split.
 
+**FP8 pools** (`dev.cache.kv_cache_dtype fp8`): the pool holds E4M3 bytes (a uint8 view), and the kernel converts
+each tile to the BF16 tile it reads otherwise (`csrc/attn512.cu`), so a run over an FP8 pool gives the bits of one over
+a BF16 pool of the same values; the same shared memory, CTAs at once and splits.
+
 **Lengths on the device (MTP).** The kernel reads each row's KV length from the device row table and computes its
 splits' key ranges from it at run time (an empty split keeps m = −inf and the merge skips it), so a plan made for an
 upper bound runs exactly once the table's lengths are rewritten on the device: `run` does it from `meta.kv_len_dev`
@@ -208,7 +212,12 @@ class Attn512:
         self.group = num_heads // num_kv_heads
         self.sms = torch.cuda.get_device_properties(device).multi_processor_count
         lib = build.load()
-        occ = lib.lmk_attn512_occupancy() if lib is not None else -1
+        # an FP8 pool (`dev.cache.kv_cache_dtype fp8`): E4M3 bytes, viewed as uint8; the same shared memory and CTAs
+        fkv = getattr(pools, "fkv", None)
+        if fkv is not None and fkv.dtype not in (torch.bfloat16, torch.uint8):
+            raise ValueError(f"attn512 reads BF16 pools or FP8 ones as uint8 bytes, not {fkv.dtype}")
+        fp8 = fkv is not None and fkv.dtype == torch.uint8  # the same shared memory either way (`run` reads the pool's)
+        occ = lib.lmk_attn512_occupancy(int(fp8)) if lib is not None else -1
         self.resident = (occ if occ > 0 else 2) * self.sms  # CTAs at once (2 an SM on SM120)
         self.device = device
         self.qo_per_row = qo_per_row
@@ -373,12 +382,13 @@ class Attn512:
         rows, items, groups, n_dec, runs, orders = meta.full_plan
         if meta.fix_len:  # the true KV lengths, decided on the device (module docstring)
             rows[:meta.n_rows, 3].copy_(meta.kv_len_dev[:meta.n_rows])
-        kv = self.pools.fkv[layer.index]  # [pages, page_size, Hkv, 512]
+        kv = self.pools.fkv[layer.index]  # [pages, page_size, Hkv, 512]: BF16, or E4M3 bytes (uint8)
         pt = meta.page_table
         lib = build.load()
         for i0, n_items, g0, n_groups, split, ordered in runs:  # a step past the partials: its launches in order
             _check(lib.lmk_attn512(
-                _p(q), self.h, self.hkv, _p(kv), kv.stride(0), kv.shape[1], _p(pt), pt.stride(0),
+                _p(q), self.h, self.hkv, _p(kv), kv.stride(0), kv.shape[1], int(kv.dtype == torch.uint8), _p(pt),
+                pt.stride(0),
                 _p(layer.k_norm.weight), _p(self.cos), _p(self.sin), self.rot, self.scale, _p(rows), _p(items[i0:]),
                 n_items, _p(groups[g0:]), n_groups, split, self.split_keys, n_dec, self.prefill_from,
                 self.prefill_keys, _p(orders[i0:]) if ordered else _p(None), _p(out),

@@ -414,9 +414,6 @@ class GemmaRunner(Runner):
         kernels = self.cuda and fused_ops
         if kernels and self.dtype != torch.bfloat16:
             raise ValueError(FP32_KERNELS)
-        if kernels and self.kv_dtype is not None:
-            raise ValueError("an FP8 KV cache on CUDA: our FP8 attention kernel is not built yet (dev.runner.cuda."
-                             "fused_ops false and attention torch run the references)")
         # before any capture (the graphs keep the launches they captured); a CPU runner leaves the library alone
         self.pdl = ops.set_pdl(pdl and kernels) if self.cuda else False
         self.stats: dict[str, Any] = {"kernels": kbuild.stats.get("state", "unused") if self.cuda else "cpu",
