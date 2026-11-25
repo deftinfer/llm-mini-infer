@@ -295,10 +295,9 @@ class DevCacheConfig(_Group):
 
 class DevSpeculativeConfig(_Group):
     # The drafter's LM head (runner/cuda/draft_head.py): the tokens it scores, ranked from the tokens the server emits
-    # (0: the whole vocabulary), and its weights' dtype (fp8: a block-FP8 copy of its rows). Drafts change acceptance
-    # and, where outputs depend on the batch, their rounding. Default: derived (below)
+    # (0: the whole vocabulary). Drafts change acceptance and, where outputs depend on the batch, their rounding.
+    # Default: derived (below)
     draft_vocab: int | None = None
-    draft_head_dtype: Literal["auto", "bfloat16", "fp8"] = "auto"
     # The grammar-universe draft head (architecture.md, "Grammar-aware heads"): on the steps the sparse head could
     # serve, with it on or off, the drafter scores only the union of every such step's masks. Default: on with drafts
     # and structured output
@@ -513,10 +512,30 @@ def _moved(data: dict[str, Any], prefix: str = "") -> list[str]:
     return out
 
 
+# Dev settings, and values of one, removed after 0.8.0 (CHANGELOG.md): (the dotted name, the value refused or None for
+# any) and what holds now. A file or an override that sets one is refused naming it, before the schema's own message
+RETIRED: dict[tuple[str, str | None], str] = {
+    ("dev.speculative.draft_head_dtype", None): "the drafter's head has the target head's dtype",
+}
+
+
+def _retired(data: dict[str, Any]) -> list[str]:
+    """The removed dev settings and values (`RETIRED`) a file or override sets, each with what holds now."""
+    out = []
+    for (name, value), now in RETIRED.items():
+        *parents, leaf = name.split(".")
+        node: Any = data
+        for p in parents:
+            node = node.get(p) if isinstance(node, dict) else None
+        if isinstance(node, dict) and leaf in node and value in (None, node[leaf]):
+            out.append(f"{name}{'' if value is None else ' ' + value}: removed after 0.8.0 ({now})")
+    return out
+
+
 def load(path: str | None, overrides: dict[str, Any]) -> Config:
     """YAML file, then dotted overrides (`scheduler.max_num_seqs: 128`), validated against the schema. The state
     fields are refused (a value there would be used as given, or overwritten), and so are dev settings given outside
-    the dev group, naming where they go."""
+    the dev group, naming where they go, and dev settings or values removed after 0.8.0, naming what holds now."""
     data: dict[str, Any] = {}
     if path:
         try:
@@ -542,6 +561,9 @@ def load(path: str | None, overrides: dict[str, Any]) -> Config:
     if moved:
         raise ValueError(f"invalid configuration: {', '.join(moved)}: dev settings (tests, benchmarks, A/B runs; a "
                          f"deployment takes their defaults): set {', '.join('dev.' + k for k in moved)}")
+    retired = _retired(data)
+    if retired:
+        raise ValueError(f"invalid configuration: {'; '.join(retired)}")
     try:
         return msgspec.convert(data, Config)
     except msgspec.ValidationError as exc:
@@ -689,9 +711,6 @@ def derive(cfg: Config) -> Config:
             "0: the whole vocabulary (the assistant's own narrow head; a ranked one costs acceptance on Gemma 4)"
             if assistant and sp.num_speculative_tokens else
             "0: the whole vocabulary (no MTP, or a vocabulary under 4 x 32,768)")
-    if dsp.draft_head_dtype == "auto":
-        dsp.draft_head_dtype = "bfloat16"
-        reasons["dev.speculative.draft_head_dtype"] = "the target head's dtype (an FP8 copy costs acceptance)"
     # A set refine piece, before the engine loads any weight (the scheduler checks its grid too)
     piece = cfg.dev.cache.refine_chunk_tokens
     if piece is not None and not 0 < piece <= sc.max_num_batched_tokens:

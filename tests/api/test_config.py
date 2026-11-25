@@ -26,7 +26,7 @@ MAXL = 8184  # a model.max_model_len for the batch invariance tests (the engine 
 def test_draft_head_defaults(tmp_path) -> None:
     cfg = config.derive(config.load(None, {"model.path": str(_model(tmp_path, 248_320, 1))}))
     assert cfg.speculative.num_speculative_tokens == 3
-    assert cfg.dev.speculative.draft_vocab == config.DRAFT_VOCAB and cfg.dev.speculative.draft_head_dtype == "bfloat16"
+    assert cfg.dev.speculative.draft_vocab == config.DRAFT_VOCAB
     assert "ranked from the tokens this server emits" in cfg.reasons["dev.speculative.draft_vocab"]
     small = tmp_path / "small"
     small.mkdir()
@@ -450,6 +450,47 @@ def test_deleted_settings_are_refused(tmp_path, monkeypatch, capsys, caplog, gro
     assert exc.value.code == 2 and len(logged) == 1 and refused in logged[0]  # not merely a missing model
 
 
+REMOVED = [  # (dotted name, a value it took, the value refused or None for any): removed after 0.8.0
+    ("dev.speculative.draft_head_dtype", "fp8", None),
+]
+
+
+@pytest.mark.parametrize(("name", "value", "only"), REMOVED, ids=[n for n, _, _ in REMOVED])
+def test_settings_removed_after_0_8_0_are_refused_by_name(tmp_path, monkeypatch, capsys, caplog, name, value,
+                                                          only) -> None:
+    """A dev setting removed after 0.8.0, or a value removed from one, fails the load from a file or an override with a
+    message that names it, says when it left and what holds now, before the schema's own message; the cli and the
+    container's entrypoint (its preflight) exit 2 with it."""
+    import yaml
+
+    from llm_mini_infer import cli, entrypoint
+
+    shown = name if only is None else f"{name} {only}"
+    refused = f"invalid configuration: {shown}: removed after 0.8.0 ({config.RETIRED[name, only]})"
+    nested: dict = {}
+    *parents, leaf = name.split(".")
+    node = nested
+    for part in parents:
+        node = node.setdefault(part, {})
+    node[leaf] = value
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(nested))
+    for path_, overrides in ((str(path), {}), (None, {name: value})):
+        with pytest.raises(ValueError) as err:
+            config.load(path_, overrides)
+        assert str(err.value) == refused
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["serve", "--model", str(tmp_path), "--set", f"{name}={value}"])
+    assert exc.value.code == 2 and refused in capsys.readouterr().err
+    assert refused in entrypoint.preflight(str(path), [])[0]
+    monkeypatch.setenv("LLM_MINI_INFER_CONFIG", str(path))
+    with pytest.raises(SystemExit) as exc:
+        entrypoint.main(["serve"])
+    logged = [r.getMessage() for r in caplog.records
+              if r.name == "llm_mini_infer.entrypoint" and r.levelname == "ERROR"]
+    assert exc.value.code == 2 and len(logged) == 1 and refused in logged[0]
+
+
 def test_the_runner_is_cuda_unless_fake_is_set(tmp_path, monkeypatch) -> None:
     """runner.kind is cuda unless a config sets fake, and never derived from what torch sees: a config that names no
     runner serves the model or fails at startup, never random tokens behind a passing /health. Here torch sees no GPU,
@@ -863,7 +904,7 @@ def test_the_settings_split(tmp_path, monkeypatch, capsys, caplog) -> None:
     from llm_mini_infer import cli, entrypoint
 
     dev = [k.removeprefix("dev.") for k in config.leaves(config.Config) if k.startswith("dev.")]
-    assert len(config.SETTINGS) == 61 < 62 and len(dev) == 65 and not set(dev) & set(config.SETTINGS)
+    assert len(config.SETTINGS) == 61 < 62 and len(dev) == 64 and not set(dev) & set(config.SETTINGS)
     for name, value in (("runner.cuda.fused_ops", False), ("cache.num_pages", 10), ("runner.fake.step_ms", 1.0),
                         ("scheduler.mixed_step_row_tokens", 100)):
         got = config.load(None, {f"dev.{name}": value}).dev

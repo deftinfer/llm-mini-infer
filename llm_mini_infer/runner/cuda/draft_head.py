@@ -1,6 +1,6 @@
 """The drafters' LM heads (docs/architecture.md, "Speculative decoding"): `DraftHead`, a drafter's head (Qwen's MTP
-layer's is the target's, Gemma 4's assistant's its own), whole or reduced, BF16 or an FP8 copy; `SubsetHead`, a head
-over the grammar's universe (`runner.cuda.heads`); and `fp32_reduction`, the fp32 partial sums of narrow BF16 heads.
+layer's is the target's, Gemma 4's assistant's its own), whole or reduced; `SubsetHead`, a head over the grammar's
+universe (`runner.cuda.heads`); and `fp32_reduction`, the fp32 partial sums of narrow BF16 heads.
 
 Drafts never change a request's tokens (verification keeps the target's samples), only how many are accepted, so a
 drafter may score them with a cheaper head than the target's (on Qwen3.8-27B, 248,320 × 5,120 BF16, 2.5 GB):
@@ -12,8 +12,6 @@ drafter may score them with a cheaper head than the target's (on Qwen3.8-27B, 24
   and punctuation (`structural_token_ids`). When too many emitted tokens fall outside the head, the ranking is redone
   and the head rebuilt in place, between steps on the compute stream (`apply`). A target token outside the head is
   never drafted, which costs acceptance at that position, never a wrong token.
-- **An FP8 copy** (`fp8_copy`; `dev.speculative.draft_head_dtype: fp8`): the head's rows quantized per 128 × 128
-  block, read by the block-FP8 GEMM: half the bytes, the drafter's logits then carrying FP8 rounding.
 
 The sampler draws each draft with the noise of its true token id (`ids`, ascending, so ties still go to the lowest
 id), so a draft and the target's sample at a position share their noise as with the whole vocabulary.
@@ -31,14 +29,13 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from ...kernels import fp8, ops
+from ...kernels import fp8
 from . import sync_check as sync_checks
 
 log = logging.getLogger(__name__)
 
 CHECK_EVERY = 4096  # emitted tokens between two checks of the ranking
 MISS_TOL = 0.002  # rebuild when more than this share of them was outside the head
-_QUANT_ROWS = 4096  # rows quantized at a time (fp32 temporaries of 4,096 × hidden)
 
 
 STRUCTURAL = frozenset(' \t\n\r{}[],:"')  # JSON's whitespace and punctuation
@@ -78,26 +75,18 @@ class DraftHead:
     """The drafter's head: `logits(hidden)` [n, size] fp32 over `ids` (int32 [size], ascending; None: the whole
     vocabulary in order). `head` is the drafter's head [V, hidden] (Qwen's MTP layer: the target's), kept as is."""
 
-    def __init__(self, head: torch.Tensor, *, size: int = 0, fp8_copy: bool = False, special: Iterable[int] = ()):
+    def __init__(self, head: torch.Tensor, *, size: int = 0, special: Iterable[int] = ()):
         self.full = head
         self.V, self.hidden = head.shape
-        size = -(-size // fp8.GROUP) * fp8.GROUP if size else 0  # whole 128-row blocks (the FP8 format)
+        size = -(-size // fp8.GROUP) * fp8.GROUP if size else 0  # whole 128-row blocks
         self.reduced = 0 < size < self.V
         self.size = size if self.reduced else self.V
-        self.fp8 = fp8_copy
-        if fp8_copy and (self.size % fp8.GROUP or self.hidden % fp8.GROUP):
-            raise ValueError(f"an FP8 draft head needs multiples of {fp8.GROUP} ({self.size} x {self.hidden})")
         dev = head.device
         self.rebuilds = 0
-        self.w = self.w8 = self.s8 = self.ids = None
-        if fp8_copy:
-            self.w8 = torch.empty((self.size, self.hidden), dtype=fp8.FP8, device=dev)
-            self.s8 = torch.empty((self.size // fp8.GROUP, self.hidden // fp8.GROUP), dtype=torch.float32, device=dev)
-        elif self.reduced:
+        self.w = self.ids = None
+        if self.reduced:
             self.w = torch.empty((self.size, self.hidden), dtype=head.dtype, device=dev)
         if not self.reduced:
-            if fp8_copy:
-                self._quantize(None)
             return
         self.ids = torch.empty(self.size, dtype=torch.int32, device=dev)
         self._ids_host = torch.empty(self.size, dtype=torch.int64, pin_memory=dev.type == "cuda")
@@ -114,18 +103,16 @@ class DraftHead:
 
     @property
     def bytes(self) -> int:
-        return sum(t.numel() * t.element_size() for t in (self.w, self.w8, self.s8, self.ids) if t is not None)
+        return sum(t.numel() * t.element_size() for t in (self.w, self.ids) if t is not None)
 
     def describe(self) -> str:
         what = f"{self.size:,} of {self.V:,} tokens" if self.reduced else "the whole vocabulary"
-        return f"{what}, {'block-FP8' if self.fp8 else str(self.full.dtype).removeprefix('torch.')}"
+        return f"{what}, {str(self.full.dtype).removeprefix('torch.')}"
 
     # -- the step path ---------------------------------------------------------------------------------------------
 
     def logits(self, hidden: torch.Tensor) -> torch.Tensor:
-        """[n, size] fp32: a GEMM in the model dtype (or the block-FP8 GEMM), then fp32."""
-        if self.fp8:
-            return fp8.gemm(ops.quant_fp8(hidden), self.w8, self.s8).float()
+        """[n, size] fp32: a GEMM in the model dtype, then fp32."""
         return F.linear(hidden, self.w if self.reduced else self.full).float()
 
     # -- the ranking (host) ------------------------------------------------------------------------------------------
@@ -153,8 +140,8 @@ class DraftHead:
         return np.sort(top)
 
     def apply(self) -> bool:
-        """Install a pending ranking: gather (and quantize) the rows on the current stream, so the next step uses
-        it. Graph-safe between replays: the head and `ids` keep their addresses."""
+        """Install a pending ranking: gather the rows on the current stream, so the next step uses it. Graph-safe
+        between replays: the head and `ids` keep their addresses."""
         if self._pending is None:
             return False
         new, self._pending = self._pending, None
@@ -174,23 +161,10 @@ class DraftHead:
         self._ids_host.numpy()[:] = ids
         idx = self._ids_host.to(self.full.device, non_blocking=True)
         self.ids.copy_(idx)
-        if self.fp8:
-            self._quantize(idx)
-        else:
-            torch.index_select(self.full, 0, idx, out=self.w)
+        torch.index_select(self.full, 0, idx, out=self.w)
         if self.full.is_cuda:
             self._copied = torch.cuda.Event()
             self._copied.record()
-
-    def _quantize(self, idx: torch.Tensor | None) -> None:
-        """Block-quantize the head's rows (all, or `idx`) into the FP8 copy, `_QUANT_ROWS` at a time."""
-        n = self.size
-        for r0 in range(0, n, _QUANT_ROWS):
-            r1 = min(n, r0 + _QUANT_ROWS)
-            rows = self.full[r0:r1] if idx is None else self.full.index_select(0, idx[r0:r1])
-            q, s = fp8.quantize_weight(rows)
-            self.w8[r0:r1] = q
-            self.s8[r0 // fp8.GROUP:r1 // fp8.GROUP] = s
 
 
 @contextmanager

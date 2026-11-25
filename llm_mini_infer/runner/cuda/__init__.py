@@ -41,7 +41,7 @@ def make_cuda_runner(cfg: Config) -> Runner:
                            grammar=bool(cfg.structured_output.enabled), vision=vision,
                            vision_buckets=o.vision_buckets, fp8_gemm=o.fp8_gemm, fp8_cold_prefill=c.fp8_cold_prefill,
                            mtp_k=sp.num_speculative_tokens or 0, assistant=sp.model, draft_vocab=dsp.draft_vocab or 0,
-                           draft_fp8=dsp.draft_head_dtype == "fp8", sparse_head=bool(o.sparse_head),
+                           sparse_head=bool(o.sparse_head),
                            sparse_head_rows=o.sparse_head_rows or 1024, draft_universe=bool(dsp.draft_universe),
                            draft_query_next=dsp.draft_query_next, pdl=bool(o.pdl), always_split=bool(o.always_split),
                            attn512_split_keys=FULL_SPLIT_KEYS if inv else 0, attn512_prefill=(
@@ -63,7 +63,7 @@ def make_cuda_runner(cfg: Config) -> Runner:
                       fp8_cold_prefill=c.fp8_cold_prefill,
                       mtp_k=cfg.speculative.num_speculative_tokens or 0,
                       draft_vocab=dsp.draft_vocab or 0,
-                      draft_fp8=dsp.draft_head_dtype == "fp8", vision=vision,
+                      vision=vision,
                       vision_buckets=o.vision_buckets, grammar=bool(cfg.structured_output.enabled),
                       pdl=bool(o.pdl), always_split=bool(o.always_split), sparse_head=bool(o.sparse_head),
                       sparse_head_rows=o.sparse_head_rows or 1024, draft_universe=bool(dsp.draft_universe),

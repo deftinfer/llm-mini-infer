@@ -316,7 +316,7 @@ class GemmaRunner(Runner):
                  decode_buckets: list[int] | None = None, token_buckets: list[int] | None = None,
                  grammar: bool = True, vision: VisionOptions | None = None, vision_buckets: list[int] | None = None,
                  fp8_gemm: str = "auto", fp8_cold_prefill: str = "reuse", mtp_k: int = 0,
-                 assistant: str | Path | None = None, draft_vocab: int = 0, draft_fp8: bool = False,
+                 assistant: str | Path | None = None, draft_vocab: int = 0,
                  sparse_head: bool = False, sparse_head_rows: int = 1024, draft_universe: bool = False,
                  draft_query_next: bool = False, pdl: bool = False, always_split: bool = False,
                  attn512_split_keys: int = 0, attn512_prefill: tuple[int, int] | None = None,
@@ -325,7 +325,7 @@ class GemmaRunner(Runner):
                  logprobs: bool = False, penalties: bool = False, draft_counts: tuple[int, ...] = (),
                  kv_cache_dtype: str = "auto"):
         """`mtp_k` > 0 drafts that many tokens per step with the MTP `assistant` (its checkpoint directory;
-        `draft_vocab`, `draft_fp8`: its head, `runner.cuda.draft_head`). `sparse_head`, `sparse_head_rows`,
+        `draft_vocab`: its head, `runner.cuda.draft_head`). `sparse_head`, `sparse_head_rows`,
         `draft_universe`: the grammar-aware heads (`runner.cuda.heads`; with `grammar` only, the universe with MTP).
         `draft_query_next`: the assistant's queries at RoPE position p + 1 instead of p (the module docstring). `pdl`:
         programmatic dependent launch. `always_split` (with `grammar`): every step runs as a forward and a
@@ -455,15 +455,12 @@ class GemmaRunner(Runner):
             self.stats["assistant_layers_shared"] = self.assistant.share(self.model.layers, cfg)
             self.stats["assistant_weight_bytes"] = sum(p.numel() * p.element_size()
                                                        for p in self.assistant.parameters())
-            if draft_fp8 and self.cuda:  # an FP8 draft head's GEMMs
-                kbuild.require_cutlass("dev.speculative.draft_head_dtype bfloat16")
             if self.cuda:  # fresh segments for the head (runner.py: the loader's cached ones would stay pinned)
                 torch.cuda.empty_cache()
             forced = special_token_ids(self.model_dir)
             if grammar and 0 < draft_vocab < cfg.vocab_size:  # JSON's whitespace and punctuation (draft_head.py)
                 forced += structural_token_ids(self.model_dir)
-            self.draft_head = DraftHead(self.assistant.head_weight, size=draft_vocab, fp8_copy=draft_fp8,
-                                        special=forced)
+            self.draft_head = DraftHead(self.assistant.head_weight, size=draft_vocab, special=forced)
             self.stats.update(draft_head=self.draft_head.describe(), draft_head_bytes=self.draft_head.bytes)
             if self.assistant.cfg.final_logit_softcapping:
                 raise NotImplementedError("an assistant head with final logit softcapping")
