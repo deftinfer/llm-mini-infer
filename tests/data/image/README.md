@@ -21,5 +21,5 @@ The cache key and sha256 of each kernel library, as `KERNELS_SHA256` in `deploy/
 
 | library | cache key | sha256 (ARCHS=120) |
 |---|---|---|
-| `libllm_mini_infer_kernels.so` | `120-3958d09bb29ad098` | `0536e5a6b9c5420b660e584d6b1b57517bd8cb674819fbb4085627ca95bf8d53` |
+| `libllm_mini_infer_kernels.so` | `120-579def9338589866` | `57e2a33ef8b107cce4656c80c2ef42825099007b26a7b966ae5cf2cb3658421b` |
 | `libllm_mini_infer_cutlass.so` | `cutlass-120a-da5aebbd96ce381f` | `f3e7d12493d607e2d8887fd995c753278e450a5d47a450757d958cc7280d8d98` |
