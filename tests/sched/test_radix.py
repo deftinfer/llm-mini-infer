@@ -12,11 +12,11 @@ from hypothesis import given
 from llm_mini_infer.cache.pools import PagePool, StatePool, WindowStore
 from llm_mini_infer.cache.radix import SPAN_BASE, RadixCache, Spans, lost_tokens, precise_ns
 
-from ..support.fuzzing import fuzz_settings, saved_on_failure
+from ..support.fuzzing import campaign_settings, saved_on_failure
 from ..support.radix_model import Model, run_scenario, scenarios
 
 
-@fuzz_settings(400)
+@campaign_settings(400)
 @given(scenarios())
 def test_random_requests_keep_every_invariant(s) -> None:
     with saved_on_failure("radix", s):

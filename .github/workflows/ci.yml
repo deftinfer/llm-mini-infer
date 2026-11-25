@@ -6,9 +6,6 @@
 #   a pull request                 every job, for a change to docs too: the `required` job is the check that main
 #                                  requires, and a path filter would leave it pending
 #   workflow_dispatch              every job, on any branch
-#
-# On a push or a pull request, the fuzz smoke runs only when llm_mini_infer/, tests/, the lock or this file change
-# beyond comments and docstrings (the changes job, .github/scripts/ci_changes.py).
 name: ci
 
 on:
@@ -89,19 +86,18 @@ jobs:
             "$RUNNER_TEMP"/rendered/*.yaml deploy/helm/examples/*.yaml
 
   # The CPU suite (GPU tests skip), with the model fixtures (tests/scripts/fetch_fixtures.py: tokenizers and
-  # configurations, no weights, cached by their pins) and helm (tests/deploy/test_helm.py). Three shards of about equal
-  # time run on their own runners, each in two pytest-xdist workers (the runner has four vCPUs); a file's tests stay on
-  # one worker, so a module's server starts once. The last shard takes every directory that the others do not name, so
-  # no new one is left out.
-  # Memory decides what runs together: the runner has about 16 GB and 3 GB of swap (ci_sample.py's first line), and
-  # when both are full it ends the job (its shutdown signal, or a hang that keeps no log). Measured earlier on a 2 vCPU,
-  # 7.8 GB runner, a test server is 0.7 GB (1.5 GB on Gemma's files), with an image pool 1.6 to 2.5 GB, and a pytest
-  # worker 0.8 to 1.9 GB. So the tests' servers start no image pool unless a test asks (tests/support/api_util.py),
-  # and the tests whose servers leave no room for a second worker's carry the serial mark: those with an image pool,
-  # and in the structured shard those that start a server beside their module's
+  # configurations, no weights, cached by their pins) and helm (tests/deploy/test_helm.py), in three shards by directory
+  # on their own runners; the last takes every directory the others do not name, so no new one is left out. The runner
+  # has 2 cores (4 vCPUs; its CPU model varies by job), where torch's default is 2 threads, and about 16 GB: two
+  # pytest-xdist workers, a file's tests on one, so a module's server starts once. When its RAM and 3 GB of swap fill,
+  # the job ends (a shutdown signal, or a hang that keeps no log), so the tests' servers start no image pool unless a
+  # test asks (tests/support/api_util.py), and a test whose servers leave no room for a second worker's (an image pool,
+  # or in the structured shard a server beside its module's) carries the serial mark and runs after the workers, alone
   tests:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    env:
+      FUZZ_CAP: "20"  # the campaign's fuzz suites run 20 examples each here: the fuzz job runs them in full
     strategy:
       fail-fast: false
       matrix:
@@ -190,30 +186,9 @@ jobs:
       - name: pytest
         run: uv run --project tools --locked pytest tools/tests -q -p no:cacheprovider
 
-  # Whether the fuzz smoke has anything to check: the push's or the pull request's files against its base, on the
-  # runner's own Python (.github/scripts/ci_changes.py); a dispatch always fuzzes
-  changes:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    outputs:
-      fuzz: ${{ steps.changes.outputs.fuzz }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-        with:
-          persist-credentials: false
-          fetch-depth: 0
-      - id: changes
-        env:
-          EVENT: ${{ github.event_name }}
-          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
-        run: |
-          if [ "$EVENT" = workflow_dispatch ]; then echo fuzz=true >> "$GITHUB_OUTPUT"; exit 0; fi
-          python3 .github/scripts/ci_changes.py "$BASE" "$GITHUB_SHA" >> "$GITHUB_OUTPUT"
-
-  # Every fuzz suite, two seeds, 500 workloads each (a full campaign is 4 x 20,000, before scheduler changes merge)
+  # Every fuzz suite, 500 workloads on each of two seeds: 1, and the run's number, which draws anew on each run and
+  # again on a rerun (a full campaign is 4 x 20,000, before scheduler changes merge)
   fuzz:
-    needs: changes
-    if: needs.changes.outputs.fuzz == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -228,7 +203,7 @@ jobs:
       - name: environment
         run: uv sync --locked
       - name: fuzz smoke
-        run: uv run --locked python -m tests.scripts.fuzz_campaign --examples 500 --seeds 1 2 --jobs 4
+        run: uv run --locked python -m tests.scripts.fuzz_campaign --examples 500 --seeds 1 $GITHUB_RUN_NUMBER --jobs 4
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         if: failure()
         with:
@@ -237,22 +212,20 @@ jobs:
           if-no-files-found: ignore
 
   # The one check that main requires. It runs after a failure too (always()), so it always reports. It passes when every
-  # other job passed, and the fuzz smoke also when it was skipped for a change without code; it fails otherwise.
+  # other job passed, and fails otherwise.
   required:
-    needs: [lint, chart, tests, tools, changes, fuzz]
+    needs: [lint, chart, tests, tools, fuzz]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - name: every job passed (the fuzz smoke may be skipped)
+      - name: every job passed
         env:
           LINT: ${{ needs.lint.result }}
           CHART: ${{ needs.chart.result }}
           TESTS: ${{ needs.tests.result }}
           TOOLS: ${{ needs.tools.result }}
-          CHANGES: ${{ needs.changes.result }}
           FUZZ: ${{ needs.fuzz.result }}
         run: |
-          echo "lint $LINT, chart $CHART, tests $TESTS, tools $TOOLS, changes $CHANGES, fuzz $FUZZ"
-          for result in "$LINT" "$CHART" "$TESTS" "$TOOLS" "$CHANGES"; do [ "$result" = success ] || exit 1; done
-          [ "$FUZZ" = success ] || [ "$FUZZ" = skipped ]
+          echo "lint $LINT, chart $CHART, tests $TESTS, tools $TOOLS, fuzz $FUZZ"
+          for result in "$LINT" "$CHART" "$TESTS" "$TOOLS" "$FUZZ"; do [ "$result" = success ] || exit 1; done

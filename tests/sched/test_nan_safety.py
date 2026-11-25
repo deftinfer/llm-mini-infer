@@ -28,7 +28,7 @@ from hypothesis import given
 from llm_mini_infer.engine.messages import FinishReason
 from llm_mini_infer.sched.scheduler import RUNNING
 
-from ..support.fuzzing import fuzz_settings, saved_on_failure
+from ..support.fuzzing import campaign_settings, saved_on_failure
 from ..support.harness import Harness, Spec, poisoned_entries
 from ..support.nan_cases import nan_workloads, run_nan_workload
 from ..support.sched_cases import VOCAB, output_of, shared, stem
@@ -642,7 +642,7 @@ def test_the_tree_takes_a_verified_requests_pages_at_once(mode: str) -> None:
 # -- fuzzing: the NaN classes the cache suites reach rarely ------------------------------------------------------------
 
 
-@fuzz_settings(300)
+@campaign_settings(300)
 @given(nan_workloads())
 def test_random_nan_workloads(w) -> None:
     with saved_on_failure("nan", w):

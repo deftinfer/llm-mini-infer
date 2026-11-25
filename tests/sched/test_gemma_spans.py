@@ -17,7 +17,7 @@ from llm_mini_infer.cache.pools import PagePool, StatePool
 from llm_mini_infer.cache.radix import RadixCache
 from llm_mini_infer.engine.messages import CHECKPOINT_SOURCES, FinishReason
 
-from ..support.fuzzing import fuzz_settings, saved_on_failure
+from ..support.fuzzing import campaign_settings, saved_on_failure
 from ..support.harness import Harness, Spec
 from ..support.sched_cases import VOCAB, check_plans, stem
 from ..support.window_workloads import arena_bound, gemma_image_workloads, harness, run_gemma_image_workload
@@ -169,7 +169,7 @@ def test_a_one_token_chunk_before_a_span_leaves_one_precise_copy() -> None:
 # -- the fuzz suite (tests/scripts/fuzz_campaign.py: "gemma_images") ---------------------------------------------------
 
 
-@fuzz_settings(300)
+@campaign_settings(300)
 @given(gemma_image_workloads())
 def test_random_gemma_image_workloads(w) -> None:
     with saved_on_failure("gemma_images", w):

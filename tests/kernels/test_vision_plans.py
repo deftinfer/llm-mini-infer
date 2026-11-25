@@ -106,6 +106,8 @@ def fake_flashinfer(stream: Stream) -> types.ModuleType:
 def vision(monkeypatch) -> tuple[FlashInferVisionAttention, Stream]:
     stream = Stream()
     monkeypatch.setitem(sys.modules, "flashinfer", fake_flashinfer(stream))
+    # pinning opens a CUDA context on a GPU host: the plans' index tensors stay unpinned
+    monkeypatch.setattr("llm_mini_infer.kernels.flashinfer._pinned32", lambda a: torch.as_tensor(a, dtype=torch.int32))
     attn = FlashInferVisionAttention(16, 72, torch.bfloat16, torch.device("cpu"),
                                      workspace=torch.zeros(16, dtype=torch.uint8), event=lambda: Event(stream))
     return attn, stream

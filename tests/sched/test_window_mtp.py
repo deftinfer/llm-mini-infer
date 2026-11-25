@@ -15,7 +15,7 @@ from __future__ import annotations
 import pytest
 from hypothesis import given
 
-from ..support.fuzzing import fuzz_settings, saved_on_failure
+from ..support.fuzzing import campaign_settings, saved_on_failure
 from ..support.harness import Harness, Spec
 from ..support.sched_cases import check_plans, output_of, shared, stem
 from ..support.window_mtp import (
@@ -126,21 +126,21 @@ def test_mtp_with_bidirectional_image_spans() -> None:
 # -- fuzzing --------------------------------------------------------------------------------------------------------
 
 
-@fuzz_settings(300)
+@campaign_settings(300)
 @given(window_mtp_workloads())
 def test_random_window_mtp_workloads(w) -> None:
     with saved_on_failure("window_mtp", w):
         run_window_mtp_workload(w)
 
 
-@fuzz_settings(300)
+@campaign_settings(300)
 @given(arena_mtp_workloads())
 def test_random_arena_mtp_workloads(w) -> None:
     with saved_on_failure("arena_mtp", w):
         run_window_mtp_workload(w)
 
 
-@fuzz_settings(300)
+@campaign_settings(300)
 @given(arena_mtp_count_workloads())
 def test_random_arena_mtp_count_workloads(w) -> None:
     """Gemma 4's arena workloads with a draft count per step."""
@@ -148,7 +148,7 @@ def test_random_arena_mtp_count_workloads(w) -> None:
         run_window_mtp_workload(w)
 
 
-@fuzz_settings(300)
+@campaign_settings(300)
 @given(gemma_images_mtp_workloads())
 def test_random_gemma_images_mtp_workloads(w) -> None:
     with saved_on_failure("gemma_images_mtp", w):

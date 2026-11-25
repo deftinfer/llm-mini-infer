@@ -1,7 +1,7 @@
 """The plan-diff harness (`tests/scripts/plandiff.py`): it finds no difference between a tree and itself, flags a
-planted one-decision change (the mixed-step bound one token lower) with its first differing plan and fields, accepts it
-where `--expect-changed` allows it, flags a strategy that draws other workloads or test cases (`--compare-draws`), and
-digests decisions, not their storage, timings or neutral ADMIT terms."""
+planted one-decision change (the mixed-step bound one token lower, on fixed workloads) with its first differing plan
+and fields, accepts it where `--expect-changed` allows it, flags a strategy that draws other workloads or test cases
+(`--compare-draws`), and digests decisions, not their storage, timings or neutral ADMIT terms."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 
 from ..scripts import plandiff as pd
+from ..support.paths import DATA
 
 BOUND = "self.soft = min(self.soft, max(grid, row_tokens // n))"
 TOKENS = "tokens=np.asarray(toks, np.int64)"  # the radix suite's drawn token arrays
@@ -121,24 +122,45 @@ def test_a_draw_is_compared_with_its_types() -> None:
     assert pd._repr_hash(pd._typed(w)) == pd._repr_hash(pd._typed({**w, "tokens": np.arange(5)}))
 
 
+FIXED = DATA / "plandiff" / "mixed_step_bound.jsonl"
+
+
+@pytest.fixture
+def fixed_workloads(monkeypatch):
+    """The base tree's draw of `arena_hits` and `gemma_images_mtp` replaced by the workloads of `FIXED`, per suite one
+    that reaches the planted bound and one that does not: no seed's draw reaches it on every platform (Hypothesis mixes
+    the literals of the modules a draw imports into it). Both trees digest them as they do drawn ones."""
+    fixed: dict[str, list[str]] = {}
+    for line in FIXED.read_text().splitlines():
+        row = json.loads(line)
+        assert row["h"] == pd._example_hash(row["ex"]), "a stale hash in the fixed workloads"
+        fixed.setdefault(row["suite"], []).append(json.dumps({"h": row["h"], "ex": row["ex"]}))
+    real = pd.run_worker
+
+    def run_worker(root, args, log, timeout):
+        if args["mode"] == "draw" and args["suite"] in fixed:
+            Path(args["examples"]).write_text("".join(x + "\n" for x in fixed[args["suite"]]))
+            args = {**args, "mode": "digest"}
+        return real(root, args, log, timeout)
+
+    monkeypatch.setattr(pd, "run_worker", run_worker)
+    return tuple(fixed)
+
+
 @needs_git
-def test_a_planted_decision_is_flagged_with_its_fields(trees, tmp_path) -> None:
+def test_a_planted_decision_is_flagged_with_its_fields(trees, fixed_workloads, tmp_path) -> None:
     clean, planted = trees
-    # The first seed whose draw reaches the bound in both suites (not window_precise: its refines go in fixed pieces,
-    # which pass the bound whole). The draws depend on Hypothesis's version and on the literals of the modules a draw
-    # imports, which Hypothesis mixes into them: seed 8 reached it in both on macOS and in one on Linux, a tree apart
+    # Two suites that reach the bound on fixed workloads (not window_precise: its refines go in fixed pieces, which pass
+    # the bound whole), and radix, which draws its own. If the fixed ones stop reaching it (the scheduler or the example
+    # format moved), draw new ones: plandiff with these trees and a seed that flags both, then per suite the smallest
+    # changed and unchanged lines of the examples-<suite>.jsonl in its --out
     suites = ("arena_hits", "gemma_images_mtp", "radix")
-    reached = set()
-    for seed in ["8", *(str(i) for i in range(1, 33) if i != 8)]:
-        status, summary, report = _run(tmp_path / seed, "--base", str(clean), "--new", str(planted), "--suites",
-                                       *suites, "--examples", "60", "--show", "1", "--seed", seed)
-        by = {s["suite"]: s for s in summary["suites"]}
-        reached |= {s for s in suites[:2] if by[s]["changed"]}
-        if all(by[s]["changed"] for s in suites[:2]):
-            break
-    else:  # a suite that never flags the plant is a broken plandiff; draws that reach it apart, Hypothesis's move
-        assert reached == set(suites[:2]), f"no seed's draw flagged the planted bound in {set(suites[:2]) - reached}"
-        pytest.skip("no seed of 32 reached the planted bound in both suites at once (Hypothesis's draws moved)")
+    assert fixed_workloads == suites[:2], fixed_workloads
+    status, summary, report = _run(tmp_path / "unexpected", "--base", str(clean), "--new", str(planted), "--suites",
+                                   *suites, "--examples", "10", "--show", "1")
+    by = {s["suite"]: s for s in summary["suites"]}
+    unreached = [s for s in suites[:2] if not by[s]["changed"]]
+    assert not unreached, f"the fixed workloads no longer reach the planted bound in {unreached}: redraw them\n{report}"
     assert status == 1, report
     assert by["radix"]["changed"] == 0  # no scheduler there
     changed = [by[s] for s in suites[:2]]
@@ -149,7 +171,7 @@ def test_a_planted_decision_is_flagged_with_its_fields(trees, tmp_path) -> None:
     assert "**unexpected**" in report and "UNEXPECTED CHANGES" in report
     # the same change where it is expected passes
     status, summary, report = _run(tmp_path / "expected", "--base", str(clean), "--new", str(planted), "--suites",
-                                   *suites, "--examples", "60", "--show", "0", "--seed", seed,
+                                   *suites, "--examples", "10", "--show", "0",
                                    "--expect-changed", ",".join(suites[:2]))
     assert status == 0 and summary["verdict"] == "changed only where expected", report
 

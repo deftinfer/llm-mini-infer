@@ -419,7 +419,9 @@ def nested_many(depth: int, ref: bool, n: int = 35) -> dict:
     return tool("nest", params)
 
 
-@pytest.mark.serial  # beside a second worker on CI's one core, the refused chains once measured 8.05 times
+# Alone on CI's runner (2 cores, 4 vCPUs, two workers): beside a second worker on an earlier 1-core runner, the
+# refused chains once measured 8.05 times
+@pytest.mark.serial
 def test_the_schema_analysis_is_linear(setup) -> None:
     """Which definitions can produce a value, and the grammar's rules, take time linear in the schema: a chain of 12
     definitions beside 960 more (the definitions' cap) takes about 4 times one of 3 beside 240 (the chain sets how far

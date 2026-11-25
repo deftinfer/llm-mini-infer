@@ -975,7 +975,9 @@ SCALED = {  # past the subset's caps: the count is called alone, its small size 
 }
 
 
-@pytest.mark.serial  # beside a second worker on CI's one core, "a pattern's alternation" once measured 8.8 times
+# Alone on CI's runner (2 cores, 4 vCPUs, two workers): beside a second worker on an earlier 1-core runner, "a
+# pattern's alternation" once measured 8.8 times
+@pytest.mark.serial
 @pytest.mark.parametrize("shape", SCALED)
 def test_the_count_is_linear_in_the_schema(shape) -> None:
     """Each definition counted once, an object's gaps and an enum's prefixes in one pass, a recursive group's rounds

@@ -16,7 +16,7 @@ from hypothesis import given
 from llm_mini_infer.engine.messages import FinishReason
 from llm_mini_infer.sched.plan import STOP_W
 
-from ..support.fuzzing import fuzz_settings, saved_on_failure
+from ..support.fuzzing import campaign_settings, saved_on_failure
 from ..support.harness import Harness, Spec, prompt_of
 from ..support.mtp_workloads import mtp_count_workloads, mtp_workloads, output_of, run_mtp_workload
 from ..support.sched_cases import VOCAB, check_plans, stem
@@ -197,14 +197,14 @@ def test_abort_mid_decode_folds_and_donates() -> None:
 # -- the targeted fuzz suite ------------------------------------------------------------------------------------------
 
 
-@fuzz_settings(300)
+@campaign_settings(300)
 @given(mtp_workloads())
 def test_random_mtp_workloads(w) -> None:
     with saved_on_failure("mtp", w):
         run_mtp_workload(w)
 
 
-@fuzz_settings(300)
+@campaign_settings(300)
 @given(mtp_count_workloads())
 def test_random_mtp_count_workloads(w) -> None:
     """The MTP workloads with a draft count per step: the same outputs and invariants whatever the counts."""

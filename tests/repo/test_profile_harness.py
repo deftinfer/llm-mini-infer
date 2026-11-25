@@ -242,9 +242,10 @@ def test_a_failed_row_count_keeps_the_ones_measured_before(pair, monkeypatch) ->
     assert res["2"]["aborted"] and "fresh" in res["2"] and "unprofiled" not in res["2"]
 
 
-def test_torch_mode_on_cpu_fills_the_records_and_the_table(pair) -> None:
+def test_torch_mode_on_cpu_fills_the_records_and_the_table(pair, monkeypatch) -> None:
     """The torch mode's windows on CPU (the profiler records no kernel there): the profiled steps pass the spy too, and
     the summary table has each measured row count and category."""
+    monkeypatch.setattr(pv, "activities", lambda: [torch.profiler.ProfilerActivity.CPU])  # CUPTI opens a CUDA context
     h, spy, prompts = harness(pair)
     res = pv.profile(h, spy, prompts, rows=[2], k=K, steps=2, warm_s=0.0, min_warm_steps=3, decode_before=1,
                      max_tokens=100, fresh=True, mode="torch", sampler=pv.PowerSampler(), log=lambda _: None)
