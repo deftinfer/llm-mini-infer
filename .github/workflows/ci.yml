@@ -105,8 +105,6 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [api, structured, other]
-        thread: [default, omp2]
         include:
           - shard: api
             paths: tests/api
@@ -136,25 +134,9 @@ jobs:
           uv sync --locked
           uv run tools/fetch_tools.py helm
           uv run --locked tests/scripts/fetch_fixtures.py
-      - name: runner facts
-        timeout-minutes: 5
-        env:
-          THREAD: ${{ matrix.thread }}
-        run: |
-          if [ "$THREAD" = omp2 ]; then export OMP_NUM_THREADS=2; fi
-          echo "[facts] arm $THREAD OMP_NUM_THREADS=${OMP_NUM_THREADS-unset} nproc $(nproc)"
-          lscpu | grep -E '^(CPU\(s\)|Model name|Thread\(s\) per core|Core\(s\) per socket|Socket\(s\))' | sed 's/^/[facts] /'
-          .venv/bin/python -c 'import torch; print("[facts] torch threads", torch.get_num_threads(), "interop", torch.get_num_interop_threads())'
-          node='tests/models/test_gemma4_mtp_depth.py::test_stop_token_ends_the_accepted_run[5-0]'
-          probe() { .venv/bin/pytest -q -p no:cacheprovider --durations=0 "$node" > "$RUNNER_TEMP/probe-$1.log" 2>&1 || true; }
-          probe alone
-          probe copy1 & probe copy2 & wait
-          probe again
-          for name in alone copy1 copy2 again; do grep -E ' (setup|call) |passed|failed' "$RUNNER_TEMP/probe-$name.log" | sed "s/^/[probe] $name /" || true; done
       - name: pytest
         env:
           PATHS: ${{ matrix.paths }}
-          THREAD: ${{ matrix.thread }}
         # The workers, then alone the serial tests (a timing bound that needs a whole core, servers that need the
         # runner's memory): a shard without one collects none (pytest's exit 5). Both run, and either one's failure
         # fails the step. faulthandler_timeout dumps every thread's stack when a test runs past 300 s. `timeout` ends
@@ -167,8 +149,6 @@ jobs:
         timeout-minutes: 26
         run: |
           status=0
-          if [ "$THREAD" = omp2 ]; then export OMP_NUM_THREADS=2; fi
-          junit="$RUNNER_TEMP/junit" && mkdir -p "$junit"
           stop="$RUNNER_TEMP/sample-stop" dump="$RUNNER_TEMP/sample-dump-at"
           python3 .github/scripts/ci_sample.py --watch $$ --stop "$stop" --dump-at "$dump" &
           guarded() {  # a limit in seconds, then pytest's arguments
@@ -180,27 +160,17 @@ jobs:
             timeout 30 uv run --locked python -c "from tests.support.api_util import sweep_stale; sweep_stale()"
             return $code
           }
-          echo "[phase] workers start $(date +%s.%N)"
-          guarded 840 -n 2 --dist loadfile -m "not serial" --durations=0 --junitxml="$junit/workers.xml" $PATHS || status=$?
-          echo "[phase] workers end $(date +%s.%N) status $status"
-          echo "[phase] serial start $(date +%s.%N)"
-          guarded 480 -m serial --durations=0 --junitxml="$junit/serial.xml" $PATHS || [ $? -eq 5 ] || status=1
-          echo "[phase] serial end $(date +%s.%N) status $status"
+          guarded 840 -n 2 --dist loadfile -m "not serial" $PATHS || status=$?
+          guarded 480 -m serial $PATHS || [ $? -eq 5 ] || status=1
           touch "$stop"
           wait
           exit $status
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         if: failure()
         with:
-          name: fuzz-failures-${{ matrix.shard }}-${{ matrix.thread }}
+          name: fuzz-failures-${{ matrix.shard }}
           path: results/fuzz/failures/
           if-no-files-found: ignore
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
-        if: always()
-        with:
-          name: junit-${{ matrix.shard }}-${{ matrix.thread }}
-          path: ${{ runner.temp }}/junit/
-          if-no-files-found: warn
 
   # tools/'s test (tools/tests/: fetch_tools) in tools/'s own environment (tools/uv.lock), apart from the root project's
   tools:
