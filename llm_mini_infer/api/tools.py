@@ -94,11 +94,6 @@ class ToolRequest:
         self.parallel = parallel_tool_calls is not False
 
     @property
-    def keeps_calls(self) -> bool:
-        """Whether the response carries the calls the model made (none: content only, the calls left out)."""
-        return self.choice in ("auto", "required", "named")
-
-    @property
     def forced(self) -> bool:
         """`required` or a named tool: the content is "" rather than null."""
         return self.choice in ("required", "named")

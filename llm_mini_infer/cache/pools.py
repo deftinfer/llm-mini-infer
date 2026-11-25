@@ -248,9 +248,6 @@ class WindowStore:
         _, pages = self._win[h]
         return int((self.pool.refcount[pages] == 1).sum()) if pages else 0
 
-    def alloc_ckpt(self) -> int | None:
-        return None  # windows are made from a request's pages (`make`), never allocated
-
 
 class PoolSizes(msgspec.Struct, frozen=True):
     num_pages: int

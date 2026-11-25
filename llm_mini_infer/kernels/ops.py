@@ -34,10 +34,6 @@ def enabled(flag: bool | None = None) -> bool:
     return _enabled
 
 
-def lib() -> Any:
-    return build.load() if _enabled else None
-
-
 def use_kernels(t: torch.Tensor) -> bool:
     return t.is_cuda and _enabled and build.load() is not None
 
