@@ -111,6 +111,7 @@ A deployment sets the rest with `--set`, the chart's `config`, or a file mounted
 | `scheduler.policy` | `fcfs` | or `priority` ([the scheduler](architecture.md#the-scheduler)) |
 | `scheduler.seed` | random | the seed of the seeds that requests without one get |
 | `cache.enable_prefix_caching` | `true` | the radix prefix cache |
+| `cache.kv_cache_dtype` | `auto` | or `fp8`: Gemma 4's full-attention layers' KV in FP8, twice the positions a page, the sliding layers' in BF16 ([sliding-window models](architecture.md#sliding-window-models)). It can change the answers, and a long cold prefill takes a few percent longer |
 | `speculative.model` | none | a separate drafter: Gemma 4's assistant |
 | `speculative.num_speculative_tokens` | 5 with an assistant, 3 with an MTP layer, else 0 | the drafts per step: 0 to 7 (Qwen3.8: at most 3) |
 | `images.enabled` | on with a vision tower | image inputs. On Gemma 4, `false` gives the KV pool about 2.3 GiB more |
@@ -149,7 +150,7 @@ A deployment sets the rest with `--set`, the chart's `config`, or a file mounted
 
 ### The dev settings
 
-`dev.<group>.<key>` holds the settings of tests and benchmarks, which a deployment does not set. These switches turn a feature off, as a fallback: `dev.runner.cuda.graphs` (eager steps), `fused_ops` (torch ops), `pdl`, `batch_invariant` ([batch invariance](architecture.md#batch-invariance)), `always_split`, `sparse_head`, `dev.speculative.draft_universe`, `dev.structured_output.forced_prefix`, `eos_free_finish`, `dev.cache.decode_checkpoint_interval` (0) and `dev.cache.demote_superseded` (false). `llm_mini_infer/config.py` comments each, and [architecture.md](architecture.md) describes most. `always_split` and `pdl` keep the outputs the same; the other switches can change the GPU's rounding. `dev.speculative.adaptive` turns one on, off by default: a draft count per step chosen from the load ([speculative decoding](architecture.md#speculative-decoding)), with `adaptive_counts` the counts below k it may run. So does `dev.cache.kv_cache_dtype fp8`: Gemma 4's full layers' KV in FP8, twice the positions a page ([sliding-window models](architecture.md#sliding-window-models)).
+`dev.<group>.<key>` holds the settings of tests and benchmarks, which a deployment does not set. These switches turn a feature off, as a fallback: `dev.runner.cuda.graphs` (eager steps), `fused_ops` (torch ops), `pdl`, `batch_invariant` ([batch invariance](architecture.md#batch-invariance)), `always_split`, `sparse_head`, `dev.speculative.draft_universe`, `dev.structured_output.forced_prefix`, `eos_free_finish`, `dev.cache.decode_checkpoint_interval` (0) and `dev.cache.demote_superseded` (false). `llm_mini_infer/config.py` comments each, and [architecture.md](architecture.md) describes most. `always_split` and `pdl` keep the outputs the same; the other switches can change the GPU's rounding. `dev.speculative.adaptive` turns one on, off by default: a draft count per step chosen from the load ([speculative decoding](architecture.md#speculative-decoding)), with `adaptive_counts` the counts below k it may run.
 
 ### Environment variables
 

@@ -91,7 +91,7 @@ OURS_OWN_K = {"gemma": (0, 1, 2, 3, 5), "qwen": (0, 1, 2, 3)}
 ADAPTIVE_SET = "dev.speculative.adaptive=true"
 # ... and the full-attention layers' KV cache in FP8 (family L, Gemma 4 only: Qwen3.8's FP8 KV is not built): a full KV
 # page holds twice the positions, so a long request takes about half the KV arena
-KV_FP8_SET = "dev.cache.kv_cache_dtype=fp8"
+KV_FP8_SET = "cache.kv_cache_dtype=fp8"
 
 
 @dataclass(frozen=True)

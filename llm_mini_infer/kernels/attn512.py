@@ -35,7 +35,7 @@ captured launches read static row, item and group tables of a bucket's capacity 
 each replay `plan_graph` rewrites the row table, and the item and group tables when they changed: its real rows under
 the wave split, its rows' split counts under the fixed split.
 
-**FP8 pools** (`dev.cache.kv_cache_dtype fp8`): the pool holds E4M3 bytes (a uint8 view), and the kernel converts
+**FP8 pools** (`cache.kv_cache_dtype fp8`): the pool holds E4M3 bytes (a uint8 view), and the kernel converts
 each tile to the BF16 tile it reads otherwise (`csrc/attn512.cu`), so a run over an FP8 pool gives the bits of one over
 a BF16 pool of the same values; the same shared memory, CTAs at once and splits.
 
@@ -212,7 +212,7 @@ class Attn512:
         self.group = num_heads // num_kv_heads
         self.sms = torch.cuda.get_device_properties(device).multi_processor_count
         lib = build.load()
-        # an FP8 pool (`dev.cache.kv_cache_dtype fp8`): E4M3 bytes, viewed as uint8; the same shared memory and CTAs
+        # an FP8 pool (`cache.kv_cache_dtype fp8`): E4M3 bytes, viewed as uint8; the same shared memory and CTAs
         fkv = getattr(pools, "fkv", None)
         if fkv is not None and fkv.dtype not in (torch.bfloat16, torch.uint8):
             raise ValueError(f"attn512 reads BF16 pools or FP8 ones as uint8 bytes, not {fkv.dtype}")

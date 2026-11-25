@@ -33,7 +33,7 @@
 // reaches the product) and masked to −inf. A row whose split holds none of its keys keeps m = −inf and l = 0, and the
 // merge skips it.
 //
-// **FP8 pools** (`FP8`: `dev.cache.kv_cache_dtype fp8`). The plane holds E4M3 bytes (kv_fp8.cuh). A tile of 16 keys is
+// **FP8 pools** (`FP8`: `cache.kv_cache_dtype fp8`). The plane holds E4M3 bytes (kv_fp8.cuh). A tile of 16 keys is
 // then 8 KiB. It lands by cp.async in one of two unswizzled 8 KiB stages, and each tile is converted once, exactly,
 // into the swizzled BF16 tile that the BF16 path loads directly (FlashInfer 0.7.2's FP8 prefill does the same). Both
 // fit in the BF16 path's two 16 KiB stages: the landing stages share the second, the BF16 tile is the first (the Q tile

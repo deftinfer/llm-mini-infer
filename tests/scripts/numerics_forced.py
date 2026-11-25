@@ -26,7 +26,7 @@ mixed-step bound derived from the profile's step costs (off with `--memory-gb`),
 tower. An arm sets `dev.runner.cuda.batch_invariant` (`on`, `off`; Gemma 4's five runner switches together, as
 `make_cuda_runner` sets them), the prefix cache (`--cache`; Qwen's checkpoint slots as the server sizes them) and CUDA
 graphs (`--no-graphs`: every step eager), and with `--kv-dtype` the KV an FP8 pool would hold (below), or with
-`--kv-cache-dtype fp8` the real FP8 pool (`dev.cache.kv_cache_dtype`: Gemma 4's full layers). Its name, and its folder
+`--kv-cache-dtype fp8` the real FP8 pool (`cache.kv_cache_dtype`: Gemma 4's full layers). Its name, and its folder
 under `--out`: `<switch>[-kv8|-kv8all|-kvfp8][-cache][-eager]` (`arm_name`), e.g. `on`, `off-cache`, `on-kv8-eager`,
 `on-kvfp8`.
 
@@ -305,7 +305,7 @@ class Options:
     pdl: bool = True
     always_split: bool = True
     check: bool = False
-    kv_cache_dtype: str = "auto"  # dev.cache.kv_cache_dtype: fp8, Gemma 4's full layers in a real FP8 pool
+    kv_cache_dtype: str = "auto"  # cache.kv_cache_dtype: fp8, Gemma 4's full layers in a real FP8 pool
 
 
 # -- prompts -----------------------------------------------------------------------------------------------------------
@@ -1585,7 +1585,7 @@ def _engine_args(p: argparse.ArgumentParser) -> None:
                    help="forward and sampling graphs apart at every step (dev.runner.cuda.always_split)")
     g.add_argument("--check", action="store_true", help="compare the device tables with the host's every step")
     g.add_argument("--kv-cache-dtype", default="auto", choices=("auto", "fp8"),
-                   help="dev.cache.kv_cache_dtype: fp8 stores Gemma 4's full layers' KV in a real FP8 pool (arm "
+                   help="cache.kv_cache_dtype: fp8 stores Gemma 4's full layers' KV in a real FP8 pool (arm "
                         "-kvfp8; --kv-dtype emulates one in a BF16 pool)")
     g.add_argument("--cache", action="store_true", help="the prefix cache on (Qwen: with checkpoint slots)")
     g.add_argument("--graphs", action=argparse.BooleanOptionalAction, default=True,

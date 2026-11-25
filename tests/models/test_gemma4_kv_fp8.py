@@ -1,4 +1,4 @@
-"""Gemma 4's full-attention layers in an FP8 KV pool (`dev.cache.kv_cache_dtype fp8`) on the CPU: the torch references'
+"""Gemma 4's full-attention layers in an FP8 KV pool (`cache.kv_cache_dtype fp8`) on the CPU: the torch references'
 store and read (`kernels.gemma_ops.kv_fp8`, `kv_read`), the runner's geometry and refusals, the fake runner's."""
 
 from __future__ import annotations

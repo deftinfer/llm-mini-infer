@@ -84,6 +84,13 @@ class SchedulerConfig(_Group):
 class CacheConfig(_Group):
     # The radix prefix cache (architecture.md, "The radix tree"); off, every prompt is computed from scratch
     enable_prefix_caching: bool = True
+    # The KV cache's dtype (vLLM's --kv-cache-dtype; architecture.md, "Sliding-window models"): auto, the model's
+    # (BF16); fp8, Gemma 4's full-attention layers in FP8 E4M3 at scale 1.0 (their stored plane is V = k / rms(k), at
+    # most sqrt(512) in magnitude), the sliding layers in BF16, as vLLM's --kv-cache-dtype fp8 with
+    # --kv-cache-dtype-skip-layers sliding_window. A full page then holds twice the positions (640 on Gemma 4 31B), so a
+    # long request takes about half the KV arena; the attention reads each value rounded to E4M3, so outputs can differ,
+    # and a long cold prefill takes a few percent longer. Gemma 4 with a BF16 runner only
+    kv_cache_dtype: Literal["auto", "fp8"] = "auto"
 
 
 class SpeculativeConfig(_Group):
@@ -284,12 +291,6 @@ class DevCacheConfig(_Group):
     # starts). Default: derived (`sched.scheduler.derive_refine_chunk_tokens`: at most 2,048, with room for decode rows
     # of 1 + `mtp_k_max` tokens)
     refine_chunk_tokens: int | None = None
-    # The KV cache's dtype (architecture.md, "Sliding-window models"): auto, the model's (BF16); fp8, Gemma 4's
-    # full-attention layers in FP8 E4M3 at scale 1.0 (their stored plane is V = k / rms(k), at most sqrt(512) in
-    # magnitude), the sliding layers in BF16. A full page then holds twice the positions (640 on Gemma 4 31B), so a
-    # long request takes about half the arena's pages; the attention reads each value rounded to E4M3, so outputs can
-    # differ. Gemma 4 with a BF16 runner only
-    kv_cache_dtype: Literal["auto", "fp8"] = "auto"
 
 
 class DevSpeculativeConfig(_Group):
@@ -1087,14 +1088,14 @@ def _derive_kernels(cfg: Config, hf: dict[str, Any], reasons: dict[str, str]) ->
 
 
 def _derive_kv_cache_dtype(cfg: Config, text: dict[str, Any], gemma: bool, reasons: dict[str, str]) -> None:
-    """`dev.cache.kv_cache_dtype` (its comment in `DevCacheConfig`): fp8 is built for Gemma 4's full-attention layers
+    """`cache.kv_cache_dtype` (its comment in `CacheConfig`): fp8 is built for Gemma 4's full-attention layers
     with `attention_k_eq_v` (one stored plane, bounded by the square root of the head dim: no scale needed) on a BF16
     runner; anything else is refused by name."""
     o = cfg.dev.runner.cuda
-    if cfg.dev.cache.kv_cache_dtype == "auto":
-        reasons["dev.cache.kv_cache_dtype"] = "auto: the model's dtype for every layer"
+    if cfg.cache.kv_cache_dtype == "auto":
+        reasons["cache.kv_cache_dtype"] = "auto: the model's dtype for every layer"
         return
-    name = "dev.cache.kv_cache_dtype fp8"
+    name = "cache.kv_cache_dtype fp8"
     if not gemma:
         raise ValueError(f"{name}: built for Gemma 4's full-attention layers only, not for "
                          f"{text.get('model_type') or 'this checkpoint'}")
@@ -1108,7 +1109,7 @@ def _derive_kv_cache_dtype(cfg: Config, text: dict[str, Any], gemma: bool, reaso
             raise ValueError(f"{name}: needs a BF16 runner, not {dtype}"
                              f"{' (dev.runner.cuda.dtype auto on the CPU)' if o.dtype == 'auto' else ''}: set "
                              "dev.runner.cuda.dtype bfloat16")
-    reasons["dev.cache.kv_cache_dtype"] = ("fp8: Gemma 4's full-attention layers in FP8 E4M3 at scale 1.0, full pages "
+    reasons["cache.kv_cache_dtype"] = ("fp8: Gemma 4's full-attention layers in FP8 E4M3 at scale 1.0, full pages "
                                            "of twice the positions; the sliding layers in BF16")
 
 

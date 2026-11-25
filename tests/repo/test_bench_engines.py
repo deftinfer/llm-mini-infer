@@ -715,8 +715,8 @@ def test_family_l_has_the_fp8_kv_arm_on_gemma_only_after_the_two_ours_arms_in_th
     assert [a.name for a in gemma["L"]].index("ours-ctx262144-kvfp8") == 2
     fp8 = gemma["L"][2]
     cmd = arms.argv(fp8, "/x/bin")
-    assert fp8.sets == (arms.KV_FP8_SET,) and arms.KV_FP8_SET == "dev.cache.kv_cache_dtype=fp8"
-    assert cmd[cmd.index("dev.cache.kv_cache_dtype=fp8") - 1] == "--set"
+    assert fp8.sets == (arms.KV_FP8_SET,) and arms.KV_FP8_SET == "cache.kv_cache_dtype=fp8"
+    assert cmd[cmd.index("cache.kv_cache_dtype=fp8") - 1] == "--set"
     assert not any("batch_invariant" in x for x in cmd) and arms.batch_invariant(fp8)
     assert arms.arms("gemma")["L"][2].name == "ours-kvfp8"
     assert not any(a.sets for a in gemma["I"]) and "kvfp8" not in " ".join(a.name for a in gemma["I"])

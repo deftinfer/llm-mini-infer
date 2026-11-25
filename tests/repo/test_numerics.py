@@ -731,7 +731,7 @@ def test_kv_fake_quant_on_every_layer(tiny_gemma: Tiny, tiny_qwen: Tiny, tmp_pat
 
 
 def test_the_real_fp8_pool_equals_the_fake_quant(tiny_gemma: Tiny, tmp_path) -> None:
-    """`--kv-cache-dtype fp8` (a real FP8 pool: `dev.cache.kv_cache_dtype`, the full layers' bytes in uint8) against
+    """`--kv-cache-dtype fp8` (a real FP8 pool: `cache.kv_cache_dtype`, the full layers' bytes in uint8) against
     `--kv-dtype fp8` (a BF16 pool whose written slots are rounded through E4M3) on the tiny Gemma 4 with its assistant,
     a BF16 CPU runner (the torch references), eager: the two arms' tokens, hidden states and acceptance are the same
     bit for bit on every request (`same`), and both differ from the BF16 arm's. The fake-quant refuses an FP8 pool, and

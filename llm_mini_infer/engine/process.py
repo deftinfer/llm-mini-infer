@@ -78,7 +78,7 @@ def build_runner(cfg: Config) -> Runner:
                                 encoder_rows=(im.encoder_cache_tokens or 0) if on else 0,
                                 encoder_budget=(im.encoder_budget or 0) if on else 0, logprobs=cfg.server.logprobs,
                                 penalties=cfg.server.penalties, draft_counts=cfg.draft_counts,
-                                kv_cache_dtype=cfg.dev.cache.kv_cache_dtype)
+                                kv_cache_dtype=cfg.cache.kv_cache_dtype)
     from ..runner.cuda import make_cuda_runner
 
     return make_cuda_runner(cfg)

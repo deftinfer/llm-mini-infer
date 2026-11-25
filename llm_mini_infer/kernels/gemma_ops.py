@@ -130,7 +130,7 @@ E4M3_MAX = 448.0  # float8_e4m3fn's largest finite value
 
 
 def kv_fp8(x: torch.Tensor) -> torch.Tensor:
-    """x as an FP8 KV pool stores it (`dev.cache.kv_cache_dtype fp8`): E4M3 bytes (uint8) of x clamped to ±448 (PTX's
+    """x as an FP8 KV pool stores it (`cache.kv_cache_dtype fp8`): E4M3 bytes (uint8) of x clamped to ±448 (PTX's
     `.satfinite`: an overflow or an infinity saturates, a NaN stays a NaN) and rounded to nearest even. x is the
     value a BF16 pool would hold: the store rounds twice, and a kernel that stores FP8 must round the same way."""
     return x.float().clamp(-E4M3_MAX, E4M3_MAX).to(torch.float8_e4m3fn).view(torch.uint8)

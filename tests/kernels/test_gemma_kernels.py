@@ -9,7 +9,7 @@ order). The head-512 attention (`csrc/attn512.cu`, K derived from the stored V p
 (from each row's first window page) are compared with fp32 attention over the same BF16 inputs, within BF16's rounding
 of P and of the output.
 
-**FP8 pools** (`dev.cache.kv_cache_dtype fp8`): the store's and the read's conversions against the references on every
+**FP8 pools** (`cache.kv_cache_dtype fp8`): the store's and the read's conversions against the references on every
 input; the store's bytes the E4M3 rounding of its BF16 store; and every attn512 test runs twice (`kv8_twice`), the
 second time over FP8 pools (the `kv8` fixture: its cases' V planes on the E4M3 grid, the kernel reading their bytes),
 where every eager run also runs over the BF16 pool of the same values and must give the same bits.

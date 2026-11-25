@@ -6,7 +6,7 @@
   NHD layout per layer), held for the positions a request's next queries can see;
 - **full pages** `fkv` [n_full, pages', full_page_size, Hf, Df] (one plane, V, with `attention_k_eq_v`; [.., 2, ..]
   without): every position of every request, shared through the prefix cache. In the runner's dtype, or uint8 bytes
-  of FP8 E4M3 values (`dev.cache.kv_cache_dtype fp8`: `gemma_ops.kv_fp8` stores, `kv_read` reads).
+  of FP8 E4M3 values (`cache.kv_cache_dtype fp8`: `gemma_ops.kv_fp8` stores, `kv_read` reads).
 In the runner both are views of one arena (`runner.cuda.gemma._Arena`), whose full pages it addresses through sub-pages
 of `full_page_size` positions; the backends need only the two views. Page 0 of each is the null page: CUDA-graph
 padding rows write their KV there.

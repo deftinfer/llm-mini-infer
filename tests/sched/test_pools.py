@@ -108,7 +108,7 @@ def test_size_arena_refuses_or_caps_a_request_it_cannot_hold() -> None:
 
 
 def test_an_fp8_arena_holds_twice_the_full_positions_a_page(caplog) -> None:
-    """With the full layers' KV in FP8 (`dev.cache.kv_cache_dtype fp8`: 20 KiB a position) a full page is 640
+    """With the full layers' KV in FP8 (`cache.kv_cache_dtype fp8`: 20 KiB a position) a full page is 640
     positions, the window pages unchanged. In 4,000 pages a request of 32,768 tokens then holds 52 full pages and 66
     window pages (118, against 169 in BF16), so 33 fit at once against 23, and 8 of 262,144 against 4; a length the
     arena caps is about twice as long."""

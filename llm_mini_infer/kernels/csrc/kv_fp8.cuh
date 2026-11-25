@@ -1,4 +1,4 @@
-// FP8 E4M3 KV values: Gemma 4's full layers with `dev.cache.kv_cache_dtype fp8` (the reference is `kv_fp8` and
+// FP8 E4M3 KV values: Gemma 4's full layers with `cache.kv_cache_dtype fp8` (the reference is `kv_fp8` and
 // `kv_read` in kernels/gemma_ops.py). A store rounds the BF16 value that a BF16 pool would hold to nearest even and
 // saturates (`.satfinite`: an overflow or an infinity becomes ±448, a NaN stays a NaN). A read is exact: every E4M3
 // value is an FP16 value and a BF16 value.

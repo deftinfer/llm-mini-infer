@@ -16,7 +16,7 @@ different mask unions, so a token's column in the sparse head moves between them
   prefill row's queries past 64 keys split by 16 (`attn512_prefill`): a request whose prompt passes 64 and whose answer
   passes 512 and 1024 positions, alone and beside requests that arrive while it runs.
 - **The forced prefix** (an answer's first tokens forced): taken whole by the final chunk, alone and beside.
-- **An FP8 KV cache** (`dev.cache.kv_cache_dtype fp8`, the full layers' KV in E4M3): the text case alone and beside,
+- **An FP8 KV cache** (`cache.kv_cache_dtype fp8`, the full layers' KV in E4M3): the text case alone and beside,
   other bits than over BF16 KV.
 - **The dense head** (the sparse head off): its GEMM runs at each step's M, which batch invariance leaves as it is; an
   expected failure that records whether its logits' bits move.

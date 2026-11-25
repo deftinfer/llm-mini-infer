@@ -234,7 +234,7 @@ def model_geometry(model_dir: str | Path, kv_cache_dtype: str = "auto") -> dict[
     KV per token covers every full-attention layer plus the MTP drafter's (BF16 K and V); a state slot holds the
     FP32 recurrent state and BF16 conv state of every linear-attention (GDN) layer plus the MTP hidden vector.
     For Qwen3.8-27B this gives 1,114,112 B per 16-token page and 153,954,304 B per slot. `kv_cache_dtype` fp8 (Gemma 4
-    only, as `dev.cache.kv_cache_dtype`): its full layers' KV at one byte a value.
+    only, as `cache.kv_cache_dtype`): its full layers' KV at one byte a value.
     """
     cfg = json.loads((Path(model_dir) / "config.json").read_text())
     tc = cfg.get("text_config", cfg)

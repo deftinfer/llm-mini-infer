@@ -148,7 +148,7 @@ class _Arena:
     positions: 320) is those `groups` sub-pages, chunk p of every slab: the same bytes as window page p. The full
     layers' page table is therefore kept per sub-page (`expand`), and our kernels read it as a page size of `sub`.
 
-    **FP8 full layers** (`full_dtype` float8_e4m3fn: `dev.cache.kv_cache_dtype fp8`). The buffer keeps its dtype and the
+    **FP8 full layers** (`full_dtype` float8_e4m3fn: `cache.kv_cache_dtype fp8`). The buffer keeps its dtype and the
     window pages theirs; the full layers view its bytes as `uint8` (one E4M3 value each: torch's index ops are not all
     defined on float8, so readers convert at the edges), so a chunk holds twice the positions (`sub` 128, a full page
     640 on Gemma 4 31B). `layout` counts in bytes for that reason."""

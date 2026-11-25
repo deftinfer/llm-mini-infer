@@ -1915,7 +1915,7 @@ class _TimedGemmaFull(_TimedPart):
 
         rows = [(int(m), int(u)) for m, u in zip(case.nq, case.ub)]
         fkv, self.table, self.q, kw, _, _ = _full_case(rows, self.H, self.HKV, PS, seed)
-        if self.args.kv_dtype == "fp8":  # the kernel reads E4M3 bytes (`dev.cache.kv_cache_dtype fp8`)
+        if self.args.kv_dtype == "fp8":  # the kernel reads E4M3 bytes (`cache.kv_cache_dtype fp8`)
             fkv = kv_fp8(fkv)
         self.pool, self.pools, self.layer = fkv, _Pools(fkv[None], PS), _Layer(kw)
 
@@ -1994,7 +1994,7 @@ def cmd_attn_timing(args: argparse.Namespace) -> int:
     for rows of `--max-model-len` + 1 + k keys. Steps (`timing_cases`, exact KV lengths): one prefill row of each of
     `--short-chunks` queries over each of `--histories` positions; one of `--long-chunk` over each of
     `--long-histories`; per `--decode-rows` count, verify rows of 1 + k queries (`--k`) over each of
-    `--decode-histories`. `--kv-dtype fp8`: Gemma 4's full layers over an FP8 pool (`dev.cache.kv_cache_dtype fp8`;
+    `--decode-histories`. `--kv-dtype fp8`: Gemma 4's full layers over an FP8 pool (`cache.kv_cache_dtype fp8`;
     time it beside a run at bf16 for the FP8 path's cost or gain). The plan is
     made once per path, outside the timed region, and only the kernels' launches are timed: eagerly, and for the
     verify rows in their decode bucket (`bucket`: its plan, run eagerly; `graph`: replayed from a CUDA graph, the

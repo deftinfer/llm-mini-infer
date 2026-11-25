@@ -39,7 +39,7 @@ embedder (`models.gemma4.vision` loads them) and any audio tower are skipped. Pr
 
 **Block-FP8 checkpoints** (`models.fp8`): the projections the checkpoint quantizes are `Fp8Linear`s (in a
 compressed-tensors block-FP8 checkpoint, every projection of the text model); the embeddings (and so the tied head), the
-norms, the vision tower and the KV cache stay BF16 (the full layers' KV in FP8 with `dev.cache.kv_cache_dtype fp8`:
+norms, the vision tower and the KV cache stay BF16 (the full layers' KV in FP8 with `cache.kv_cache_dtype fp8`:
 `runner.cuda.gemma._Arena`). The full layers' qkv_proj is q and k only (`k_eq_v`: V is the K projection, so it is
 computed once; the product is the same). Each FP8 projection's input comes quantized from the op
 that produces it (`kernels.gemma_ops`), but the attention output, which the standalone kernel (`ops.quant_fp8`)
