@@ -1645,6 +1645,31 @@ def test_the_decode_packs_pillows_pixels_as_tobytes_does() -> None:
         got[0, 0, 0] = 7  # writable: its own buffer
 
 
+def test_a_pillow_without_its_private_encoder_takes_the_public_path(monkeypatch) -> None:
+    """`Image._getencoder` is Pillow's private name: without it (a `PIL.Image` that lacks only that name, as the
+    decode imports it; Pillow's own calls keep theirs), the decode packs the same pixels through numpy, every JPEG case
+    of the old decoder's and an odd size included."""
+    import PIL
+
+    from llm_mini_infer.vision.family import _rgb, decode_rgb
+
+    class Without:
+        def __getattr__(self, name: str):
+            if name == "_getencoder":
+                raise AttributeError(name)
+            return getattr(Image, name)
+
+    cases = list(old_jpeg_cases().values())
+    want = [decode_rgb(data, probe(data)) for data in cases]
+    im = Image.fromarray(np.random.default_rng(6).integers(0, 256, (23, 37, 3), dtype=np.uint8), "RGB")
+    monkeypatch.setattr(PIL, "Image", Without())
+    for data, pixels in zip(cases, want, strict=True):
+        assert torch.equal(decode_rgb(data, probe(data)), pixels)
+    got = _rgb(im, torch)
+    assert np.array_equal(got.numpy(), np.asarray(im))
+    got[0, 0, 0] = 7  # writable: its own buffer
+
+
 def test_the_resize_is_torchvisions_call_for_call() -> None:
     """`resize_bicubic`, on torch alone, equals torchvision's uint8 antialiased bicubic resize (the dev group keeps
     torchvision for the reference tests): up and down, odd sizes, an unchanged size, on the decode's channels-last view

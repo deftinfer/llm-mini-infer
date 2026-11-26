@@ -170,9 +170,12 @@ def _rgb(im: Any, torch: Any) -> Any:
     """An RGB image's pixels as uint8 [H, W, 3] over one writable buffer that Pillow's raw encoder packs into, chunk by
     chunk, as `tobytes` runs it, without `tobytes`' join of the chunks and a copy for torch: at 12 megapixels each is
     36 MB more to copy and, on linux, to fault in. `_getencoder` is Pillow's private name for it, at the stack's pinned
-    Pillow (the JPEG digests and HF's pixel tests read its bytes)."""
+    Pillow (the JPEG digests and HF's pixel tests read its bytes); a Pillow without it takes the public path, the
+    same bytes through numpy's copy."""
     from PIL import Image
 
+    if not hasattr(Image, "_getencoder"):
+        return torch.from_numpy(np.asarray(im).copy())
     enc = Image._getencoder("RGB", "raw", "RGB")
     enc.setimage(im.im, (0, 0, *im.size))
     buf = bytearray(3 * im.width * im.height)
