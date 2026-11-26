@@ -22,9 +22,9 @@
 ARG CUDA_BASE=nvidia/cuda:13.0.2-base-ubuntu24.04@sha256:2ab6381d970b211fb93853796dc6707eb8a72575a375c422b17cf4d8b2641701
 ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.13.5@sha256:32a7bb39b496babbd997b0a39a4d66c126bdaf5661b302bf6f06abda8deca6ff
 # The GPU-validated stack the image keeps (its label): the five Python packages pyproject pins (torch with its CUDA
-# libraries, FlashInfer, llguidance, tokenizers, Pillow with torchvision) at the versions the GPU suite and the
-# image's comparison runs; tests/data/image/ records the image's freeze, apt list and inventory on it
-ARG STACK="torch==2.14.1+cu130 torchvision==0.29.1+cu130 flashinfer-python==0.7.2 llguidance==1.9.1 tokenizers==0.23.3 pillow==13.0.0"
+# libraries, FlashInfer, llguidance, tokenizers, Pillow) at the versions the GPU suite and the image's comparison
+# runs; tests/data/image/ records the image's freeze, apt list and inventory on it
+ARG STACK="torch==2.14.1+cu130 flashinfer-python==0.7.2 llguidance==1.9.1 tokenizers==0.23.3 pillow==13.0.0"
 # Ubuntu's archive at a fixed time, its security updates included: the os and kernels stages install their Ubuntu
 # packages from it at pinned versions (tests/data/image/apt.txt and toolchain.json); the image's apt source names it,
 # where the notices find the GPL and LGPL packages' sources

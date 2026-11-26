@@ -184,7 +184,7 @@
     },
     "llm-mini-infer-frontend-0": {
      "processes": 2,
-     "modules": 577,
+     "modules": 587,
      "dists": [
       "Jinja2",
       "MarkupSafe",
@@ -198,6 +198,7 @@
       "msgspec",
       "numpy",
       "nvidia-cutlass-dsl-libs-base",
+      "pillow",
       "pybase64",
       "pyzmq",
       "setuptools",
@@ -227,6 +228,7 @@
       "llguidance": 1,
       "msgspec": 1,
       "numpy": 5,
+      "pillow": 8,
       "pybase64": 1,
       "pyzmq": 3,
       "tokenizers": 1,
@@ -241,12 +243,11 @@
     },
     "llm-mini-infer-pool-0": {
      "processes": 2,
-     "modules": 2410,
+     "modules": 1320,
      "dists": [
       "cuda-bindings",
       "dill",
       "llm-mini-infer",
-      "mpmath",
       "msgspec",
       "numpy",
       "nvidia-cutlass-dsl-libs-base",
@@ -254,11 +255,8 @@
       "pillow",
       "pyzmq",
       "setuptools",
-      "sympy",
       "torch",
-      "torchvision",
       "tqdm",
-      "triton",
       "typing_extensions"
      ],
      "libs": {
@@ -277,7 +275,7 @@
       "cuda-bindings": 8,
       "driver": 1,
       "msgspec": 1,
-      "numpy": 15,
+      "numpy": 5,
       "nvidia-cublas": 2,
       "nvidia-cuda-cupti": 1,
       "nvidia-cuda-nvrtc": 2,
@@ -292,11 +290,9 @@
       "nvidia-nccl-cu13": 1,
       "nvidia-nvjitlink": 1,
       "nvidia-nvshmem-cu13": 1,
-      "pillow": 14,
+      "pillow": 8,
       "pyzmq": 3,
-      "torch": 11,
-      "torchvision": 9,
-      "triton": 1
+      "torch": 11
      },
      "flashinfer_aot": [],
      "cubins_opened": [],
@@ -307,12 +303,11 @@
     },
     "llm-mini-infer-pool-1": {
      "processes": 2,
-     "modules": 2410,
+     "modules": 1320,
      "dists": [
       "cuda-bindings",
       "dill",
       "llm-mini-infer",
-      "mpmath",
       "msgspec",
       "numpy",
       "nvidia-cutlass-dsl-libs-base",
@@ -320,11 +315,8 @@
       "pillow",
       "pyzmq",
       "setuptools",
-      "sympy",
       "torch",
-      "torchvision",
       "tqdm",
-      "triton",
       "typing_extensions"
      ],
      "libs": {
@@ -343,7 +335,7 @@
       "cuda-bindings": 8,
       "driver": 1,
       "msgspec": 1,
-      "numpy": 15,
+      "numpy": 5,
       "nvidia-cublas": 2,
       "nvidia-cuda-cupti": 1,
       "nvidia-cuda-nvrtc": 2,
@@ -358,11 +350,9 @@
       "nvidia-nccl-cu13": 1,
       "nvidia-nvjitlink": 1,
       "nvidia-nvshmem-cu13": 1,
-      "pillow": 14,
+      "pillow": 8,
       "pyzmq": 3,
-      "torch": 11,
-      "torchvision": 9,
-      "triton": 1
+      "torch": 11
      },
      "flashinfer_aot": [],
      "cubins_opened": [],
@@ -373,12 +363,11 @@
     },
     "llm-mini-infer-pool-2": {
      "processes": 2,
-     "modules": 2410,
+     "modules": 1320,
      "dists": [
       "cuda-bindings",
       "dill",
       "llm-mini-infer",
-      "mpmath",
       "msgspec",
       "numpy",
       "nvidia-cutlass-dsl-libs-base",
@@ -386,11 +375,8 @@
       "pillow",
       "pyzmq",
       "setuptools",
-      "sympy",
       "torch",
-      "torchvision",
       "tqdm",
-      "triton",
       "typing_extensions"
      ],
      "libs": {
@@ -409,7 +395,7 @@
       "cuda-bindings": 8,
       "driver": 1,
       "msgspec": 1,
-      "numpy": 15,
+      "numpy": 5,
       "nvidia-cublas": 2,
       "nvidia-cuda-cupti": 1,
       "nvidia-cuda-nvrtc": 2,
@@ -424,11 +410,9 @@
       "nvidia-nccl-cu13": 1,
       "nvidia-nvjitlink": 1,
       "nvidia-nvshmem-cu13": 1,
-      "pillow": 14,
+      "pillow": 8,
       "pyzmq": 3,
-      "torch": 11,
-      "torchvision": 9,
-      "triton": 1
+      "torch": 11
      },
      "flashinfer_aot": [],
      "cubins_opened": [],
@@ -439,12 +423,11 @@
     },
     "llm-mini-infer-pool-3": {
      "processes": 2,
-     "modules": 2410,
+     "modules": 1320,
      "dists": [
       "cuda-bindings",
       "dill",
       "llm-mini-infer",
-      "mpmath",
       "msgspec",
       "numpy",
       "nvidia-cutlass-dsl-libs-base",
@@ -452,11 +435,8 @@
       "pillow",
       "pyzmq",
       "setuptools",
-      "sympy",
       "torch",
-      "torchvision",
       "tqdm",
-      "triton",
       "typing_extensions"
      ],
      "libs": {
@@ -475,7 +455,7 @@
       "cuda-bindings": 8,
       "driver": 1,
       "msgspec": 1,
-      "numpy": 15,
+      "numpy": 5,
       "nvidia-cublas": 2,
       "nvidia-cuda-cupti": 1,
       "nvidia-cuda-nvrtc": 2,
@@ -490,11 +470,9 @@
       "nvidia-nccl-cu13": 1,
       "nvidia-nvjitlink": 1,
       "nvidia-nvshmem-cu13": 1,
-      "pillow": 14,
+      "pillow": 8,
       "pyzmq": 3,
-      "torch": 11,
-      "torchvision": 9,
-      "triton": 1
+      "torch": 11
      },
      "flashinfer_aot": [],
      "cubins_opened": [],
@@ -505,12 +483,11 @@
     },
     "llm-mini-infer-pool-4": {
      "processes": 2,
-     "modules": 2410,
+     "modules": 1320,
      "dists": [
       "cuda-bindings",
       "dill",
       "llm-mini-infer",
-      "mpmath",
       "msgspec",
       "numpy",
       "nvidia-cutlass-dsl-libs-base",
@@ -518,11 +495,8 @@
       "pillow",
       "pyzmq",
       "setuptools",
-      "sympy",
       "torch",
-      "torchvision",
       "tqdm",
-      "triton",
       "typing_extensions"
      ],
      "libs": {
@@ -541,7 +515,7 @@
       "cuda-bindings": 8,
       "driver": 1,
       "msgspec": 1,
-      "numpy": 15,
+      "numpy": 5,
       "nvidia-cublas": 2,
       "nvidia-cuda-cupti": 1,
       "nvidia-cuda-nvrtc": 2,
@@ -556,11 +530,9 @@
       "nvidia-nccl-cu13": 1,
       "nvidia-nvjitlink": 1,
       "nvidia-nvshmem-cu13": 1,
-      "pillow": 14,
+      "pillow": 8,
       "pyzmq": 3,
-      "torch": 11,
-      "torchvision": 9,
-      "triton": 1
+      "torch": 11
      },
      "flashinfer_aot": [],
      "cubins_opened": [],
@@ -571,12 +543,11 @@
     },
     "llm-mini-infer-pool-5": {
      "processes": 2,
-     "modules": 2410,
+     "modules": 1320,
      "dists": [
       "cuda-bindings",
       "dill",
       "llm-mini-infer",
-      "mpmath",
       "msgspec",
       "numpy",
       "nvidia-cutlass-dsl-libs-base",
@@ -584,11 +555,8 @@
       "pillow",
       "pyzmq",
       "setuptools",
-      "sympy",
       "torch",
-      "torchvision",
       "tqdm",
-      "triton",
       "typing_extensions"
      ],
      "libs": {
@@ -607,7 +575,7 @@
       "cuda-bindings": 8,
       "driver": 1,
       "msgspec": 1,
-      "numpy": 15,
+      "numpy": 5,
       "nvidia-cublas": 2,
       "nvidia-cuda-cupti": 1,
       "nvidia-cuda-nvrtc": 2,
@@ -622,11 +590,9 @@
       "nvidia-nccl-cu13": 1,
       "nvidia-nvjitlink": 1,
       "nvidia-nvshmem-cu13": 1,
-      "pillow": 14,
+      "pillow": 8,
       "pyzmq": 3,
-      "torch": 11,
-      "torchvision": 9,
-      "triton": 1
+      "torch": 11
      },
      "flashinfer_aot": [],
      "cubins_opened": [],
@@ -637,12 +603,11 @@
     },
     "llm-mini-infer-pool-6": {
      "processes": 2,
-     "modules": 2410,
+     "modules": 1320,
      "dists": [
       "cuda-bindings",
       "dill",
       "llm-mini-infer",
-      "mpmath",
       "msgspec",
       "numpy",
       "nvidia-cutlass-dsl-libs-base",
@@ -650,11 +615,8 @@
       "pillow",
       "pyzmq",
       "setuptools",
-      "sympy",
       "torch",
-      "torchvision",
       "tqdm",
-      "triton",
       "typing_extensions"
      ],
      "libs": {
@@ -673,7 +635,7 @@
       "cuda-bindings": 8,
       "driver": 1,
       "msgspec": 1,
-      "numpy": 15,
+      "numpy": 5,
       "nvidia-cublas": 2,
       "nvidia-cuda-cupti": 1,
       "nvidia-cuda-nvrtc": 2,
@@ -688,11 +650,9 @@
       "nvidia-nccl-cu13": 1,
       "nvidia-nvjitlink": 1,
       "nvidia-nvshmem-cu13": 1,
-      "pillow": 14,
+      "pillow": 8,
       "pyzmq": 3,
-      "torch": 11,
-      "torchvision": 9,
-      "triton": 1
+      "torch": 11
      },
      "flashinfer_aot": [],
      "cubins_opened": [],
@@ -703,12 +663,11 @@
     },
     "llm-mini-infer-pool-7": {
      "processes": 2,
-     "modules": 2410,
+     "modules": 1320,
      "dists": [
       "cuda-bindings",
       "dill",
       "llm-mini-infer",
-      "mpmath",
       "msgspec",
       "numpy",
       "nvidia-cutlass-dsl-libs-base",
@@ -716,11 +675,8 @@
       "pillow",
       "pyzmq",
       "setuptools",
-      "sympy",
       "torch",
-      "torchvision",
       "tqdm",
-      "triton",
       "typing_extensions"
      ],
      "libs": {
@@ -739,7 +695,7 @@
       "cuda-bindings": 8,
       "driver": 1,
       "msgspec": 1,
-      "numpy": 15,
+      "numpy": 5,
       "nvidia-cublas": 2,
       "nvidia-cuda-cupti": 1,
       "nvidia-cuda-nvrtc": 2,
@@ -754,11 +710,9 @@
       "nvidia-nccl-cu13": 1,
       "nvidia-nvjitlink": 1,
       "nvidia-nvshmem-cu13": 1,
-      "pillow": 14,
+      "pillow": 8,
       "pyzmq": 3,
-      "torch": 11,
-      "torchvision": 9,
-      "triton": 1
+      "torch": 11
      },
      "flashinfer_aot": [],
      "cubins_opened": [],
@@ -990,7 +944,7 @@
     },
     "llm-mini-infer-frontend-0": {
      "processes": 2,
-     "modules": 578,
+     "modules": 588,
      "dists": [
       "Jinja2",
       "MarkupSafe",
@@ -1004,6 +958,7 @@
       "msgspec",
       "numpy",
       "nvidia-cutlass-dsl-libs-base",
+      "pillow",
       "pybase64",
       "pyzmq",
       "setuptools",
@@ -1022,13 +977,12 @@
     },
     "llm-mini-infer-pool-0": {
      "processes": 2,
-     "modules": 2434,
+     "modules": 1344,
      "dists": [
       "PyYAML",
       "cuda-bindings",
       "dill",
       "llm-mini-infer",
-      "mpmath",
       "msgspec",
       "numpy",
       "nvidia-cutlass-dsl-libs-base",
@@ -1036,11 +990,8 @@
       "pillow",
       "pyzmq",
       "setuptools",
-      "sympy",
       "torch",
-      "torchvision",
       "tqdm",
-      "triton",
       "typing_extensions"
      ],
      "libs": {},
@@ -1053,13 +1004,12 @@
     },
     "llm-mini-infer-pool-1": {
      "processes": 2,
-     "modules": 2434,
+     "modules": 1344,
      "dists": [
       "PyYAML",
       "cuda-bindings",
       "dill",
       "llm-mini-infer",
-      "mpmath",
       "msgspec",
       "numpy",
       "nvidia-cutlass-dsl-libs-base",
@@ -1067,11 +1017,8 @@
       "pillow",
       "pyzmq",
       "setuptools",
-      "sympy",
       "torch",
-      "torchvision",
       "tqdm",
-      "triton",
       "typing_extensions"
      ],
      "libs": {},
@@ -1084,13 +1031,12 @@
     },
     "llm-mini-infer-pool-2": {
      "processes": 2,
-     "modules": 2434,
+     "modules": 1344,
      "dists": [
       "PyYAML",
       "cuda-bindings",
       "dill",
       "llm-mini-infer",
-      "mpmath",
       "msgspec",
       "numpy",
       "nvidia-cutlass-dsl-libs-base",
@@ -1098,11 +1044,8 @@
       "pillow",
       "pyzmq",
       "setuptools",
-      "sympy",
       "torch",
-      "torchvision",
       "tqdm",
-      "triton",
       "typing_extensions"
      ],
      "libs": {},
@@ -1115,13 +1058,12 @@
     },
     "llm-mini-infer-pool-3": {
      "processes": 2,
-     "modules": 2434,
+     "modules": 1344,
      "dists": [
       "PyYAML",
       "cuda-bindings",
       "dill",
       "llm-mini-infer",
-      "mpmath",
       "msgspec",
       "numpy",
       "nvidia-cutlass-dsl-libs-base",
@@ -1129,11 +1071,8 @@
       "pillow",
       "pyzmq",
       "setuptools",
-      "sympy",
       "torch",
-      "torchvision",
       "tqdm",
-      "triton",
       "typing_extensions"
      ],
      "libs": {},
@@ -1146,13 +1085,12 @@
     },
     "llm-mini-infer-pool-4": {
      "processes": 2,
-     "modules": 2434,
+     "modules": 1344,
      "dists": [
       "PyYAML",
       "cuda-bindings",
       "dill",
       "llm-mini-infer",
-      "mpmath",
       "msgspec",
       "numpy",
       "nvidia-cutlass-dsl-libs-base",
@@ -1160,11 +1098,8 @@
       "pillow",
       "pyzmq",
       "setuptools",
-      "sympy",
       "torch",
-      "torchvision",
       "tqdm",
-      "triton",
       "typing_extensions"
      ],
      "libs": {},
@@ -1177,13 +1112,12 @@
     },
     "llm-mini-infer-pool-5": {
      "processes": 2,
-     "modules": 2434,
+     "modules": 1344,
      "dists": [
       "PyYAML",
       "cuda-bindings",
       "dill",
       "llm-mini-infer",
-      "mpmath",
       "msgspec",
       "numpy",
       "nvidia-cutlass-dsl-libs-base",
@@ -1191,11 +1125,8 @@
       "pillow",
       "pyzmq",
       "setuptools",
-      "sympy",
       "torch",
-      "torchvision",
       "tqdm",
-      "triton",
       "typing_extensions"
      ],
      "libs": {},
@@ -1208,13 +1139,12 @@
     },
     "llm-mini-infer-pool-6": {
      "processes": 2,
-     "modules": 2434,
+     "modules": 1344,
      "dists": [
       "PyYAML",
       "cuda-bindings",
       "dill",
       "llm-mini-infer",
-      "mpmath",
       "msgspec",
       "numpy",
       "nvidia-cutlass-dsl-libs-base",
@@ -1222,11 +1152,8 @@
       "pillow",
       "pyzmq",
       "setuptools",
-      "sympy",
       "torch",
-      "torchvision",
       "tqdm",
-      "triton",
       "typing_extensions"
      ],
      "libs": {},
@@ -1239,13 +1166,12 @@
     },
     "llm-mini-infer-pool-7": {
      "processes": 2,
-     "modules": 2434,
+     "modules": 1344,
      "dists": [
       "PyYAML",
       "cuda-bindings",
       "dill",
       "llm-mini-infer",
-      "mpmath",
       "msgspec",
       "numpy",
       "nvidia-cutlass-dsl-libs-base",
@@ -1253,11 +1179,8 @@
       "pillow",
       "pyzmq",
       "setuptools",
-      "sympy",
       "torch",
-      "torchvision",
       "tqdm",
-      "triton",
       "typing_extensions"
      ],
      "libs": {},
@@ -1458,7 +1381,7 @@
     },
     "llm-mini-infer-frontend-0": {
      "processes": 1,
-     "modules": 577,
+     "modules": 587,
      "dists": [
       "Jinja2",
       "MarkupSafe",
@@ -1472,6 +1395,7 @@
       "msgspec",
       "numpy",
       "nvidia-cutlass-dsl-libs-base",
+      "pillow",
       "pybase64",
       "pyzmq",
       "setuptools",
@@ -1501,6 +1425,7 @@
       "llguidance": 1,
       "msgspec": 1,
       "numpy": 5,
+      "pillow": 8,
       "pybase64": 1,
       "pyzmq": 3,
       "tokenizers": 1,
@@ -1515,12 +1440,11 @@
     },
     "llm-mini-infer-pool-0": {
      "processes": 1,
-     "modules": 2410,
+     "modules": 1320,
      "dists": [
       "cuda-bindings",
       "dill",
       "llm-mini-infer",
-      "mpmath",
       "msgspec",
       "numpy",
       "nvidia-cutlass-dsl-libs-base",
@@ -1528,11 +1452,8 @@
       "pillow",
       "pyzmq",
       "setuptools",
-      "sympy",
       "torch",
-      "torchvision",
       "tqdm",
-      "triton",
       "typing_extensions"
      ],
      "libs": {
@@ -1551,7 +1472,7 @@
       "cuda-bindings": 8,
       "driver": 1,
       "msgspec": 1,
-      "numpy": 15,
+      "numpy": 5,
       "nvidia-cublas": 2,
       "nvidia-cuda-cupti": 1,
       "nvidia-cuda-nvrtc": 2,
@@ -1566,11 +1487,9 @@
       "nvidia-nccl-cu13": 1,
       "nvidia-nvjitlink": 1,
       "nvidia-nvshmem-cu13": 1,
-      "pillow": 14,
+      "pillow": 8,
       "pyzmq": 3,
-      "torch": 11,
-      "torchvision": 9,
-      "triton": 1
+      "torch": 11
      },
      "flashinfer_aot": [],
      "cubins_opened": [],
@@ -1581,12 +1500,11 @@
     },
     "llm-mini-infer-pool-1": {
      "processes": 1,
-     "modules": 2410,
+     "modules": 1320,
      "dists": [
       "cuda-bindings",
       "dill",
       "llm-mini-infer",
-      "mpmath",
       "msgspec",
       "numpy",
       "nvidia-cutlass-dsl-libs-base",
@@ -1594,11 +1512,8 @@
       "pillow",
       "pyzmq",
       "setuptools",
-      "sympy",
       "torch",
-      "torchvision",
       "tqdm",
-      "triton",
       "typing_extensions"
      ],
      "libs": {
@@ -1617,7 +1532,7 @@
       "cuda-bindings": 8,
       "driver": 1,
       "msgspec": 1,
-      "numpy": 15,
+      "numpy": 5,
       "nvidia-cublas": 2,
       "nvidia-cuda-cupti": 1,
       "nvidia-cuda-nvrtc": 2,
@@ -1632,11 +1547,9 @@
       "nvidia-nccl-cu13": 1,
       "nvidia-nvjitlink": 1,
       "nvidia-nvshmem-cu13": 1,
-      "pillow": 14,
+      "pillow": 8,
       "pyzmq": 3,
-      "torch": 11,
-      "torchvision": 9,
-      "triton": 1
+      "torch": 11
      },
      "flashinfer_aot": [],
      "cubins_opened": [],
@@ -1647,12 +1560,11 @@
     },
     "llm-mini-infer-pool-2": {
      "processes": 1,
-     "modules": 2410,
+     "modules": 1320,
      "dists": [
       "cuda-bindings",
       "dill",
       "llm-mini-infer",
-      "mpmath",
       "msgspec",
       "numpy",
       "nvidia-cutlass-dsl-libs-base",
@@ -1660,11 +1572,8 @@
       "pillow",
       "pyzmq",
       "setuptools",
-      "sympy",
       "torch",
-      "torchvision",
       "tqdm",
-      "triton",
       "typing_extensions"
      ],
      "libs": {
@@ -1683,7 +1592,7 @@
       "cuda-bindings": 8,
       "driver": 1,
       "msgspec": 1,
-      "numpy": 15,
+      "numpy": 5,
       "nvidia-cublas": 2,
       "nvidia-cuda-cupti": 1,
       "nvidia-cuda-nvrtc": 2,
@@ -1698,11 +1607,9 @@
       "nvidia-nccl-cu13": 1,
       "nvidia-nvjitlink": 1,
       "nvidia-nvshmem-cu13": 1,
-      "pillow": 14,
+      "pillow": 8,
       "pyzmq": 3,
-      "torch": 11,
-      "torchvision": 9,
-      "triton": 1
+      "torch": 11
      },
      "flashinfer_aot": [],
      "cubins_opened": [],
@@ -1713,12 +1620,11 @@
     },
     "llm-mini-infer-pool-3": {
      "processes": 1,
-     "modules": 2410,
+     "modules": 1320,
      "dists": [
       "cuda-bindings",
       "dill",
       "llm-mini-infer",
-      "mpmath",
       "msgspec",
       "numpy",
       "nvidia-cutlass-dsl-libs-base",
@@ -1726,11 +1632,8 @@
       "pillow",
       "pyzmq",
       "setuptools",
-      "sympy",
       "torch",
-      "torchvision",
       "tqdm",
-      "triton",
       "typing_extensions"
      ],
      "libs": {
@@ -1749,7 +1652,7 @@
       "cuda-bindings": 8,
       "driver": 1,
       "msgspec": 1,
-      "numpy": 15,
+      "numpy": 5,
       "nvidia-cublas": 2,
       "nvidia-cuda-cupti": 1,
       "nvidia-cuda-nvrtc": 2,
@@ -1764,11 +1667,9 @@
       "nvidia-nccl-cu13": 1,
       "nvidia-nvjitlink": 1,
       "nvidia-nvshmem-cu13": 1,
-      "pillow": 14,
+      "pillow": 8,
       "pyzmq": 3,
-      "torch": 11,
-      "torchvision": 9,
-      "triton": 1
+      "torch": 11
      },
      "flashinfer_aot": [],
      "cubins_opened": [],
@@ -1779,12 +1680,11 @@
     },
     "llm-mini-infer-pool-4": {
      "processes": 1,
-     "modules": 2410,
+     "modules": 1320,
      "dists": [
       "cuda-bindings",
       "dill",
       "llm-mini-infer",
-      "mpmath",
       "msgspec",
       "numpy",
       "nvidia-cutlass-dsl-libs-base",
@@ -1792,11 +1692,8 @@
       "pillow",
       "pyzmq",
       "setuptools",
-      "sympy",
       "torch",
-      "torchvision",
       "tqdm",
-      "triton",
       "typing_extensions"
      ],
      "libs": {
@@ -1815,7 +1712,7 @@
       "cuda-bindings": 8,
       "driver": 1,
       "msgspec": 1,
-      "numpy": 15,
+      "numpy": 5,
       "nvidia-cublas": 2,
       "nvidia-cuda-cupti": 1,
       "nvidia-cuda-nvrtc": 2,
@@ -1830,11 +1727,9 @@
       "nvidia-nccl-cu13": 1,
       "nvidia-nvjitlink": 1,
       "nvidia-nvshmem-cu13": 1,
-      "pillow": 14,
+      "pillow": 8,
       "pyzmq": 3,
-      "torch": 11,
-      "torchvision": 9,
-      "triton": 1
+      "torch": 11
      },
      "flashinfer_aot": [],
      "cubins_opened": [],
@@ -1845,12 +1740,11 @@
     },
     "llm-mini-infer-pool-5": {
      "processes": 1,
-     "modules": 2410,
+     "modules": 1320,
      "dists": [
       "cuda-bindings",
       "dill",
       "llm-mini-infer",
-      "mpmath",
       "msgspec",
       "numpy",
       "nvidia-cutlass-dsl-libs-base",
@@ -1858,11 +1752,8 @@
       "pillow",
       "pyzmq",
       "setuptools",
-      "sympy",
       "torch",
-      "torchvision",
       "tqdm",
-      "triton",
       "typing_extensions"
      ],
      "libs": {
@@ -1881,7 +1772,7 @@
       "cuda-bindings": 8,
       "driver": 1,
       "msgspec": 1,
-      "numpy": 15,
+      "numpy": 5,
       "nvidia-cublas": 2,
       "nvidia-cuda-cupti": 1,
       "nvidia-cuda-nvrtc": 2,
@@ -1896,11 +1787,9 @@
       "nvidia-nccl-cu13": 1,
       "nvidia-nvjitlink": 1,
       "nvidia-nvshmem-cu13": 1,
-      "pillow": 14,
+      "pillow": 8,
       "pyzmq": 3,
-      "torch": 11,
-      "torchvision": 9,
-      "triton": 1
+      "torch": 11
      },
      "flashinfer_aot": [],
      "cubins_opened": [],
@@ -1911,12 +1800,11 @@
     },
     "llm-mini-infer-pool-6": {
      "processes": 1,
-     "modules": 2410,
+     "modules": 1320,
      "dists": [
       "cuda-bindings",
       "dill",
       "llm-mini-infer",
-      "mpmath",
       "msgspec",
       "numpy",
       "nvidia-cutlass-dsl-libs-base",
@@ -1924,11 +1812,8 @@
       "pillow",
       "pyzmq",
       "setuptools",
-      "sympy",
       "torch",
-      "torchvision",
       "tqdm",
-      "triton",
       "typing_extensions"
      ],
      "libs": {
@@ -1947,7 +1832,7 @@
       "cuda-bindings": 8,
       "driver": 1,
       "msgspec": 1,
-      "numpy": 15,
+      "numpy": 5,
       "nvidia-cublas": 2,
       "nvidia-cuda-cupti": 1,
       "nvidia-cuda-nvrtc": 2,
@@ -1962,11 +1847,9 @@
       "nvidia-nccl-cu13": 1,
       "nvidia-nvjitlink": 1,
       "nvidia-nvshmem-cu13": 1,
-      "pillow": 14,
+      "pillow": 8,
       "pyzmq": 3,
-      "torch": 11,
-      "torchvision": 9,
-      "triton": 1
+      "torch": 11
      },
      "flashinfer_aot": [],
      "cubins_opened": [],
@@ -1977,12 +1860,11 @@
     },
     "llm-mini-infer-pool-7": {
      "processes": 1,
-     "modules": 2410,
+     "modules": 1320,
      "dists": [
       "cuda-bindings",
       "dill",
       "llm-mini-infer",
-      "mpmath",
       "msgspec",
       "numpy",
       "nvidia-cutlass-dsl-libs-base",
@@ -1990,11 +1872,8 @@
       "pillow",
       "pyzmq",
       "setuptools",
-      "sympy",
       "torch",
-      "torchvision",
       "tqdm",
-      "triton",
       "typing_extensions"
      ],
      "libs": {
@@ -2013,7 +1892,7 @@
       "cuda-bindings": 8,
       "driver": 1,
       "msgspec": 1,
-      "numpy": 15,
+      "numpy": 5,
       "nvidia-cublas": 2,
       "nvidia-cuda-cupti": 1,
       "nvidia-cuda-nvrtc": 2,
@@ -2028,11 +1907,9 @@
       "nvidia-nccl-cu13": 1,
       "nvidia-nvjitlink": 1,
       "nvidia-nvshmem-cu13": 1,
-      "pillow": 14,
+      "pillow": 8,
       "pyzmq": 3,
-      "torch": 11,
-      "torchvision": 9,
-      "triton": 1
+      "torch": 11
      },
      "flashinfer_aot": [],
      "cubins_opened": [],
