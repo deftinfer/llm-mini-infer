@@ -114,7 +114,7 @@ def toolchain() -> dict:
 
 def notices() -> dict:
     """The third-party notices (deploy/THIRD_PARTY_NOTICES) and what they say of the image: the paths they name that
-    are missing, the distributions with no licence file among the files their RECORD lists, the libraries torchvision
+    are missing, the distributions with no licence file among the files their RECORD lists, the libraries Pillow
     bundles (by name, without auditwheel's hash), the sections of Pillow's licence file, and the image's apt source."""
     text = NOTICES.read_text()
     paths = re.findall(r"(?<![\w.:/>])((?:/|site-packages/)[\w./*+-]*[\w/*])", text)
@@ -128,7 +128,7 @@ def notices() -> dict:
     return {"sha256": sha256(NOTICES), "missing": missing,
             "unlicensed": sorted(d.metadata["Name"] for d in md.distributions()
                                  if not any(licensed(f) for f in d.files or [])),
-            "torchvision_libs": sorted({p.name.split(".")[0] for p in (SITE / "torchvision.libs").iterdir()}),
+            "pillow_libs": sorted({p.name.split(".")[0].rsplit("-", 1)[0] for p in (SITE / "pillow.libs").iterdir()}),
             "pillow_sections": [s.strip("\n").splitlines()[0] for s in pillow.split("\n----\n") if s.strip()],
             "apt_source": Path("/etc/apt/sources.list.d/ubuntu.sources").read_text()}
 

@@ -17,7 +17,7 @@ image as its user (`--network none`, `--shm-size 2g`, tests/data mounted read-on
 - **no nvcc, no ptxas, no compiler:** none on PATH or under the CUDA toolkit's bin/ (the kernels' keys read the
   build's record; FlashInfer's import takes torch's CUDA version);
 - **notices:** /usr/share/doc/llm-mini-infer/THIRD_PARTY_NOTICES is deploy/THIRD_PARTY_NOTICES, and holds there: every
-  path it names exists, the wheels without a licence file and torchvision's bundled libraries are the ones it names,
+  path it names exists, the wheels without a licence file and Pillow's bundled libraries are the ones it names,
   Pillow's licence file has the sections it refers to, the apt source is the Dockerfile's Ubuntu snapshot;
 - **imports:** every module of llm_mini_infer, Qwen's included;
 - **configuration:** the entrypoint's preflight on the image's config.yaml with the host check Job's settings, over
@@ -150,10 +150,10 @@ def test_the_notices_hold_for_the_image(facts) -> None:
     n, text = facts["notices"], NOTICES.read_text()
     assert n["sha256"] == hashlib.sha256(NOTICES.read_bytes()).hexdigest()
     assert n["missing"] == []
-    # a new wheel without a licence file, or a library torchvision newly bundles, needs its licence in the notices
+    # a new wheel without a licence file, or a library Pillow newly bundles, needs its licence in the notices
     assert sorted(map(norm, n["unlicensed"])) == sorted(map(norm, listed(text, "site-packages/*.dist-info/ names")))
-    libs = listed(text, "torchvision's wheel")
-    assert n["torchvision_libs"] == sorted(libs)
+    libs = listed(text, "Pillow's wheel")
+    assert n["pillow_libs"] == sorted(libs)
     sections = [w.removeprefix("Pillow's ") for w in libs.values() if w.startswith("Pillow's ")]
     assert sections and set(sections) <= set(n["pillow_sections"])
     assert f"https://snapshot.ubuntu.com/ubuntu/{dockerfile_arg('UBUNTU_SNAPSHOT')}/" in n["apt_source"]
