@@ -19,37 +19,81 @@ it.
 default 178,956,970, Pillow's decompression-bomb bound) is a `ProbeError` before anything decodes the image (a JPEG
 declares its size in 4 bytes of its SOF and the decoder allocates what it says: a few hundred bytes can ask for
 65,500² pixels, 12.9 GB of RGB; Pillow refuses an image at that size too, but only in the pool); a PNG text chunk
-that inflates past `MAX_TEXT_CHUNK`, or text past `MAX_TEXT_MEMORY`, is a `ProbeError`, as Pillow refuses the image
-(zlib inflates about 1,000 times); and EXIF whose IFD0 has more than `MAX_IFD0_ENTRIES` entries counts as orientation
-1 here, because Pillow's loader costs about a microsecond of Python an entry (the pool's decode still orients such an
-image by Pillow, and an orientation of 5..8 then fails its size check: a 400).
+that inflates past `MAX_TEXT_CHUNK` is a `ProbeError`, as Pillow refuses the image. Bounds of its own, where Pillow
+reads on, for crafted files (no encoder comes near them):
+- a JPEG header of more than `MAX_JPEG_MARKERS` markers before its scan (segments, stray-byte and fill runs, markers
+  without a length; a fill run counts one a KiB) is a `ProbeError`; a run is skipped at C speed;
+- of PNG text, the probe reads only the values `getexif` uses, each from the last chunk Pillow keeps, and refuses
+  past `MAX_TEXT_WORK`: bytes inflated, kept or not, text decoded or parsed, compressed bytes fed to zlib (which
+  spends up to about 60 ns on a byte of crafted input), and the EXIF and XMP it then reads;
+- EXIF whose IFD0 has more than `MAX_IFD0_ENTRIES` entries, and a "Raw profile type exif" longer than
+  `MAX_TEXT_CHUNK`, count as orientation 1 (Pillow's loader costs about a microsecond of Python an entry); XMP is
+  searched in its first `MAX_TEXT_CHUNK` bytes, up to `_XMP_DECOYS` `tiff:Orientation` that do not match; of the
+  Orientation tag, one value is unpacked, whatever its count; meanwhile Pillow's TIFF loader logs nothing (one
+  record an entry at debug level) and reads each tag's data at once (`_read_at_once`). The pool's decode still
+  orients by Pillow, and an orientation the probe read otherwise then fails its size check if it swaps the sides (a
+  400).
 """
 
 from __future__ import annotations
 
+import logging
 import re
 import struct
 import warnings
 import zlib
+from collections import deque
 from dataclasses import dataclass
 
-_XMP_ORIENTATION = re.compile(rb'tiff:Orientation(="|>)([0-9])')  # Pillow's getexif: on the `xmp` bytes
-_XMP_TEXT_ORIENTATION = re.compile(r'tiff:Orientation(="|>)([0-9])')  # and on the PNG `XML:com.adobe.xmp` text
+# Pillow's getexif finds `re.search(r'tiff:Orientation(="|>)([0-9])', xmp)`: the probe finds the tag with memchr and
+# reads what follows it (`_xmp_orientation`), on bytes (on text: the same match)
+_XMP_TAG = b"tiff:Orientation"
+_XMP_DECOYS = 64
 _TRANSPOSED = {o: o for o in range(2, 9)}  # exif_transpose's lookup: a value equal to one (a float or rational too)
 _SOF = frozenset({0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF})
 # JPEG markers Pillow's JpegImagePlugin knows (0xC0 to 0xFE; any other fails its open), and those it reads no length for
 _NO_LENGTH = frozenset({0xC8, *range(0xD0, 0xDA), *range(0xF0, 0xFE)})
+# Pillow's JPEG walk by the byte after an 0xFF: 0 a segment the probe skips by its length, 1 a byte skipped with the
+# 0xFF (0x00) or a marker without a length, 2 fill (0xFF), 3 a frame header, 4 APP1, 5 the start of scan, 6 no marker
+_JPEG_STEP = bytes(2 if m == 0xFF else 1 if m == 0 or m in _NO_LENGTH else 6 if m < 0xC0 else 5 if m == 0xDA else
+                   3 if m in _SOF else 4 if m == 0xE1 else 0 for m in range(256))
+_FILL = re.compile(rb"\xff+")  # a run of fill: one match, charged a marker a KiB (`_jpeg`)
+_U16 = struct.Struct(">H").unpack_from
+_U32 = struct.Struct(">I").unpack_from
+_U32LE = struct.Struct("<I").unpack_from
+# The most markers the probe walks before a JPEG's scan (module docstring): a file has tens, hundreds with an ICC
+# profile or XMP split over segments; each costs about 0.2 µs of Python
+MAX_JPEG_MARKERS = 2048
 # The most pixels an image may store (images.max_source_pixels' default and bound): Pillow's decompression-bomb bound
 # (2 x Image.MAX_IMAGE_PIXELS)
 MAX_SOURCE_PIXELS = 178_956_970
-# The most bytes one PNG zTXt or iTXt chunk may inflate to, and all of an image's text: Pillow's MAX_TEXT_CHUNK
-# (ImageFile.SAFEBLOCK, 1 MiB) and MAX_TEXT_MEMORY
+# The most bytes one PNG zTXt or iTXt chunk may inflate to: Pillow's MAX_TEXT_CHUNK (ImageFile.SAFEBLOCK, 1 MiB)
 MAX_TEXT_CHUNK = 1 << 20
-MAX_TEXT_MEMORY = 64 * MAX_TEXT_CHUNK
-# The most IFD0 entries the probe has Pillow read (module docstring): cameras write a few dozen; 1,000 take about 1 ms
-MAX_IFD0_ENTRIES = 1000
-_PNG_TEXT_KEYS = frozenset({b"exif", b"Raw profile type exif", b"XML:com.adobe.xmp"})  # the PNG text getexif reads
-_PNG_CHUNK = re.compile(rb"\w{4}")  # a chunk type Pillow reads on (PngImagePlugin's is_cid)
+# The PNG text work the probe does at most (module docstring), about a nanosecond a unit: a byte inflated, kept or
+# not (a stream zlib refuses counts the step it failed in); two a byte of a Raw profile's hex parsed; _DECODE_COST a
+# byte decoded beyond ASCII and a 32nd a byte checked for ASCII; _FED_COST a compressed byte fed to zlib (in pieces of
+# _TEXT_FEED: crafted deflate blocks cost zlib up to about 70 ns a byte); _TEXT_CHUNK_COST a chunk read; and, for what
+# the probe then does with a PNG's metadata, _ENTRY_COST an IFD0 entry loaded (and a sixteenth of the block), one and
+# a half a byte of XMP searched. Text of up to half Pillow's 1 MiB, or a compressed EXIF of tens of KiB, fits
+MAX_TEXT_WORK = 5 * MAX_TEXT_CHUNK // 2
+_FED_COST = 72
+_DECODE_COST = 3
+_TEXT_CHUNK_COST = 1 << 12
+_ENTRY_COST = 1 << 12  # an IFD0 entry Pillow's loader reads, from PNG text or eXIf (up to about 4 µs)
+_INFLATE_STEP = 1 << 14
+_TEXT_FEED = 1 << 12
+# The most IFD0 entries the probe has Pillow read (module docstring): cameras write a few dozen
+MAX_IFD0_ENTRIES = 256
+# The chunks the probe reads: 0 IEND, 1 eXIf, 2 text, 3 acTL, 4 fcTL, 5 the image data
+_PNG_KIND = {b"IEND": 0, b"eXIf": 1, b"tEXt": 2, b"zTXt": 2, b"iTXt": 2, b"acTL": 3, b"fcTL": 4, b"IDAT": 5,
+             b"fdAT": 5}
+# The text keys getexif reads, by a chunk's first byte: the key with its NUL and the value it sets (0 `exif`, 1 "Raw
+# profile type exif", 2 `XML:com.adobe.xmp`, 3 `xmp`, which an iTXt XMP packet sets too); and each key alone, which
+# tEXt and zTXt read as the key with an empty value
+_PNG_TEXT = {0x65: (b"exif\0", 0), 0x52: (b"Raw profile type exif\0", 1), 0x58: (b"XML:com.adobe.xmp\0", 2),
+             0x78: (b"xmp\0", 3)}
+_PNG_TEXT_KEYS = tuple(k for k, _ in _PNG_TEXT.values())
+_PNG_BARE_KEYS = {len(k) - 1: k[:-1] for k in _PNG_TEXT_KEYS}
 
 
 class ProbeError(ValueError):
@@ -104,36 +148,115 @@ def check_source_pixels(header: Header, limit: int = MAX_SOURCE_PIXELS) -> None:
 # -- the orientation: Pillow's getexif and exif_transpose -------------------------------------------------------------
 
 
-def orientation(info: dict[str, bytes | str]) -> int:
+def orientation(info) -> int:
     """The orientation Pillow 13's `ImageOps.exif_transpose` applies to an image whose info holds these entries, read
     as `Image.getexif` reads them: `exif` (else "Raw profile type exif", in hex) by Pillow's EXIF loader; when IFD0 has
     no Orientation tag, the XMP (`XML:com.adobe.xmp` when set, else `xmp`); then exif_transpose's lookup of 2..8, else
-    1. Also 1 when getexif raises (EXIF it cannot load: exif_transpose leaves the image as stored) and when IFD0 has
-    more than MAX_IFD0_ENTRIES entries (module docstring). When exif_transpose fails afterwards, rewriting the EXIF
-    once it has transposed (rare: crafted values), the pool serves the image as stored; reading that here would cost a
-    rewrite of every sub-IFD on the event loop, so an orientation of 5..8 there fails the pool's size check instead."""
-    from PIL import Image
+    1. Also 1 when getexif raises (EXIF it cannot load, or text where it expects bytes: exif_transpose leaves the
+    image as stored), and past the module docstring's bounds. `info` is a dict, or `_PngText`, which reads a value
+    when asked for it. When exif_transpose fails afterwards, rewriting the EXIF once it has transposed (rare: crafted
+    values), the pool serves the image as stored; reading that here would cost a rewrite of every sub-IFD on the
+    event loop, so an orientation of 5..8 there fails the pool's size check instead."""
+    from PIL import Image, ImageFile
 
+    charge = getattr(info, "charge", None)  # _PngText counts this work against MAX_TEXT_WORK
+    log = logging.getLogger("PIL.TiffImagePlugin")
+    quiet, safe_read = log.disabled, getattr(ImageFile, "_safe_read", None)
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")  # corrupt entries: the pool's decode warns, as vLLM's does
+            log.disabled = True  # its debug record an entry (module docstring)
             exif = info.get("exif")
-            if exif is None and "Raw profile type exif" in info:
-                exif = bytes.fromhex("".join(info["Raw profile type exif"].split("\n")[3:]))
+            if exif is None and (raw := info.get("Raw profile type exif")) is not None:
+                if len(raw) > MAX_TEXT_CHUNK:
+                    return 1
+                exif = _raw_profile(raw, charge)
             e = Image.Exif()
             if exif is not None:
-                if _ifd0_entries(exif) > MAX_IFD0_ENTRIES:
+                entries = _ifd0_entries(exif)
+                if entries > MAX_IFD0_ENTRIES:
                     return 1
+                if charge:
+                    charge(_ENTRY_COST * entries + len(exif) // 16)
+                if safe_read is not None:
+                    ImageFile._safe_read = _read_at_once
                 e.load(exif)
             if 0x0112 in e:
-                return _TRANSPOSED.get(e.get(0x0112, 1), 1)
-            xmp, pattern = info.get("XML:com.adobe.xmp"), _XMP_TEXT_ORIENTATION
-            if not xmp and (xmp := info.get("xmp")):
-                pattern = _XMP_ORIENTATION
-            m = pattern.search(xmp) if xmp else None
-            return _TRANSPOSED.get(int(m[2]), 1) if m else 1
+                return _TRANSPOSED.get(_orientation_tag(e), 1)
+            xmp = info.get("XML:com.adobe.xmp") or info.get("xmp")  # bytes: as getexif's match on the text
+            if xmp and charge:
+                charge(3 * min(len(xmp), MAX_TEXT_CHUNK) // 2)
+            return _xmp_orientation(xmp) if xmp else 1
+    except ProbeError:  # a bound of the module docstring, met reading the text
+        raise
     except Exception:
         return 1
+    finally:
+        log.disabled = quiet
+        if safe_read is not None:
+            ImageFile._safe_read = safe_read
+
+
+def _read_at_once(fp, size: int) -> bytes:
+    """Pillow's `ImageFile._safe_read` on the BytesIO that Exif.load reads: the same bytes and the same error, in one
+    read. Pillow's own reads a tag of more than a MiB in 1 MiB blocks and joins them, which on linux faults every block
+    in afresh (a 15 MiB tag: about 20 ms). Set only while the probe's Exif.load runs (`orientation`)."""
+    if size <= 0:
+        return b""
+    data = fp.read(size)
+    if len(data) < size:
+        raise OSError("Truncated File Read")
+    return data
+
+
+def _xmp_orientation(xmp: bytes) -> int:
+    """exif_transpose's lookup of getexif's first `tiff:Orientation(="|>)([0-9])` in an XMP packet: each
+    `tiff:Orientation` found by memchr in its first MAX_TEXT_CHUNK bytes, and what follows it; 1 after _XMP_DECOYS
+    that do not match (module docstring)."""
+    j = -len(_XMP_TAG)
+    for _ in range(_XMP_DECOYS):
+        j = xmp.find(_XMP_TAG, j + len(_XMP_TAG), MAX_TEXT_CHUNK)
+        if j < 0:
+            return 1
+        k = j + len(_XMP_TAG)
+        digit = xmp[k + 1:k + 2] if xmp[k:k + 1] == b">" else xmp[k + 2:k + 3] if xmp[k:k + 2] == b'="' else b""
+        if digit.isdigit():
+            return _TRANSPOSED.get(int(digit), 1)
+    return 1
+
+
+def _raw_profile(text: str, charge=None) -> bytes:
+    """getexif's `bytes.fromhex("".join(text.split("\\n")[3:]))`, without a list of the lines or a str.replace (slow
+    on text of many newlines): text other than ASCII is not hex, so a ValueError either way. `charge`: the hex parsed,
+    two units a character (`_PngText.charge`)."""
+    p = -1
+    for _ in range(3):
+        p = text.find("\n", p + 1)
+        if p < 0:
+            return b""
+    if charge:
+        charge(2 * (len(text) - p - 1))
+    if not text.isascii():
+        raise ValueError("a Raw profile's hex is ASCII")
+    return bytes.fromhex(text[p + 1:].encode("ascii").translate(None, b"\n").decode("ascii"))
+
+
+def _orientation_tag(e) -> object:
+    """IFD0's Orientation as `e.get(0x0112)` gives it, from one value of the tag's data instead of all of them (a
+    count filling the block would have Pillow unpack millions): BYTE, ASCII and UNDEFINED data loads as bytes or text,
+    never 2..8, so 1; of the other types, Pillow keeps a one-value tag's first value whatever the count
+    (`ImageFileDirectory_v2._setitem`), so the data cut to one unit gives the same. The tag's raw data is Pillow's
+    private `_tagdata`: without it, the public lookup of every value."""
+    ifd = getattr(e, "_info", None)
+    raw = getattr(ifd, "_tagdata", None)
+    if isinstance(raw, dict) and 0x0112 in raw:
+        typ = ifd.tagtype.get(0x0112)
+        if typ in (1, 2, 7):
+            return 1
+        unit = getattr(ifd, "_load_dispatch", {}).get(typ)
+        if unit is not None:
+            raw[0x0112] = raw[0x0112][:unit[0]]
+    return e.get(0x0112, 1)
 
 
 def _ifd0_entries(exif: bytes | str) -> int:
@@ -160,143 +283,305 @@ def _ifd0_entries(exif: bytes | str) -> int:
 def _jpeg(b: bytes | memoryview) -> Header:
     """Markers up to the start of scan, walked as Pillow's `JpegImageFile._open` walks them (a byte other than 0xFF
     skipped, 0xFFFF padding, 0xFF00 skipped, a segment's length below 2 read as 2): the first SOF's size, the APP1
-    Exif segments (concatenated, as Pillow's `exif`) and the last APP1 XMP segment (its `xmp`)."""
+    Exif segments (concatenated, as Pillow's `exif`) and the last APP1 XMP segment (its `xmp`). A run of stray bytes or
+    of fill is skipped at C speed (`bytes.find`, a regex match), and the walk takes at most MAX_JPEG_MARKERS (module
+    docstring), a fill run counting one a KiB."""
+    if not isinstance(b, bytes):
+        b = bytes(b)
     n = len(b)
+    last = n - 4  # the last offset at which a marker and its length fit
     i = 2
     size: tuple[int, int] | None = None
-    info: dict[str, bytes | str] = {}
-    exif: list[bytes] = []  # joined once: appending to one bytes object copies it each segment
-    while i + 2 <= n:
-        if b[i] != 0xFF:
-            i += 1
-            continue
-        marker = b[i + 1]
-        if marker == 0xFF:
-            i += 1
-            continue
-        if marker == 0x00:
-            i += 2
-            continue
-        if marker < 0xC0:
-            raise ProbeError("broken JPEG header: no marker found")
-        if marker in _NO_LENGTH:
-            i += 2
-            continue
-        if marker == 0xDA or i + 4 > n:
+    exif: list[tuple[int, int]] = []  # the Exif segments' data, joined once at the end
+    xmp: tuple[int, int] | None = None
+    step, u16, markers = _JPEG_STEP, _U16, 0
+    while i <= last:
+        markers += 1
+        if markers > MAX_JPEG_MARKERS:
+            raise ProbeError(f"broken JPEG header: more than {MAX_JPEG_MARKERS} markers before the scan")
+        if b[i] == 0xFF:
+            k = step[b[i + 1]]
+            if not k:  # a segment the probe does not read: the common case, kept short
+                (seg,) = u16(b, i + 2)
+                i += seg + 2 if seg > 1 else 4  # a length below 2 read as 2
+            elif k > 2:
+                if k == 5:
+                    break
+                if k == 6:
+                    raise ProbeError("broken JPEG header: no marker found")
+                (seg,) = u16(b, i + 2)
+                end = i + 2 + max(2, seg)
+                if k == 3:
+                    if size is None:
+                        if i + 9 > n:
+                            raise ProbeError("broken JPEG header: truncated SOF")
+                        h, w = struct.unpack_from(">HH", b, i + 5)
+                        size = (w, h)
+                elif b.startswith(b"Exif\x00\x00", i + 4, end):
+                    exif.append((i + 10 if exif else i + 4, min(end, n)))  # Pillow keeps the first one's prefix
+                elif b.startswith(b"http://ns.adobe.com/xap/1.0/\x00", i + 4, end):
+                    xmp = (i + 33, min(end, n))
+                i = end
+            elif k == 1:
+                i += 2
+            else:  # fill: scanned no further than the markers left allow, a KiB each
+                e = _FILL.match(b, i, i + ((MAX_JPEG_MARKERS - markers + 1) << 10)).end()
+                markers += (e - i) >> 10
+                if markers > MAX_JPEG_MARKERS:
+                    raise ProbeError(f"broken JPEG header: more than {MAX_JPEG_MARKERS} markers before the scan")
+                i = e - 1  # the run's last 0xFF starts the next marker
+        else:
+            i = b.find(b"\xff", i + 1)
+            if i < 0:
+                i = n
+    else:  # fewer than 4 bytes left: no segment's length fits, as Pillow's walk reads on to the end
+        while i + 2 <= n:
+            if b[i] != 0xFF:
+                i += 1
+                continue
+            k = step[b[i + 1]]
+            if k == 6:
+                raise ProbeError("broken JPEG header: no marker found")
+            if k == 2 or k == 1:
+                i += 3 - k
+                continue
             break
-        seg = max(2, struct.unpack_from(">H", b, i + 2)[0])
-        end = min(n, i + 2 + seg)
-        if marker in _SOF and size is None:
-            if i + 9 > n:
-                raise ProbeError("broken JPEG header: truncated SOF")
-            h, w = struct.unpack_from(">HH", b, i + 5)
-            size = (w, h)
-        elif marker == 0xE1:
-            s = bytes(b[i + 4:end])
-            if s.startswith(b"Exif\x00\x00"):
-                exif.append(s[6:] if exif else s)
-            elif s.startswith(b"http://ns.adobe.com/xap/1.0/\x00"):
-                info["xmp"] = s.split(b"\x00", 1)[1]
-        i += 2 + seg
     if size is None:
         raise ProbeError("broken JPEG header: no frame header before the scan")
     _check(*size, "JPEG")
+    info: dict[str, bytes] = {}
+    if xmp:
+        info["xmp"] = b[xmp[0]:xmp[1]]
     if exif:
-        info["exif"] = b"".join(exif)
+        view = memoryview(b)
+        exif[0] = (exif[0][0] + 6, exif[0][1])  # one copy, without the prefix Exif.load would strip by copying
+        block = b"".join(view[s:e] for s, e in exif)
+        info["exif"] = block if not block.startswith(b"Exif\x00\x00") else b"Exif\x00\x00" + block
     return Header("jpeg", size[0], size[1], orientation(info))
 
 
 def _png(b: bytes | memoryview) -> Header:
-    """IHDR, then every chunk header (the image data never decompressed) for the metadata Pillow puts in the image's
-    info: `eXIf` and the text chunks (`_png_text`). Pillow reads the chunks after the image data too when it applies
-    the orientation, and stops at a malformed chunk type, or, in an animated PNG, at the next frame's fcTL."""
+    """IHDR, then every chunk header (the image data never decompressed), noting the `eXIf` chunks and the text
+    chunks of the keys getexif reads (`_PngText` reads them when asked). Pillow reads the chunks after the image data
+    too when it applies the orientation, and stops at a malformed chunk type, or, in an animated PNG, at the next
+    frame's fcTL."""
+    if not isinstance(b, bytes):
+        b = bytes(b)
     n = len(b)
-    if n < 33 or bytes(b[12:16]) != b"IHDR":
+    if n < 33 or b[12:16] != b"IHDR":
         raise ProbeError("broken PNG header: no IHDR")
     w, h = struct.unpack_from(">II", b, 16)
     _check(w, h, "PNG")
-    info: dict[str, bytes | str] = {}
-    text = 0  # the text read, which Pillow bounds by MAX_TEXT_MEMORY
+    found = _PngText(b)
+    chunks = found.chunks
     frames: int | None = None  # acTL's frame count (Pillow's im_n_frames: a second acTL clears it)
     fctl = False  # a fcTL before the image data: it is the first frame, not a default image
     animated: bool | None = None  # decided at the image data, as Pillow decides it at open
+    kinds, u32, keys, bare, text = _PNG_KIND, _U32, _PNG_TEXT_KEYS, _PNG_BARE_KEYS, _PNG_TEXT
     i = 8
     while i + 8 <= n:
-        length = struct.unpack_from(">I", b, i)[0]
-        kind = bytes(b[i + 4:i + 8])
-        if kind == b"IEND" or not _PNG_CHUNK.fullmatch(kind) or (kind == b"fcTL" and animated):
+        (length,) = u32(b, i)
+        kind = b[i + 4:i + 8]
+        t = kinds.get(kind)
+        if t is None:  # a chunk the probe does not read; a malformed type ends Pillow's walk (its is_cid: \w{4})
+            if not kind.isalnum() and not kind.replace(b"_", b"a").isalnum():
+                break
+        elif t == 2:
+            p = i + 8
+            if b.startswith(keys, p, p + length) or (length in bare and b[p:p + length] == bare[length]):
+                key, which = text[b[p]]
+                m = p + len(key)  # the compression method, when the chunk holds one
+                if kind == b"zTXt" and length > len(key) and m < n and b[m]:
+                    raise ProbeError(f"unknown compression method {b[m]} in a PNG zTXt chunk")  # Pillow's
+                chunks[which].append(i)
+        elif t == 1:
+            chunks[0].append(i)
+        elif not t:
             break
-        if kind == b"eXIf":
-            info["exif"] = b"Exif\x00\x00" + bytes(b[i + 8:i + 8 + length])
-        elif kind in (b"tEXt", b"zTXt", b"iTXt"):
-            text += _png_text(info, kind, bytes(b[i + 8:i + 8 + length]))
-            if text > MAX_TEXT_MEMORY:
-                raise ProbeError(f"PNG text chunks hold more than {MAX_TEXT_MEMORY >> 20} MiB")
         elif animated is None:
-            if kind == b"acTL" and length >= 8 and i + 12 <= n:
-                count = struct.unpack_from(">I", b, i + 8)[0]
-                frames = None if frames is not None else count if 0 < count <= 0x80000000 else None
-            elif kind == b"fcTL":
+            if t == 3:
+                if length >= 8 and i + 12 <= n:
+                    (count,) = u32(b, i + 8)
+                    frames = None if frames is not None else count if 0 < count <= 0x80000000 else None
+            elif t == 4:
                 fctl = True
-            elif kind in (b"IDAT", b"fdAT"):  # the image data (Pillow takes a first fdAT as it)
+            else:  # the image data (Pillow takes a first fdAT as it)
                 animated = frames is not None and frames + (not fctl) > 1
+        elif t == 4 and animated:
+            break
         i += 12 + length
-    return Header("png", w, h, orientation(info))
+    return Header("png", w, h, orientation(found))
 
 
-def _png_text(info: dict[str, bytes | str], kind: bytes, s: bytes) -> int:
-    """Pillow's tEXt, zTXt and iTXt handlers (`PngStream.chunk_*`) for the keys getexif reads: what each puts in
-    `info`, and the length of the text it counts against MAX_TEXT_MEMORY. tEXt keeps the key `exif` as bytes; zTXt
-    keeps the text of a stream zlib cannot inflate as ""; iTXt keeps nothing then, nor for another compression
-    method or a text that is not UTF-8, but records an `XML:com.adobe.xmp` packet as `xmp` before that check."""
-    if kind != b"iTXt":
-        k, _, v = s.partition(b"\0")
-        if k not in _PNG_TEXT_KEYS:
-            return 0
-        if kind == b"zTXt":
-            if v and v[0] != 0:
-                raise ProbeError(f"unknown compression method {v[0]} in a PNG zTXt chunk")  # as Pillow refuses it
+class _PngText:
+    """A PNG's metadata as Pillow's chunk handlers leave it in the image's info (`PngStream.chunk_eXIf`, `chunk_tEXt`,
+    `chunk_zTXt`, `chunk_iTXt`), read for a key when `orientation` asks for it: from the key's last chunk back, as the
+    last chunk that sets a value wins. `exif` comes as bytes (eXIf, tEXt), or as "" for text (zTXt, iTXt: getexif
+    then raises); "Raw profile type exif" as text; `XML:com.adobe.xmp` and `xmp` as bytes, whose XMP match is the
+    text's. tEXt and zTXt always set their value (zTXt: "" for a stream zlib refuses); iTXt sets nothing for another
+    compression method, a stream zlib refuses or a text that is not UTF-8, but records an XMP packet as `xmp` before
+    that check. Within MAX_TEXT_WORK (module docstring); the chunks noted per key are the last that the bound lets it
+    read."""
+
+    def __init__(self, b: bytes) -> None:
+        self.b = b
+        n = MAX_TEXT_WORK // _TEXT_CHUNK_COST + 1  # more would pass the bound before the first is reached
+        self.chunks: tuple[deque[int], ...] = tuple(deque(maxlen=n) for _ in range(4))
+        self.work = 0
+        self.values: dict[str, object] = {}
+        self.read: dict[int, tuple[bytes, bytes]] = {}
+        self.itxt: dict[int, tuple[bytes, bytes, bytes] | None] = {}
+
+    def get(self, key: str, default: object = None) -> object:
+        if key not in self.values:
+            self.values[key] = {"exif": self._exif, "Raw profile type exif": self._raw,
+                                "XML:com.adobe.xmp": self._xml, "xmp": self._xmp}[key]()
+        v = self.values[key]
+        return default if v is None else v
+
+    def _exif(self) -> bytes | str | None:
+        for i in reversed(self.chunks[0]):
+            kind, v = self._chunk(i)
+            if kind == b"eXIf":  # Pillow's info holds `Exif\0\0` + v, and Exif.load strips one or two prefixes
+                return v if not v.startswith(b"Exif\x00\x00") else b"Exif\x00\x00" + v
+            if kind == b"tEXt":
+                return v
+            if kind == b"zTXt":
+                self._inflate(v[1:])  # its text, whatever it holds: as Pillow refuses past MAX_TEXT_CHUNK
+                return ""
+            if (parts := self._itxt_parts(i)) is not None and self._utf8(*parts):
+                return ""
+        return None
+
+    def _raw(self) -> str | None:
+        for i in reversed(self.chunks[1]):
+            kind, v = self._chunk(i)
+            if kind == b"tEXt":
+                return v.decode("latin-1")
+            if kind == b"zTXt":
+                return (self._inflate(v[1:]) or b"").decode("latin-1")
+            if (parts := self._itxt_parts(i)) is not None and self._utf8(*parts[:2]):
+                self._spend(len(parts[2]) >> 5)
+                if not parts[2].isascii():
+                    self._spend(_DECODE_COST * len(parts[2]))
+                try:
+                    return parts[2].decode("utf-8")  # decoded once: the text getexif reads
+                except UnicodeError:
+                    continue
+        return None
+
+    def _xml(self) -> bytes | None:
+        chunks = self.chunks[2]
+        for k in range(len(chunks) - 1, -1, -1):
+            kind, v = self._chunk(chunks[k])
+            if kind == b"tEXt":
+                return v
+            if kind == b"zTXt":
+                return self._inflate(v[1:]) or b""
+            parts = self._itxt_parts(chunks[k])
+            if parts is None:
+                continue
+            if k == 0 and self.get("xmp") is parts[2]:
+                return parts[2]  # the first XMP chunk, and the last that inflates: valid or not, getexif matches it
+            if self._utf8(*parts):
+                return parts[2]
+        return None
+
+    def _xmp(self) -> bytes | str | None:
+        """An iTXt XMP packet's bytes, or the text of a chunk keyed `xmp` (getexif's bytes match then raises: 1)."""
+        xml = set(self.chunks[2])
+        for i in sorted(xml.union(self.chunks[3]), reverse=True):
+            kind, v = self._chunk(i)
+            if i in xml:
+                if kind == b"iTXt" and (parts := self._itxt_parts(i)) is not None:
+                    return parts[2]
+            elif kind == b"tEXt":
+                return v.decode("latin-1")
+            elif kind == b"zTXt":
+                return (self._inflate(v[1:]) or b"").decode("latin-1")
+            elif (parts := self._itxt_parts(i)) is not None and self._utf8(*parts):
+                return ""
+        return None
+
+    def _chunk(self, i: int) -> tuple[bytes, bytes]:
+        """The chunk at `i`: its type and its data (a text chunk's after its key's NUL), counted once."""
+        if i not in self.read:
+            self._spend(_TEXT_CHUNK_COST)
+            b = self.b
+            (length,) = _U32(b, i)
+            kind = b[i + 4:i + 8]
+            key = 0 if kind == b"eXIf" else len(_PNG_TEXT[b[i + 8]][0])
+            self.read[i] = (kind, b[i + 8 + key:i + 8 + length])
+        return self.read[i]
+
+    def _itxt_parts(self, i: int) -> tuple[bytes, bytes, bytes] | None:
+        """An iTXt chunk's language, translated key and text (inflated), or None when Pillow sets nothing before its
+        UTF-8 check; read once."""
+        if i not in self.itxt:
+            kind, r = self.read[i]
+            parts = None
+            j = r.find(b"\0", 2)  # Pillow's r[2:].split(b"\0", 2), with memchr
+            k = r.find(b"\0", j + 1) if j >= 0 else -1
+            if kind == b"iTXt" and k >= 0:
+                v: bytes | None = r[k + 1:]
+                if r[0]:
+                    v = self._inflate(v) if r[1] == 0 else None
+                if v is not None:
+                    parts = (r[2:j], r[j + 1:k], v)
+            self.itxt[i] = parts
+        return self.itxt[i]
+
+    def _utf8(self, *texts: bytes) -> bool:
+        """Whether each is UTF-8, as Pillow's strict decode reads it: ASCII at once, other text counted as work."""
+        for x in texts:
+            self._spend(len(x) >> 5)
+            if not x.isascii():
+                self._spend(_DECODE_COST * len(x))
+                try:
+                    x.decode("utf-8")
+                except UnicodeError:
+                    return False
+        return True
+
+    def _inflate(self, data: bytes) -> bytes | None:
+        """Pillow's `_safe_zlib_decompress`: at most MAX_TEXT_CHUNK bytes (a `ProbeError` past them), None for a
+        stream zlib refuses; the input fed in pieces and the output taken in steps, each counted (module docstring)."""
+        d = zlib.decompressobj()
+        parts: list[bytes] = []
+        out = pos = 0
+        tail = b""
+        while not d.eof:
+            if not tail and pos < len(data):
+                tail = data[pos:pos + _TEXT_FEED]
+                pos += len(tail)
+                self._spend(_FED_COST * len(tail))
+            fed = not tail and pos >= len(data)  # zlib holds the whole input, and may still owe output
+            if fed and out >= MAX_TEXT_CHUNK:
+                break  # Pillow's one call ends there too, with no input left over: no error
+            room = min(_INFLATE_STEP, MAX_TEXT_CHUNK - out) or 1  # past the cap, a byte more is Pillow's error
             try:
-                v = _inflate(v[1:])
+                part = d.decompress(tail, room)
             except zlib.error:
-                v = b""
-        text = v.decode("latin-1")
-        info[k.decode("latin-1")] = v if kind == b"tEXt" and k == b"exif" else text
-        return len(text)
-    k, sep, r = s.partition(b"\0")
-    if not sep or len(r) < 2 or k not in _PNG_TEXT_KEYS:
-        return 0
-    compressed, method, r = r[0], r[1], r[2:]
-    parts = r.split(b"\0", 2)
-    if len(parts) < 3:
-        return 0
-    lang, translated, v = parts
-    if compressed:
-        if method != 0:
-            return 0
-        try:
-            v = _inflate(v)
-        except zlib.error:
-            return 0
-    if k == b"XML:com.adobe.xmp":
-        info["xmp"] = v
-    try:
-        lang.decode("utf-8")
-        translated.decode("utf-8")
-        text = v.decode("utf-8")
-    except UnicodeError:
-        return 0
-    info[k.decode("latin-1")] = text
-    return len(text)
+                self._spend(room)
+                return None
+            self._spend(len(part))
+            out += len(part)
+            if out > MAX_TEXT_CHUNK:
+                raise ProbeError(f"a PNG text chunk inflates past {MAX_TEXT_CHUNK >> 20} MiB")
+            parts.append(part)
+            tail = d.unconsumed_tail
+            if fed and not part:
+                break
+        return b"".join(parts)
 
+    def charge(self, n: int) -> None:
+        """Work `orientation` does with these values (loading the EXIF, searching the XMP), counted as text work."""
+        self._spend(n)
 
-def _inflate(data: bytes) -> bytes:
-    """Pillow's `_safe_zlib_decompress`: at most MAX_TEXT_CHUNK bytes, and a `ProbeError` past them."""
-    d = zlib.decompressobj()
-    out = d.decompress(data, MAX_TEXT_CHUNK)
-    if d.unconsumed_tail:
-        raise ProbeError(f"a PNG text chunk inflates past {MAX_TEXT_CHUNK >> 20} MiB")
-    return out
+    def _spend(self, n: int) -> None:
+        self.work += n
+        if self.work > MAX_TEXT_WORK:
+            raise ProbeError("PNG text takes more work to read than the probe's bound (MAX_TEXT_WORK)")
 
 
 def _gif(b: bytes | memoryview) -> Header:
@@ -311,24 +596,25 @@ def _webp(b: bytes | memoryview) -> Header:
     """The canvas of a VP8X file, else the VP8 or VP8L frame size, within the RIFF's size. Metadata as libwebp's
     demuxer gives it to Pillow: only in a VP8X file (its first chunk), the first EXIF and XMP chunks its flags declare
     (an empty one counts as none)."""
+    if not isinstance(b, bytes):
+        b = bytes(b)
     n = min(len(b), 8 + struct.unpack_from("<I", b, 4)[0])  # libwebp reads no further than the RIFF's size
     i = 12
     size: tuple[int, int] | None = None
-    flags = 0
-    info: dict[str, bytes | str] = {}
+    flags = b[20] if n >= 30 and b[12:16] == b"VP8X" else 0  # the first chunk's
+    info: dict[str, bytes] = {}
     seen: set[bytes] = set()
+    u32 = _U32LE
     while i + 8 <= n:
-        kind = bytes(b[i:i + 4])
-        length = struct.unpack_from("<I", b, i + 4)[0]
+        kind = b[i:i + 4]
+        (length,) = u32(b, i + 4)
         d = i + 8
         if kind == b"VP8X" and d + 10 <= n:
             w = 1 + (b[d + 4] | b[d + 5] << 8 | b[d + 6] << 16)
             h = 1 + (b[d + 7] | b[d + 8] << 8 | b[d + 9] << 16)
             size = (w, h)
-            if i == 12:
-                flags = b[d]
         elif kind == b"VP8 " and size is None and d + 10 <= n:
-            if bytes(b[d + 3:d + 6]) != b"\x9d\x01\x2a":
+            if b[d + 3:d + 6] != b"\x9d\x01\x2a":
                 raise ProbeError("broken WebP header: no VP8 start code")
             w, h = struct.unpack_from("<HH", b, d + 6)
             size = (w & 0x3FFF, h & 0x3FFF)
@@ -340,7 +626,7 @@ def _webp(b: bytes | memoryview) -> Header:
         elif kind in (b"EXIF", b"XMP ") and kind not in seen and flags & (0x08 if kind == b"EXIF" else 0x04):
             seen.add(kind)
             if length:
-                info["exif" if kind == b"EXIF" else "xmp"] = bytes(b[d:d + length])
+                info["exif" if kind == b"EXIF" else "xmp"] = b[d:d + length]
         i = d + length + (length & 1)
     if size is None:
         raise ProbeError("broken WebP header: no VP8, VP8L or VP8X chunk")

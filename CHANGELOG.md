@@ -14,8 +14,9 @@ Changed:
 
 Fixed:
 - An image's orientation is the one Pillow's `ImageOps.exif_transpose` applies, read by Pillow's own EXIF loader. An EXIF block behind two `Exif\0\0` prefixes is read: a JPEG was served as stored, and a PNG or WebP at orientations 5 to 8 got a 400. EXIF that Pillow cannot load leaves the image as stored even beside an XMP orientation: a JPEG was turned by the XMP's value, and a PNG at orientations 5 to 8 got a 400.
-- A WebP's EXIF and XMP count only where Pillow reads them, in a VP8X file whose flags declare them, the first chunk of each. A PNG's text chunks count by Pillow's rules for each key, up to where Pillow stops reading, and a PNG with more than 64 MiB of text that the server reads is refused before it is decoded, as Pillow refuses it.
-- An image whose EXIF holds more than 1,000 IFD0 entries is sized as stored, without reading them on the event loop; its decode still applies Pillow's orientation, so at 5 to 8 the request gets a 400.
+- A WebP's EXIF and XMP count only where Pillow reads them, in a VP8X file whose flags declare them, the first chunk of each. A PNG's text chunks count by Pillow's rules for each key, up to where Pillow stops reading.
+- An image whose EXIF holds more than 256 IFD0 entries is sized as stored, without reading them on the event loop; its decode still applies Pillow's orientation, so at 5 to 8 the request gets a 400.
+- The header probe bounds its work on crafted images, where Pillow reads on. A JPEG with more than 2,048 markers before its scan (a run of stray bytes counts as one, a run of fill one a KiB) gets a 400, and so does a PNG whose metadata text takes more than the probe's bound to read (bytes inflated or decoded, compressed bytes counted more). A "Raw profile type exif" text longer than 1 MiB is sized as stored, and an XMP packet's orientation is read in its first MiB, past at most 64 `tiff:Orientation` that do not match; at 5 to 8 those get a 400.
 
 ## 0.8.0
 
