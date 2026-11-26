@@ -1326,6 +1326,19 @@ def test_jpeg_decodes_to_the_old_decoders_pixels() -> None:
         assert hashlib.sha256(got.tobytes()).hexdigest() == pixels, name
 
 
+def test_the_decode_packs_pillows_pixels_as_tobytes_does() -> None:
+    """The decode's tensor is Pillow's own bytes, packed straight into one writable buffer: equal to `np.asarray` at
+    1 x 1, a single row and column, odd sizes and rows wider than one of the encoder's chunks."""
+    from llm_mini_infer.vision.family import _rgb
+
+    rng = np.random.default_rng(5)
+    for w, h in ((1, 1), (1, 7), (9, 1), (37, 23), (20000, 3), (3, 20000), (641, 479)):
+        im = Image.fromarray(rng.integers(0, 256, (h, w, 3), dtype=np.uint8), "RGB")
+        got = _rgb(im, torch)
+        assert got.shape == (h, w, 3) and np.array_equal(got.numpy(), np.asarray(im)), (w, h)
+        got[0, 0, 0] = 7  # writable: its own buffer
+
+
 def test_the_resize_is_torchvisions_call_for_call() -> None:
     """`resize_bicubic`, on torch alone, equals torchvision's uint8 antialiased bicubic resize (the dev group keeps
     torchvision for the reference tests): up and down, odd sizes, an unchanged size, on the decode's channels-last view

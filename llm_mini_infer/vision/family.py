@@ -126,6 +126,8 @@ def load(model_dir: str | Path, *, min_pixels: int | None = None, max_pixels: in
 
 # -- the pool's exact CPU path, shared by the families ----------------------------------------------------------------
 
+_TRANSPOSED = frozenset(range(2, 9))  # the orientations exif_transpose's lookup transposes
+
 
 def decode_rgb(data: bytes, header: Header) -> Any:
     """The image as vLLM hands it to HF's processors, uint8 [3, H, W] after the orientation: through Pillow, opened as
@@ -149,18 +151,41 @@ def decode_rgb(data: bytes, header: Header) -> Any:
                          f"{header.width}x{header.height}")
     im.load()  # the pixels first, so that only the EXIF's errors are suppressed: a truncated image still fails
     with contextlib.suppress(Exception):  # a broken EXIF leaves the image as stored
-        im = ImageOps.exif_transpose(im)
+        if im.getexif().get(0x0112, 1) in _TRANSPOSED:  # else exif_transpose only copies the image (its cached EXIF)
+            im = ImageOps.exif_transpose(im)
     if im.mode in ("RGBA", "LA", "PA") or "transparency" in im.info:
         rgba = im if im.mode == "RGBA" else im.convert("RGBA")  # pasted onto white, as vLLM does
         im = Image.new("RGB", rgba.size, (255, 255, 255))
         im.paste(rgba, mask=rgba.getchannel("A"))
     elif im.mode != "RGB":
         im = im.convert("RGB")
-    img = torch.from_numpy(np.asarray(im).copy()).permute(2, 0, 1)
+    img = _rgb(im, torch).permute(2, 0, 1)
     if tuple(img.shape[1:]) != (header.oriented[1], header.oriented[0]):
         raise ProbeError(f"the decoded image is {img.shape[2]}x{img.shape[1]}, but its header says "
                          f"{header.oriented[0]}x{header.oriented[1]}")
     return img
+
+
+def _rgb(im: Any, torch: Any) -> Any:
+    """An RGB image's pixels as uint8 [H, W, 3] over one writable buffer that Pillow's raw encoder packs into, chunk by
+    chunk, as `tobytes` runs it, without `tobytes`' join of the chunks and a copy for torch: at 12 megapixels each is
+    36 MB more to copy and, on linux, to fault in. `_getencoder` is Pillow's private name for it, at the stack's pinned
+    Pillow (the JPEG digests and HF's pixel tests read its bytes)."""
+    from PIL import Image
+
+    enc = Image._getencoder("RGB", "raw", "RGB")
+    enc.setimage(im.im, (0, 0, *im.size))
+    buf = bytearray(3 * im.width * im.height)
+    view, pos, step = memoryview(buf), 0, max(1 << 16, 4 * im.width)  # tobytes' chunk size
+    while True:
+        _, status, chunk = enc.encode(step)
+        view[pos:pos + len(chunk)] = chunk
+        pos += len(chunk)
+        if status:
+            break
+    if status < 0 or pos != len(buf):
+        raise RuntimeError(f"Pillow's raw encoder: status {status}, {pos} of {len(buf)} bytes")
+    return torch.frombuffer(buf, dtype=torch.uint8).view(im.height, im.width, 3)
 
 
 def resize_bicubic(img: Any, height: int, width: int) -> Any:
