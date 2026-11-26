@@ -12,8 +12,6 @@ they are exactly that: the BF16 op, then `fp8.quant_ref`.
 
 from __future__ import annotations
 
-from typing import Any
-
 import torch
 import torch.nn.functional as F
 
@@ -233,7 +231,3 @@ def attention_ref(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, qpos: torch
     o = F.scaled_dot_product_attention(q.transpose(0, 1)[None], k.transpose(0, 1)[None], v.transpose(0, 1)[None],
                                        attn_mask=mask, scale=1.0, enable_gqa=True)
     return o[0].transpose(0, 1)
-
-
-def lib() -> Any:
-    return build.load()

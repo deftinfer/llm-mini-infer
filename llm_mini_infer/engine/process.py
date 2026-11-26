@@ -241,10 +241,7 @@ class EngineLoop:
                                                         grammar_forced_requests=s.forced_requests,
                                                         grammar_forced_tokens=s.forced_tokens,
                                                         grammar_eos_free=[int(x) for x in s.eos_free],
-                                                        grammar_eos_free_gated=s.eos_free_gated,
-                                                        spec_first_rejections=[int(x) for x in s.first_rejections],
-                                                        spec_window_mask_counts=[int(x) for x in s.window_masks],
-                                                        spec_window_mask_sum=s.window_masks_sum)))
+                                                        grammar_eos_free_gated=s.eos_free_gated)))
 
     def _emit(self, report: StepReport) -> None:
         """The outputs of a step, sent from inside the turn (before the next step's masks; `EngineCore.step`)."""

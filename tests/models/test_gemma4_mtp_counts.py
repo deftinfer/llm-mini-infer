@@ -49,14 +49,13 @@ def run(pair, k: int, reqs: list[dict], oracle=None, rng=None, masks=None, **kw)
 
 
 def recount_masks(r: Run, seen: dict[str, int]) -> None:
-    """The verify-mask counters recounted from each step's plan and results (`Scheduler.process` wrapped), apart from
-    the scheduler's window tables: `seen["read"]`, the masks verification read (one a sample: `n_out` on each live
-    MASKED verify row); `seen["lowered"]`, such rows at a count below k; `seen["rejected"]`, their first rejected
-    drafts (among the v the step verified, one that differs from the target's sample there), from the drafts the
-    slot's last SAMPLE row made. No row samples more than its step's 1 + v."""
+    """What the live MASKED verify rows did, from each step's plan and results (`Scheduler.process` wrapped):
+    `seen["lowered"]`, such rows at a count below k; `seen["rejected"]`, their first rejected drafts (among the v the
+    step verified, one that differs from the target's sample there), from the drafts the slot's last SAMPLE row made.
+    No row samples more than its step's 1 + v."""
     s, process = r.sched, r.sched.process
     made: dict[int, np.ndarray] = {}
-    seen.update(read=0, lowered=0, rejected=0)
+    seen.update(lowered=0, rejected=0)
 
     def counted(inf, tokens, n_out, gpu_busy_ns, status=None, drafts=None, *a, **kw):
         v = r.k if inf.v < 0 else inf.v
@@ -68,7 +67,6 @@ def recount_masks(r: Run, seen: dict[str, int]) -> None:
         for i in np.flatnonzero(live & inf.device & masked).tolist():
             assert n[i] <= 1 + v, (v, int(n[i]))
             acc, d = int(n[i]) - 1, made.get(int(inf.slots[i]))
-            seen["read"] += acc + 1
             seen["lowered"] += v < r.k
             seen["rejected"] += acc < v and d is not None and d[acc] != toks[i, acc]
         out = process(inf, tokens, n_out, gpu_busy_ns, status, drafts, *a, **kw)
@@ -146,10 +144,9 @@ def test_masked_outputs_equal_under_a_schedule_of_counts(pair, params) -> None:
                 draft_counts=COUNTS if k else (), count_schedule=schedule)
         s = r.sched
         assert s.grammars.errors == 0
-        if k:  # the counters count what each step verified at its count (`Scheduler._rejections`)
+        if k:  # masked verify rows ran at a count below k, and some had a draft rejected
             exercised(r, schedule)
-            assert seen["lowered"] and seen["rejected"] and s.window_masks_sum > 0, seen
-            assert (s.window_masks.sum(), s.first_rejections.sum()) == (seen["read"], seen["rejected"]), seen
+            assert seen["lowered"] and seen["rejected"], seen
         outs.append((r.out, r.finish))
     assert all(o == outs[0] for o in outs[1:])
     assert outs[0][1][0] == FinishReason.STOP and outs[0][0][0][-1] == EOS

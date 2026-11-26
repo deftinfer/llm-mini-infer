@@ -295,10 +295,9 @@ class DevCacheConfig(_Group):
 
 class DevSpeculativeConfig(_Group):
     # The drafter's LM head (runner/cuda/draft_head.py): the tokens it scores, ranked from the tokens the server emits
-    # (0: the whole vocabulary), and its weights' dtype (fp8: a block-FP8 copy of its rows). Drafts change acceptance
-    # and, where outputs depend on the batch, their rounding. Default: derived (below)
+    # (0: the whole vocabulary). Drafts change acceptance and, where outputs depend on the batch, their rounding.
+    # Default: derived (below)
     draft_vocab: int | None = None
-    draft_head_dtype: Literal["auto", "bfloat16", "fp8"] = "auto"
     # The grammar-universe draft head (architecture.md, "Grammar-aware heads"): on the steps the sparse head could
     # serve, with it on or off, the drafter scores only the union of every such step's masks. Default: on with drafts
     # and structured output
@@ -381,7 +380,7 @@ class DevCudaConfig(_Group):
     decode_buckets: list[int] | None = None
     token_buckets: list[int] | None = None  # token counts with a breakable graph (default: default_token_buckets)
     vision_buckets: list[int] | None = None  # patch counts with a vision-tower graph ([]: eager; default: derived)
-    fp8_gemm: Literal["auto", "cutlass", "sglang", "flashinfer", "torch"] = "auto"  # block-FP8 GEMMs (kernels.fp8)
+    fp8_gemm: Literal["auto", "cutlass", "sglang", "torch"] = "auto"  # block-FP8 GEMMs (kernels.fp8)
     # The grammar-sparse head (architecture.md, "Grammar-aware heads"): on a step whose every sample token has a
     # grammar mask, the target's head scores only the union of the step's masks; other steps (a row without a mask, a
     # union over sparse_head_rows) take the dense head. Default: on with structured output
@@ -406,13 +405,6 @@ class DevCudaConfig(_Group):
     # block-FP8 checkpoint while model.max_model_len is at most 32,768 (QWEN_INVARIANT_MAX_LEN), when the token
     # budget, the chunk cap and dev.cache.page_size allow it (`_invariance_blocked`)
     batch_invariant: bool | None = None
-    # With batch invariance, the full layers' prefill split (architecture.md, "Batch invariance"): a prefill query with
-    # more keys than this splits them by a size from its position. Default: 8,192 (`kernels.attn512.PREFILL_FROM`); at
-    # model.max_model_len or more no query splits (for measurements). Gemma 4: a query takes its keys whole up to the
-    # larger of this and 16,384 (`kernels.attn512.PREFILL_KEYS`, the split size past it), so a value below 16,384
-    # changes nothing. Qwen3.8: the keys split in 2,048-key splits (`kernels.attn_window.FULL_PREFILL_KEYS`) from this
-    # value up, so at least 2,048. At most 2**31 - 1 (a 32-bit int in our kernels)
-    prefill_split_from: int | None = None
 
 
 class DevRunnerConfig(_Group):
@@ -513,10 +505,36 @@ def _moved(data: dict[str, Any], prefix: str = "") -> list[str]:
     return out
 
 
+# Dev settings, and values of one, removed after 0.8.0 (CHANGELOG.md): (the dotted name, the value refused or None for
+# any) and what holds now. A file or an override that sets one, in the dev group or outside it (where `_moved` no
+# longer knows it), is refused naming it, before the schema's own message
+RETIRED: dict[tuple[str, str | None], str] = {
+    ("dev.speculative.draft_head_dtype", None): "the drafter's head is in the model dtype, dev.runner.cuda.dtype's: on "
+                                                "Gemma 4 the assistant's own head, on Qwen3.8 the target's",
+    ("dev.runner.cuda.prefill_split_from", None): "the full layers' prefill split starts at the kernels' threshold, "
+                                                  "kernels.attn512.PREFILL_FROM",
+    ("dev.runner.cuda.fp8_gemm", "flashinfer"): "the FP8 GEMMs take auto, cutlass, sglang or torch",
+}
+
+
+def _retired(data: dict[str, Any]) -> list[str]:
+    """The removed dev settings and values (`RETIRED`) a file or override sets, each with what holds now."""
+    out = []
+    for (name, value), now in RETIRED.items():
+        for given in (name, name.removeprefix("dev.")):
+            *parents, leaf = given.split(".")
+            node: Any = data
+            for p in parents:
+                node = node.get(p) if isinstance(node, dict) else None
+            if isinstance(node, dict) and leaf in node and value in (None, node[leaf]):
+                out.append(f"{given}{'' if value is None else ' ' + value}: removed after 0.8.0 ({now})")
+    return out
+
+
 def load(path: str | None, overrides: dict[str, Any]) -> Config:
     """YAML file, then dotted overrides (`scheduler.max_num_seqs: 128`), validated against the schema. The state
     fields are refused (a value there would be used as given, or overwritten), and so are dev settings given outside
-    the dev group, naming where they go."""
+    the dev group, naming where they go, and dev settings or values removed after 0.8.0, naming what holds now."""
     data: dict[str, Any] = {}
     if path:
         try:
@@ -542,6 +560,9 @@ def load(path: str | None, overrides: dict[str, Any]) -> Config:
     if moved:
         raise ValueError(f"invalid configuration: {', '.join(moved)}: dev settings (tests, benchmarks, A/B runs; a "
                          f"deployment takes their defaults): set {', '.join('dev.' + k for k in moved)}")
+    retired = _retired(data)
+    if retired:
+        raise ValueError(f"invalid configuration: {'; '.join(retired)}")
     try:
         return msgspec.convert(data, Config)
     except msgspec.ValidationError as exc:
@@ -689,9 +710,6 @@ def derive(cfg: Config) -> Config:
             "0: the whole vocabulary (the assistant's own narrow head; a ranked one costs acceptance on Gemma 4)"
             if assistant and sp.num_speculative_tokens else
             "0: the whole vocabulary (no MTP, or a vocabulary under 4 x 32,768)")
-    if dsp.draft_head_dtype == "auto":
-        dsp.draft_head_dtype = "bfloat16"
-        reasons["dev.speculative.draft_head_dtype"] = "the target head's dtype (an FP8 copy costs acceptance)"
     # A set refine piece, before the engine loads any weight (the scheduler checks its grid too)
     piece = cfg.dev.cache.refine_chunk_tokens
     if piece is not None and not 0 < piece <= sc.max_num_batched_tokens:
@@ -1065,19 +1083,6 @@ def _derive_kernels(cfg: Config, hf: dict[str, Any], reasons: dict[str, str]) ->
         raise ValueError("dev.runner.cuda.always_split: needs structured output (its graphs are the grammar masks' "
                          "split)")
     _derive_batch_invariance(cfg, hf, gemma, reasons)
-    if o.prefill_split_from is not None and (o.prefill_split_from < 1 or not o.batch_invariant):
-        raise ValueError(f"dev.runner.cuda.prefill_split_from {o.prefill_split_from}: at least 1, with "
-                         "dev.runner.cuda.batch_invariant on (the split is its kernels')")
-    if o.prefill_split_from is not None and o.prefill_split_from > 2**31 - 1:
-        raise ValueError(f"dev.runner.cuda.prefill_split_from {o.prefill_split_from}: at most {2**31 - 1:,} (our "
-                         "kernels take it as a 32-bit int)")
-    if o.prefill_split_from is not None and not gemma:
-        from .kernels.attn_window import FULL_PREFILL_KEYS
-
-        if o.prefill_split_from < FULL_PREFILL_KEYS:
-            raise ValueError(f"dev.runner.cuda.prefill_split_from {o.prefill_split_from}: at least "
-                             f"{FULL_PREFILL_KEYS:,} on Qwen3.8 (its prefill split's base: a query between them would "
-                             "take one split, whole or in the splits by its tile; `kernels.attn_window.FullAttention`)")
     if cfg.engine.plan_at_boundary and cfg.runner.kind == "cuda" and not gemma:
         raise ValueError("engine.plan_at_boundary: Gemma 4 only on CUDA (the Qwen runner's prefill and mixed steps "
                          "launch breakable graphs whose eager GDN and attention breaks take 15-22 ms of host time on a "

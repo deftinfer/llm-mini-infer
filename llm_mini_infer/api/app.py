@@ -640,9 +640,6 @@ class App:
 
     # -- chat ------------------------------------------------------------------------------------------------
 
-    def render_prompt(self, messages: list, add_generation_prompt: bool, kwargs: dict | None) -> str:
-        return self.render_conversation(messages, add_generation_prompt, kwargs)[0]
-
     def _template_messages(self, msgs: list[dict], where: list[int] | None = None) -> list[dict]:
         r = self.renderer
         return to_template_messages(msgs, r.content_format, r.supports_developer_role,

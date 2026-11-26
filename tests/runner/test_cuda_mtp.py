@@ -197,11 +197,10 @@ def test_outputs_equal_with_a_reduced_draft_head(model, params) -> None:
     assert set(runs[1].r.tables.drafts[1:].flatten().tolist()) <= ids | {0}
 
 
-def test_draft_head_ranking_and_fp8_copy() -> None:
+def test_draft_head_ranking() -> None:
     """The ranking: before traffic, the lowest ids and the special tokens; emitted tokens outside the head are counted
-    and, past the miss tolerance, ranked in at the next check and installed by `apply`; the logits are the head's rows
-    (or their block-FP8 copy, dequantized)."""
-    from llm_mini_infer.kernels import fp8
+    and, past the miss tolerance, ranked in at the next check and installed by `apply`; the logits are the head's
+    rows. With size 0 the head is the whole one: no ids, the full vocabulary, the head itself and no copy of it."""
     from llm_mini_infer.runner.cuda import draft_head as dh
 
     torch.manual_seed(2)
@@ -218,12 +217,10 @@ def test_draft_head_ranking_and_fp8_copy() -> None:
     assert torch.equal(d.logits(hidden), torch.nn.functional.linear(hidden, head[d.ids.long()]).float())
     d.observe(burst)  # nothing missed now: no new ranking
     assert not d.apply()
-    q = dh.DraftHead(head, size=256, fp8_copy=True, special=[1000, 1001])
-    w8, s8 = fp8.quantize_weight(head[q.ids.long()])
-    want = fp8.gemm_ref(fp8.quant_ref(hidden), w8, s8).float()  # the GEMM writes BF16, as the target's head
-    assert torch.equal(q.logits(hidden), want)
-    full8 = dh.DraftHead(head, size=0, fp8_copy=True)
-    assert full8.ids is None and full8.size == 1024 and full8.logits(hidden).shape == (3, 1024)
+    full = dh.DraftHead(head, size=0)
+    assert not full.reduced and full.ids is None and full.w is None and full.size == full.V == 1024
+    assert full.full is head and full.bytes == 0 and full.describe() == "the whole vocabulary, float32"
+    assert torch.equal(full.logits(hidden), torch.nn.functional.linear(hidden, head).float())
 
 
 def test_drafts_take_the_noise_of_the_positions_they_fill(model) -> None:

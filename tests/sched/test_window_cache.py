@@ -10,7 +10,6 @@ pools and that everything comes back once the cache is cleared.
 
 from __future__ import annotations
 
-import numpy as np
 import pytest
 from hypothesis import given
 
@@ -152,58 +151,47 @@ def test_decode_windows_serve_a_continuation() -> None:
     assert h.results[1].cached == 80  # the decode window at 80 (20 prompt + 60 generated)
 
 
-def test_rows_crossing_pages_together_get_the_pages_of_row_by_row_calls() -> None:
+def test_rows_crossing_pages_together_share_a_window() -> None:
     """Ten requests resume from one window (a 40-token prompt another request computed) and decode in step: every 4
     tokens their rows cross a window page boundary together, every 20 a full page's too, and past the window they give
-    back the pages of the window they share, then their own. `Scheduler._grow_rows` and `_wslide` take and give back
-    those pages at once; the plans (every page id) and the arena's free list are those of the calls row by row, and the
-    strict fake checks every row's window."""
+    back the pages of the window they share, then their own. The strict fake checks every row's window, and the
+    scheduler's accounting is checked at every turn. On the steps whose plan is the ten rows alone (a token each), the
+    scheduler's `_grow` calls that take pages and its `_wrelease` calls that give pages back are counted: all ten rows
+    take a full page in one step, and give back in one step pages of which one was held by two rows (the window they
+    resumed from)."""
     prompt = stem(7, 40)
+    specs = [Spec(rid=0, prompt_len=0, prompt=prompt, max_tokens=2, seed=70)]
+    specs += [Spec(rid=i, prompt_len=0, prompt=prompt, max_tokens=60, seed=70 + i, arrive=8, ignore_eos=True)
+              for i in range(1, 11)]
+    h = harness(specs, max_num_seqs=10)
+    s, steps, cur = h.sched, [], {"grow": 0, "released": []}
+    grow, release, schedule = s._grow, s._wrelease, s.schedule
 
-    def run(per_row: bool) -> tuple[list, list[int], dict[str, int]]:
-        specs = [Spec(rid=0, prompt_len=0, prompt=prompt, max_tokens=2, seed=70)]
-        specs += [Spec(rid=i, prompt_len=0, prompt=prompt, max_tokens=60, seed=70 + i, arrive=8, ignore_eos=True)
-                  for i in range(1, 11)]
-        h = harness(specs, max_num_seqs=10)
-        s, seen = h.sched, {"grow": 0, "slide": 0, "shared": 0}
-        grow_rows, wslide = s._grow_rows, s._wslide
+    def counted_grow(slot: int, n: int) -> None:
+        cur["grow"] += n > 0  # the decode loop also calls it for rows that need only a window page (n <= 0)
+        grow(slot, n)
 
-        def grow(slots, need, needw):
-            seen["grow"] = max(seen["grow"], len(slots))
-            if not per_row:
-                return grow_rows(slots, need, needw)
-            for slot, a, c in zip(slots.tolist(), need.tolist(), needw.tolist()):
-                s._grow(slot, a)
-                s._wgrow(slot, c)
+    def counted_release(slot: int, q: int) -> None:
+        a, lo = int(s.wlo[slot]), s._wlow(q)
+        if lo > a:  # the row gives pages back: those it holds below its next query's window
+            cur["released"].append([p for p in s.slot_req[slot].wpages[a:lo] if p])
+        release(slot, q)
 
-        def slide(slots, q):
-            lo = np.maximum(q - s.window + 1, 0) // s.wps
-            rows = np.flatnonzero(lo > s.wlo[slots]).tolist()
-            held = [p for i in rows for p in s.slot_req[int(slots[i])].wpages[int(s.wlo[slots[i]]):int(lo[i])] if p]
-            seen["slide"] = max(seen["slide"], len(rows))
-            seen["shared"] += len(set(held)) < len(held)
-            if not per_row:
-                return wslide(slots, q)
-            for i in rows:
-                s._wrelease(int(slots[i]), int(q[i]))
+    def counted_schedule():  # one step's calls, with what its plan holds
+        cur.update(grow=0, released=[])
+        planned = schedule()
+        if planned is not None:
+            inf, held = planned[1], [p for got in cur["released"] for p in got]
+            steps.append((len(inf.slots), inf.n_tokens, cur["grow"], len(cur["released"]), len(set(held)) < len(held)))
+        return planned
 
-        s._grow_rows, s._wslide = grow, slide
-        pages, launch = [], h.runner.launch_forward
-
-        def record(plan):
-            pages.append([a.tolist() for a in (plan.page_slot, plan.page_index, plan.page_id, plan.wpage_slot,
-                                               plan.wpage_index, plan.wpage_id)])
-            return launch(plan)
-
-        h.runner.launch_forward = record
-        h.run(check_every_turn=True)
-        h.check()
-        assert all(h.results[i].cached == 36 for i in range(1, 11))  # in step: the prompt's end on the page grid
-        return pages, list(s.kv._free), seen
-
-    batched, free, seen = run(per_row=False)
-    assert (batched, free) == run(per_row=True)[:2]
-    assert seen["grow"] == seen["slide"] == 10 and seen["shared"]  # every row at once, shared pages among them
+    s._grow, s._wrelease, s.schedule = counted_grow, counted_release, counted_schedule
+    h.run(check_every_turn=True)
+    h.check()
+    assert all(h.results[i].cached == 36 for i in range(1, 11))  # in step: the prompt's end on the page grid
+    decode = [st for st in steps if st[:2] == (10, 10)]  # the ten rows alone, a token each
+    assert any(g == 10 for _, _, g, _, _ in decode), steps  # the ten cross a full page boundary in one step
+    assert any(r == 10 and two for _, _, _, r, two in decode), steps  # and give back a page two of them held
 
 
 def test_preemption_mid_prefill_resumes_from_its_window() -> None:

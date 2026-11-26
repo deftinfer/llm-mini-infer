@@ -85,10 +85,6 @@ class QwenVision(ImageFamily):
                    std=tuple(pre.get("image_std", (0.5, 0.5, 0.5))),
                    rescale=float(pre.get("rescale_factor", 1 / 255)), mrope=bool(rope.get("mrope_section")))
 
-    @property
-    def patch_dim(self) -> int:
-        return 3 * self.temporal * self.patch * self.patch
-
     # -- frontend --------------------------------------------------------------------------------------------------
 
     def size(self, header: Header) -> ImageSize:

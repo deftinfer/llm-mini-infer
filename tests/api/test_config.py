@@ -26,7 +26,7 @@ MAXL = 8184  # a model.max_model_len for the batch invariance tests (the engine 
 def test_draft_head_defaults(tmp_path) -> None:
     cfg = config.derive(config.load(None, {"model.path": str(_model(tmp_path, 248_320, 1))}))
     assert cfg.speculative.num_speculative_tokens == 3
-    assert cfg.dev.speculative.draft_vocab == config.DRAFT_VOCAB and cfg.dev.speculative.draft_head_dtype == "bfloat16"
+    assert cfg.dev.speculative.draft_vocab == config.DRAFT_VOCAB
     assert "ranked from the tokens this server emits" in cfg.reasons["dev.speculative.draft_vocab"]
     small = tmp_path / "small"
     small.mkdir()
@@ -450,6 +450,57 @@ def test_deleted_settings_are_refused(tmp_path, monkeypatch, capsys, caplog, gro
     assert exc.value.code == 2 and len(logged) == 1 and refused in logged[0]  # not merely a missing model
 
 
+REMOVED = [  # (dotted name, a value it took, the value refused or None for any): removed after 0.8.0
+    ("dev.speculative.draft_head_dtype", "fp8", None),
+    ("dev.runner.cuda.prefill_split_from", 8192, None),
+    ("dev.runner.cuda.fp8_gemm", "flashinfer", "flashinfer"),  # the value alone
+]
+
+
+@pytest.mark.parametrize(("name", "value", "only"), REMOVED, ids=[n for n, _, _ in REMOVED])
+def test_settings_removed_after_0_8_0_are_refused_by_name(tmp_path, monkeypatch, capsys, caplog, name, value,
+                                                          only) -> None:
+    """A dev setting removed after 0.8.0, or a value removed from one, fails the load from a file or an override with a
+    message that names it, says when it left and what holds now, before the schema's own message, and so does a removed
+    setting given outside the dev group; the cli and the container's entrypoint (its preflight) exit 2 with it."""
+    import yaml
+
+    from llm_mini_infer import cli, entrypoint
+
+    shown = name if only is None else f"{name} {only}"
+    refused = f"invalid configuration: {shown}: removed after 0.8.0 ({config.RETIRED[name, only]})"
+    nested: dict = {}
+    *parents, leaf = name.split(".")
+    node = nested
+    for part in parents:
+        node = node.setdefault(part, {})
+    node[leaf] = value
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(nested))
+    for path_, overrides in ((str(path), {}), (None, {name: value})):
+        with pytest.raises(ValueError) as err:
+            config.load(path_, overrides)
+        assert str(err.value) == refused
+    if only is None:  # outside the dev group (a removed value there gets the moved settings' message first)
+        outside = name.removeprefix("dev.")
+        with pytest.raises(ValueError) as err:
+            config.load(None, {outside: value})
+        assert str(err.value) == refused.replace(name, outside, 1)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["serve", "--model", str(tmp_path), "--set", f"{name}={value}"])
+    assert exc.value.code == 2 and refused in capsys.readouterr().err
+    assert refused in entrypoint.preflight(str(path), [])[0]
+    monkeypatch.setenv("LLM_MINI_INFER_CONFIG", str(path))
+    with pytest.raises(SystemExit) as exc:
+        entrypoint.main(["serve"])
+    logged = [r.getMessage() for r in caplog.records
+              if r.name == "llm_mini_infer.entrypoint" and r.levelname == "ERROR"]
+    assert exc.value.code == 2 and len(logged) == 1 and refused in logged[0]
+    if name == "dev.runner.cuda.fp8_gemm":  # the value alone left: the setting's others still load
+        for other in ("auto", "cutlass", "sglang", "torch"):
+            assert config.load(None, {name: other}).dev.runner.cuda.fp8_gemm == other
+
+
 def test_the_runner_is_cuda_unless_fake_is_set(tmp_path, monkeypatch) -> None:
     """runner.kind is cuda unless a config sets fake, and never derived from what torch sees: a config that names no
     runner serves the model or fails at startup, never random tokens behind a passing /health. Here torch sees no GPU,
@@ -663,40 +714,6 @@ def test_qwen_batch_invariance(tmp_path) -> None:
                                             True})).dev.runner.cuda.batch_invariant is True
 
 
-def test_the_prefill_split_threshold_needs_batch_invariance(tmp_path) -> None:
-    """dev.runner.cuda.prefill_split_from (the full layers' prefill split under batch invariance) is left unset by
-    default (the kernels' PREFILL_FROM), takes a positive value with batch invariance on and refuses one without it or
-    below 1; on Qwen3.8 one below its prefill split's base (2,048), where a query could take one split either way."""
-    g = str(_gemma(tmp_path / "g"))
-
-    def derive(**kw) -> config.Config:
-        return config.derive(config.load(None, {"model.path": g, **kw}))
-
-    key = "dev.runner.cuda.prefill_split_from"
-    assert derive().dev.runner.cuda.prefill_split_from is None
-    assert derive(**{key: 1 << 20}).dev.runner.cuda.prefill_split_from == 1 << 20
-    for bad in ({key: 0}, {key: 8192, "dev.runner.cuda.batch_invariant": False}):
-        with pytest.raises(ValueError, match=r"^dev\.runner\.cuda\.prefill_split_from \d+: at least 1, with "
-                                             r"dev\.runner\.cuda\.batch_invariant on"):
-            derive(**bad)
-    assert derive(**{key: 1}).dev.runner.cuda.prefill_split_from == 1  # Gemma 4: per query, any threshold
-    (tmp_path / "q").mkdir()
-    q = _model(tmp_path / "q", 248_320, 1)  # Qwen3.8 with a block-FP8 checkpoint: on by default
-    conf = json.loads((q / "config.json").read_text())
-    conf["quantization_config"] = {"quant_method": "fp8", "weight_block_size": [128, 128]}
-    (q / "config.json").write_text(json.dumps(conf))
-    qwen = {"model.path": str(q)}
-    assert config.derive(config.load(None, {**qwen, key: 2048})).dev.runner.cuda.prefill_split_from == 2048
-    with pytest.raises(ValueError, match=r"^dev\.runner\.cuda\.prefill_split_from 2047: at least 2,048 on Qwen3\.8"):
-        config.derive(config.load(None, {**qwen, key: 2047}))
-    top = 2**31 - 1  # a 32-bit int in our kernels
-    over = r"^dev\.runner\.cuda\.prefill_split_from 2147483648: at most 2,147,483,647 \(our kernels take it as a 32"
-    for model in ({"model.path": g}, qwen):
-        assert config.derive(config.load(None, {**model, key: top})).dev.runner.cuda.prefill_split_from == top
-        with pytest.raises(ValueError, match=over):
-            config.derive(config.load(None, {**model, key: top + 1}))
-
-
 def test_a_pool_capped_length_names_the_invariance_default_it_missed(tmp_path) -> None:
     """A Qwen3.8 block-FP8 checkpoint whose derived model.max_model_len is past QWEN_INVARIANT_MAX_LEN gets batch
     invariance off; once the KV pool caps that length to the limit or below, `capped_invariance_note` says so, and
@@ -863,7 +880,7 @@ def test_the_settings_split(tmp_path, monkeypatch, capsys, caplog) -> None:
     from llm_mini_infer import cli, entrypoint
 
     dev = [k.removeprefix("dev.") for k in config.leaves(config.Config) if k.startswith("dev.")]
-    assert len(config.SETTINGS) == 61 < 62 and len(dev) == 65 and not set(dev) & set(config.SETTINGS)
+    assert len(config.SETTINGS) == 61 < 62 and len(dev) == 63 and not set(dev) & set(config.SETTINGS)
     for name, value in (("runner.cuda.fused_ops", False), ("cache.num_pages", 10), ("runner.fake.step_ms", 1.0),
                         ("scheduler.mixed_step_row_tokens", 100)):
         got = config.load(None, {f"dev.{name}": value}).dev

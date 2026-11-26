@@ -54,10 +54,6 @@ class PenaltyTables:
         self.bias_val = torch.zeros((slots, MAX_LOGIT_BIAS), dtype=torch.float32, device=device)
         self._bit = torch.arange(32, dtype=torch.int32, device=device)
 
-    @staticmethod
-    def bytes_for(slots: int, vocab: int) -> int:
-        return slots * (vocab * 4 + MAX_LOGIT_BIAS * 8 + 20)
-
     def reset(self) -> None:
         self.terms.zero_()
 

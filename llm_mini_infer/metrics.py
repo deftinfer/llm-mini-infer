@@ -23,7 +23,6 @@ from __future__ import annotations
 from bisect import bisect_left
 from collections.abc import Sequence
 
-from .engine.messages import POPCOUNT_BUCKETS
 from .runner.base import UNION_BUCKETS
 
 REQUEST_LATENCY = (0.3, 0.5, 0.8, 1.0, 1.5, 2.0, 2.5, 5.0, 10.0, 15.0, 20.0, 30.0, 40.0, 50.0, 60.0, 120.0, 240.0,
@@ -420,15 +419,6 @@ class Metrics:
         self.grammar_eos_free_gated = Counter("llm_mini_infer:grammar_eos_free_gated_total",
                                               "Requests whose stopped grammar's EOS was left to the step in flight: "
                                               "no other request stayed in it.", base)
-        self.spec_first_rejections = Counter("llm_mini_infer:spec_first_rejections_total",
-                                             "MTP verify rows with a rejected draft, by the grammar mask its target "
-                                             "sample was drawn under: forced (one token), eos (the EOS alone: the end "
-                                             "of a document), choice, free (unconstrained). Rows without masks are "
-                                             "not counted.", base, labels=("mask",))
-        self.spec_window_mask_tokens = Histogram("llm_mini_infer:spec_window_mask_tokens",
-                                                 "Tokens the grammar masks of MTP verify rows allowed, every mask "
-                                                 "verification read (the samples after the pending token and after "
-                                                 "each accepted draft).", base, POPCOUNT_BUCKETS)
         self.backpressure_pauses = Counter("llm_mini_infer:frontend_backpressure_pauses_total",
                                            "Times a frontend lagging behind its outputs had its admissions paused.",
                                            base)

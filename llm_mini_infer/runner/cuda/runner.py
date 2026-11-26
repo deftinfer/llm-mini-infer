@@ -689,7 +689,7 @@ class CudaRunner(Runner):
                  memory_utilization: float = 0.9, memory_gb: float | None = None, check: bool = False,
                  graphs: bool = True, fused_ops: bool = True, decode_buckets: list[int] | None = None,
                  token_buckets: list[int] | None = None, fp8_gemm: str = "auto", fp8_cold_prefill: str = "reuse",
-                 mtp_k: int = 0, draft_vocab: int = 0, draft_fp8: bool = False, vision: VisionOptions | None = None,
+                 mtp_k: int = 0, draft_vocab: int = 0, vision: VisionOptions | None = None,
                  vision_buckets: list[int] | None = None, grammar: bool = True, pdl: bool = False,
                  always_split: bool = False, sparse_head: bool = False, sparse_head_rows: int = 1024,
                  draft_universe: bool = False, batch_invariant: bool = False, attn_split_keys: int = 0,
@@ -787,15 +787,12 @@ class CudaRunner(Runner):
         if self.k:
             mtp = self.model.mtp
             self.stats["mtp_weight_bytes"] = sum(p.numel() * p.element_size() for p in mtp.parameters())
-            if draft_fp8 and self.cuda:  # an FP8 draft head's GEMMs
-                kbuild.require_cutlass("dev.speculative.draft_head_dtype bfloat16")
             if self.cuda:  # fresh segments for the head, else it would keep the loader's cached ones pinned
                 torch.cuda.empty_cache()
             forced = special_token_ids(self.model_dir)
             if grammar and 0 < draft_vocab < self.model.lm_head_weight.shape[0]:
                 forced += structural_token_ids(self.model_dir)
-            self.draft_head = DraftHead(self.model.lm_head_weight, size=draft_vocab, fp8_copy=draft_fp8,
-                                        special=forced)
+            self.draft_head = DraftHead(self.model.lm_head_weight, size=draft_vocab, special=forced)
             self.stats.update(draft_head=self.draft_head.describe(), draft_head_bytes=self.draft_head.bytes)
             gdn_layers = [layer.linear_attn for layer in self.model.layers if not layer.is_attn]
             # every GDN layer's gating parameters, for the fold kernel (all layers in one launch)

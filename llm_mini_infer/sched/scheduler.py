@@ -97,8 +97,6 @@ from ..engine.messages import (
     ABORT_SHUTDOWN,
     CHECKPOINT_SOURCES,
     LOST_CAUSES,
-    MASK_CLASSES,
-    POPCOUNT_BUCKETS,
     AddRequest,
     FinishReason,
 )
@@ -172,7 +170,6 @@ def _lp_unused(n: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return (np.full(n, np.nan, np.float32), np.zeros((n, MAX_LOGPROBS), np.int32),
             np.full((n, MAX_LOGPROBS), np.nan, np.float32))
 _OUT_W = 256  # per-slot ring of generated tokens; full rows are flushed to the request (needed for recompute)
-GROW_ROWS = 4  # decode rows crossing a page boundary in one step from which `_grow_rows` takes their pages at once
 
 
 class Req:
@@ -395,11 +392,6 @@ class Inflight:
     decode_ckpts: list[tuple[int, int, int]] = field(default_factory=list)  # (slot, aid, dst)
     masked: np.ndarray | None = None  # MASKED rows (structured output): their plan indices; None without any
     invalid: np.ndarray | None = None  # MTP, per row: how many drafts its grammar refuses (`fill_masks`), not counted
-    # MTP, per masked verify row (`fill_masks`; the verify-mask counters): its masks' popcounts [rows, 1 + k] (−1: a
-    # row without them) and classes (`MASK_CLASSES` indices), and the drafts it verifies [rows, k]
-    wpop: np.ndarray | None = None
-    wcls: np.ndarray | None = None
-    wdraft: np.ndarray | None = None
     n_encode: int = 0  # images the plan encodes (ENCODE sections; llm_mini_infer:step_encoder_images)
     # MTP: the drafts the plan's device rows verify and those its SAMPLE rows make (`sched.plan`; −1: k), and whether
     # every row of it is a decode row without logprobs (the step's time is the decode part's: `DraftCounts`)
@@ -942,11 +934,6 @@ class Scheduler:
         self.forced_declined = 0  # final chunks that sampled theirs: a CKPT record off the grid at the prompt's end
         self.eos_free = np.zeros(2, np.int64)  # EOS-free finishes: no row of the request in flight, its row in flight
         self.eos_free_gated = 0  # requests left to the EOS the step in flight samples (the gate: nothing else stays)
-        # The verify-mask counters (`_rejections`): MTP verify rows' first rejected draft by the class of the mask
-        # its target sample was drawn under (MASK_CLASSES), and the popcounts of the masks verification read
-        self.first_rejections = np.zeros(len(MASK_CLASSES), np.int64)
-        self.window_masks = np.zeros(len(POPCOUNT_BUCKETS) + 1, np.int64)  # counts per bucket (the last one +Inf)
-        self.window_masks_sum = 0
         # Backpressure (engine.process): frontends lagging behind their outputs; their waiting requests are not admitted
         self.paused_frontends: set[int] = set()
         self.grammar_rejects = 0  # requests whose grammar the engine could not compile, or not in time
@@ -1252,7 +1239,10 @@ class Scheduler:
                 need = (self.mirror[dec] + (self.reserve + self.ps - 1)) // self.ps - self.num_pages[dec]
                 needw = None
                 if self.window:  # each row's first query is at mirror + dev_inflight or later (MTP): slide its window
-                    self._wslide(dec, self.mirror[dec] + self.dev_inflight[dec])
+                    q = self.mirror[dec] + self.dev_inflight[dec]
+                    lo = np.maximum(q - self.window + 1, 0) // self.wps
+                    for i in np.flatnonzero(lo > self.wlo[dec]).tolist():
+                        self._wrelease(int(dec[i]), int(q[i]))
                     needw = (self.mirror[dec] + (self.reserve + self.wps - 1)) // self.wps - self.num_wpages[dec]
                     short = np.flatnonzero((need > 0) | (needw > 0))
                     ok = not short.size or self._ensure_pages(int(need[need > 0].sum()), int(needw[needw > 0].sum()))
@@ -1263,7 +1253,10 @@ class Scheduler:
                     dec, stop_running = self._decode_with_preemption(order, dec, need, needw)
                     preempted = True
                 elif short.size:
-                    self._grow_rows(dec[short], need[short], None if needw is None else needw[short])
+                    for i in short.tolist():
+                        self._grow(int(dec[i]), int(need[i]))
+                        if needw is not None:
+                            self._wgrow(int(dec[i]), int(needw[i]))
                 if len(dec):
                     row0 = b.n_sched
                     b.add_device_rows(dec, self.masked[dec] if self.n_masked else None,
@@ -2074,7 +2067,6 @@ class Scheduler:
         drafts: list[tuple[Any, int, list[int]]] = []
         unread: list[tuple[int, int]] = []  # masks along drafts that verification never reads: [start, end) in `buf`
         invalid = np.zeros(len(inf.slots), np.int64) if k else None
-        windows: list[tuple[int, int, int]] = []  # live verify rows (verify-mask counters): (plan row, offset, slot)
         off = 0
         for r in inf.masked.tolist():
             slot = int(inf.slots[r])
@@ -2084,12 +2076,9 @@ class Scheduler:
                 buf[off:off + n] = only
             elif req.matcher is None:
                 buf[off:off + n] = -1  # its grammar terminated (ignore_eos): unconstrained
-                if n > 1:
-                    windows.append((r, off, slot))
             elif n == 1:
                 singles.append((req.matcher, off))
             else:
-                windows.append((r, off, slot))
                 m, d = req.matcher, self.drafts[slot, :k].tolist()
                 v = 0 if m.is_stopped() else m.validate_tokens(d)
                 invalid[r] = k - v
@@ -2109,31 +2098,7 @@ class Scheduler:
         for start, end in unread:  # after the fill, so they never depend on what the backend wrote past w
             buf[start:end] = only
         inf.invalid = invalid
-        if windows:
-            self._window_masks(inf, buf, windows)
         return off
-
-    def _window_masks(self, inf: Inflight, buf: np.ndarray, windows: list[tuple[int, int, int]]) -> None:
-        """The verify-mask counters (`_rejections`): the popcount and class (`MASK_CLASSES`) of each mask of the
-        verify rows `windows` (plan row, offset in `buf`, slot), and the drafts each row verifies, for `process` to
-        class its first rejected draft and count the masks verification read. One pass over the rows' masks, behind
-        the forward."""
-        k, n, g = self._v(inf), len(inf.slots), self.grammars
-        rows = np.asarray([w[0] for w in windows], np.int64)
-        idx = (np.asarray([w[1] for w in windows], np.int64)[:, None] + np.arange(1 + k)).ravel()
-        block = buf[idx].view(np.uint32)
-        vocab = g.backend.vocab_size  # an all-ones mask (unconstrained) counts the vocabulary, not its padding bits
-        pop = np.minimum(np.bitwise_count(block).sum(axis=1, dtype=np.int64), vocab)
-        n_eos = np.zeros(len(block), np.int64)  # the grammar's EOS ids a mask allows (several under auto, xgrammar)
-        for e in g.eos:
-            n_eos += (block[:, e >> 5] >> np.uint32(e & 31)) & np.uint32(1)
-        cls = np.where((pop == n_eos) & (n_eos > 0), 1, np.where(pop == 1, 0, np.where(pop == vocab, 3, 2)))
-        inf.wpop = np.full((n, 1 + k), -1, np.int64)
-        inf.wpop[rows] = pop.reshape(-1, 1 + k)
-        inf.wcls = np.zeros((n, 1 + k), np.int8)
-        inf.wcls[rows] = cls.reshape(-1, 1 + k)
-        inf.wdraft = np.full((n, k), -1, np.int32)
-        inf.wdraft[rows] = self.drafts[np.asarray([w[2] for w in windows], np.int64), :k]
 
     # -- images -----------------------------------------------------------------------------------------------
 
@@ -2650,7 +2615,7 @@ class Scheduler:
             self.mirror[ds] += n_out[dm]
             self.dev_inflight[ds] -= 1
             if self.k:
-                self._count_verify(inf, np.flatnonzero(dm), n_out[dm], tokens)
+                self._count_verify(inf, np.flatnonzero(dm), n_out[dm])
         m = valid & inf.sample
         s = slots[m]
         if not len(s):
@@ -2723,11 +2688,10 @@ class Scheduler:
             self._finish(int(s[i]))
         return out
 
-    def _count_verify(self, inf: Inflight, rows: np.ndarray, n_out: np.ndarray, tokens: np.ndarray) -> None:
-        """The speculative-decoding counters (`vllm:spec_decode_*`; one draft is one request's verify step) and the
-        verify-mask counters for the MTP verify rows `rows` (plan indices) whose results their requests get, with
-        `n_out` tokens each: the rows of running requests (`process`) and those held for preempted ones
-        (`_deliver_held`)."""
+    def _count_verify(self, inf: Inflight, rows: np.ndarray, n_out: np.ndarray) -> None:
+        """The speculative-decoding counters (`vllm:spec_decode_*`; one draft is one request's verify step) for the MTP
+        verify rows `rows` (plan indices) whose results their requests get, with `n_out` tokens each: the rows of
+        running requests (`process`) and those held for preempted ones (`_deliver_held`)."""
         acc = n_out.astype(np.int64) - 1
         v = self._v(inf)
         self.spec_drafts += len(rows)
@@ -2740,8 +2704,6 @@ class Scheduler:
         self.spec_verified_per_pos[:v] += len(rows)
         if self.count_policy is not None:  # a step's rows in one call or several (`_deliver_held`): one decay
             self.count_policy.observe_accept(v, acc, inf.step_id)
-        if inf.wpop is not None:
-            self._rejections(inf, rows, acc, tokens)
 
     def _v(self, inf: Inflight) -> int:
         """The drafts the plan's device rows verified (`Inflight.v`; −1: k)."""
@@ -2838,30 +2800,6 @@ class Scheduler:
         tok[has], ids[has], top[has] = logprobs.token[j[has]], logprobs.top_ids[j[has]], logprobs.top[j[has]]
         return tok, ids, top
 
-    def _rejections(self, inf: Inflight, rows: np.ndarray, acc: np.ndarray, tokens: np.ndarray) -> None:
-        """The verify-mask counters (`llm_mini_infer:spec_first_rejections_total`,
-        `llm_mini_infer:spec_window_mask_tokens`) for this step's verify rows `rows` (plan indices, live) with `acc`
-        accepted drafts each: the popcounts of the masks verification read (the samples after the pending token and
-        after each accepted draft), and the class of the mask the first rejected draft's position was sampled under. A
-        draft equal to its target sample, refused only because that sample ends the request (a stop token, or
-        max_tokens: the commit limits), is no rejection."""
-        k = self._v(inf)
-        pop = inf.wpop[rows]
-        has = pop[:, 0] >= 0
-        if not has.any():
-            return
-        rows, acc, pop = rows[has], acc[has], pop[has]
-        p = pop[np.arange(1 + k)[None, :] <= acc[:, None]]
-        self.window_masks += np.bincount(np.searchsorted(POPCOUNT_BUCKETS, p), minlength=len(self.window_masks))
-        self.window_masks_sum += int(p.sum())
-        rej = acc < k
-        if rej.any():
-            r, a = rows[rej], acc[rej]
-            real = inf.wdraft[r, a] != tokens[r, a]
-            if real.any():
-                cls = inf.wcls[r[real], a[real]].astype(np.int64)
-                self.first_rejections += np.bincount(cls, minlength=len(MASK_CLASSES))
-
     def _cut(self, s: np.ndarray, toks: np.ndarray, n_tok: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """MTP rows of up to 1 + k tokens: deliver each row's tokens up to its first finish (EOS, a stop token, or
         `max_out`), append them to the slots' output rings, and return (tokens per row, the tokens flattened, finish
@@ -2955,7 +2893,7 @@ class Scheduler:
             new: list[int] = row[0, :int(cut[0])].tolist()
             finish = int(fin[0])
             if self.k and inf.device[i]:
-                self._count_verify(inf, np.array([i]), n_out[i:i + 1], tokens)
+                self._count_verify(inf, np.array([i]), n_out[i:i + 1])
                 self.spec_trimmed += n - len(new)
                 req.verify_rows += 1
                 req.verify_tokens += len(new)
@@ -3560,51 +3498,6 @@ class Scheduler:
         self.num_pages[slot] = first + n
         self.builder.add_pages(slot, first, pages)
 
-    def _grow_rows(self, slots: np.ndarray, need: np.ndarray, needw: np.ndarray | None) -> None:
-        """`_grow`, then `_wgrow`, for each of the decode rows `slots` in turn, at once (a batch whose rows cross a page
-        boundary together): one allocation, cut in the order those calls take pages off the free stack (a row's full
-        pages, then its window pages), so every page id and plan entry is theirs. Python only extends the requests'
-        page tables. Fewer than `GROW_ROWS` rows take those calls: their arrays would cost more."""
-        if len(slots) < GROW_ROWS:
-            for slot, a, c in zip(slots.tolist(), need.tolist(), [0] * len(slots) if needw is None else needw.tolist()):
-                self._grow(slot, a)
-                self._wgrow(slot, c)
-            return
-        n = np.maximum(need, 0).tolist()
-        nw = np.maximum(needw, 0).tolist() if needw is not None else [0] * len(n)
-        pages = self.kv.alloc(sum(n) + sum(nw))  # `wkv` is `kv` in window mode
-        if pages is None:
-            raise RuntimeError("page allocation failed after the capacity check")
-        fs, fi, fn, fp = [], [], [], []  # full pages: the rows' slots, first new page indices and counts; the pages
-        ws, wi, wn, wp = [], [], [], []  # window pages: the same
-        i = 0
-        for slot, a, c in zip(slots.tolist(), n, nw):
-            req = self.slot_req[slot]
-            if a:
-                got = pages[i:i + a]
-                fs.append(slot)
-                fi.append(len(req.pages))
-                fn.append(a)
-                fp += got
-                req.pages += got
-                i += a
-            if c:
-                got = pages[i:i + c]
-                ws.append(slot)
-                wi.append(len(req.wpages))
-                wn.append(c)
-                wp += got
-                req.wpages += got
-                i += c
-        if fs:
-            if self._n_unv or self._orphans:  # as at admission
-                self.cache.unverified[fp] = 0
-            self.num_pages[fs] = np.add(fi, fn)
-            self.builder.add_page_runs(fs, fi, fn, fp)
-        if ws:
-            self.num_wpages[ws] = np.add(wi, wn)
-            self.builder.add_page_runs(ws, wi, wn, wp, window=True)
-
     # -- the window pool (sliding-window models) ---------------------------------------------------------------
 
     def _wgrow(self, slot: int, n: int) -> None:
@@ -3639,31 +3532,6 @@ class Scheduler:
             self.wkv.release(old)
             self.pending_wclear.append((slot, a, lo - a))  # cleared in the runner's table too
         self.wlo[slot] = lo
-
-    def _wslide(self, slots: np.ndarray, q: np.ndarray) -> None:
-        """`_wrelease` for decode rows, at once: Python only clears the tables of the rows that cross a page boundary,
-        and their pages go back in one release, row after row, as the per-row releases free them; per row only when two
-        rows hold the same page (a window both resumed from), which the later of their releases frees."""
-        lo = np.maximum(q - self.window + 1, 0) // self.wps
-        rows = np.flatnonzero(lo > self.wlo[slots])
-        if not len(rows):
-            return
-        slots, lo = slots[rows], lo[rows]
-        old: list[list[int]] = []
-        for slot, a, b in zip(slots.tolist(), self.wlo[slots].tolist(), lo.tolist()):
-            table = self.slot_req[slot].wpages
-            got = [p for p in table[a:b] if p]
-            table[a:b] = [0] * (b - a)
-            if got:
-                old.append(got)
-                self.pending_wclear.append((slot, a, b - a))  # cleared in the runner's table too
-        flat = [p for got in old for p in got]
-        if len(set(flat)) == len(flat):
-            self.wkv.release(flat)
-        else:
-            for got in old:
-                self.wkv.release(got)
-        self.wlo[slots] = lo
 
     def _make_window(self, req: Req, c: int) -> int:
         """A window checkpoint at position c from the request's own window pages: the ones holding positions

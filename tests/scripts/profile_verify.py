@@ -269,7 +269,7 @@ GEMM = r"nvjet|gemm|gemv|cublas|cutlass|xmma|splitKreduce|dot_kernel|reduce_1Blo
 
 # A verify step's kernels, first match wins: our kernels before the FP8 GEMMs (their signatures may name e4m3), the
 # FP8 GEMMs before cuBLAS (the vendored CUTLASS blockwise kernel, `lmk_fp8::cutlass_3x_gemm_fp8_blockwise`;
-# FlashInfer's groupwise and torch._scaled_mm's when `fp8_gemm` picks them), attn512 (the full layers and the
+# torch._scaled_mm's when `fp8_gemm` picks it), attn512 (the full layers and the
 # assistant's full layer), FlashInfer and our window kernel (the sliding layers; the assistant's sliding layers are
 # FlashInfer's either way), our sampler, then the
 # BF16 GEMMs: the tied head, the assistant's layers and head (cuBLAS: nvjet, its CUTLASS kernels, gemv, split-K; our
@@ -282,7 +282,7 @@ GEMM = r"nvjet|gemm|gemv|cublas|cutlass|xmma|splitKreduce|dot_kernel|reduce_1Blo
 VERIFY_CATEGORIES: list[tuple[str, re.Pattern[str]]] = [
     ("memcpy", MEMCPY),
     ("norm_act_quant", re.compile(OURS)),
-    ("fp8_gemm", re.compile(r"lmk_fp8|fp8_blockwise|gemm_fp8|fp8_gemm|[Bb]lockwise|[Gg]roupwise|f8f6f4|e4m3\w*gemm|"
+    ("fp8_gemm", re.compile(r"lmk_fp8|fp8_blockwise|gemm_fp8|fp8_gemm|[Bb]lockwise|f8f6f4|e4m3\w*gemm|"
                             r"gemm\w*e4m3|scaled_mm|deep_gemm")),
     ("full_attention", re.compile(r"attn512")),
     ("sliding_attention", re.compile(r"flashinfer|BatchPrefill|BatchDecode|MergeStates|attn_window")),

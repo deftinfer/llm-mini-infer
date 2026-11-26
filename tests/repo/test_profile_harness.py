@@ -410,7 +410,6 @@ CUTLASS_FP8 = ("void cutlass::device_kernel<lmk_fp8::cutlass_3x_gemm_fp8_blockwi
                "lmk_fp8::cutlass_3x_gemm_fp8_blockwise<cutlass::bfloat16_t>::GemmKernel::Params)")
 VERIFY_NAMES = {
     CUTLASS_FP8: "fp8_gemm",
-    "void flashinfer::gemm::GemmGroupwiseKernel<cutlass::float_e4m3_t>(...)": "fp8_gemm",
     "nvjet_tst_192x112_64x5_2x1_v_bz_coopB_TNT": "bf16_gemm",
     "void cutlass::Kernel2<cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_128x1_tn_align8>(cutlass_80_wmma_"
     "tensorop_bf16_s161616gemm_bf16_32x32_128x1_tn_align8::Params)": "bf16_gemm",

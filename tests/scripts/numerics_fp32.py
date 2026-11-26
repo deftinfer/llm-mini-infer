@@ -90,8 +90,8 @@ drafts.
 
 **Fixed differences from the engine:** the cos/sin caches in fp32 (BF16 there); Gemma's full-layer keys from the fp32
 stored plane (from the BF16-rounded V there); every projection on fp32 activations (FP8 there, BF16 on PRECISE rows);
-the drafter's full head (a reduced or FP8 draft head there: settings `draft_vocab`, `draft_fp8`). On a CPU fp32 engine
-whose checkpoint has no FP8 projection the reference is the engine's own arithmetic, up to summation order.
+the drafter's full head (a reduced draft head there: setting `draft_vocab`). On a CPU fp32 engine whose checkpoint
+has no FP8 projection the reference is the engine's own arithmetic, up to summation order.
 """
 
 from __future__ import annotations

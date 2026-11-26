@@ -28,7 +28,6 @@ from ..engine.messages import (
     ABORT_STOP,
     CHECKPOINT_SOURCES,
     LOST_CAUSES,
-    MASK_CLASSES,
     OPENAI_FINISH,
     Abort,
     Ack,
@@ -669,10 +668,6 @@ class EngineClient:
                 m.grammar_eos_free.set_total(s.grammar_eos_free[0], "no")
                 m.grammar_eos_free.set_total(s.grammar_eos_free[1], "yes")
             m.grammar_eos_free_gated.set_total(s.grammar_eos_free_gated)
-            for c, n in zip(MASK_CLASSES, s.spec_first_rejections):
-                m.spec_first_rejections.set_total(n, c)
-            if s.spec_window_mask_counts:
-                m.spec_window_mask_tokens.set_cumulative(s.spec_window_mask_counts, s.spec_window_mask_sum)
         if s.spec_accepted_per_pos:
             sm = m.spec_metrics(len(s.spec_accepted_per_pos))
             sm.num_drafts.set_total(s.spec_drafts)

@@ -214,15 +214,13 @@ llm_mini_infer:grammar_forced_requests_total{model_name="m",engine="0"} %(freq)s
 llm_mini_infer:grammar_eos_free_finishes_total{model_name="m",engine="0",in_flight="no"} %(eos_no)s
 llm_mini_infer:grammar_eos_free_finishes_total{model_name="m",engine="0",in_flight="yes"} %(eos_yes)s
 llm_mini_infer:grammar_eos_free_gated_total{model_name="m",engine="0"} %(gated)s
-llm_mini_infer:spec_first_rejections_total{model_name="m",engine="0",mask="forced"} 0
-llm_mini_infer:spec_first_rejections_total{model_name="m",engine="0",mask="free"} %(rej_free)s
 vllm:generation_tokens_total{model_name="m",engine="0"} %(gen)s
 """
 
 
 _PAGE_BASE = {"drafts": 0, "p0": 0, "p1": 0, "busy": 0, "idle": 0, "sparse": 0, "dense": 0, "forced": 0, "kept": 0,
               "u16": 0, "u32": 0, "u64": 0, "usum": 0, "usteps": 0, "rebuilds": 0, "freq": 0, "eos_no": 0,
-              "eos_yes": 0, "gated": 0, "rej_free": 0, "gen": 0, "failed": 0, "gerr": 0}
+              "eos_yes": 0, "gated": 0, "gen": 0, "failed": 0, "gerr": 0}
 
 
 def page(**kw: float) -> dict[str, float]:
@@ -231,9 +229,9 @@ def page(**kw: float) -> dict[str, float]:
 
 def test_the_engines_window_from_its_metrics() -> None:
     a = page(drafts=100, p0=50, p1=20, busy=10, idle=0.01, sparse=90, dense=0, forced=40, u16=10, u32=50, u64=90,
-             usum=2000, usteps=80, rebuilds=2, freq=20, eos_no=5, eos_yes=1, gated=1, rej_free=7, gen=900)
+             usum=2000, usteps=80, rebuilds=2, freq=20, eos_no=5, eos_yes=1, gated=1, gen=900)
     b = page(drafts=300, p0=230, p1=180, busy=30, idle=0.02, sparse=290, dense=10, forced=80, u16=40, u32=150, u64=290,
-             usum=7400, usteps=270, rebuilds=3, freq=40, eos_no=20, eos_yes=3, gated=2, rej_free=37, gen=1500,
+             usum=7400, usteps=270, rebuilds=3, freq=40, eos_no=20, eos_yes=3, gated=2, gen=1500,
              failed=2, gerr=1)
     d = hostcheck.engine_delta(a, b, completed=20)
     assert d["accept"] == {"drafts": 200, "per_pos": [0.9, 0.8], "tokens_per_verify": 2.7,
@@ -248,7 +246,6 @@ def test_the_engines_window_from_its_metrics() -> None:
     assert (d["forced_requests"], d["forced_tokens"], d["generation_tokens"]) == (20, 40, 600)
     assert (d["requests_failed"], d["grammar_errors"]) == (2, 1)
     assert d["eos_free_finishes"] == {"no": 15, "yes": 2} and d["eos_free_gated"] == 1
-    assert d["spec_first_rejections"] == {"forced": 0, "free": 30}
     assert hostcheck.engine_delta(a, a, completed=0)["union_tokens"] is None  # no union in the window
     # with a draft count per step: each position's accepted over the verify steps that held it
     held = "llm_mini_infer:spec_decode_num_verified_per_pos_total{position=\"%s\"} %d\n"
@@ -271,8 +268,8 @@ def test_the_engines_window_from_its_metrics() -> None:
     assert dv["generation_tokens"] == 400 and dv["head_steps"] == {} and dv["sparse_share"] is None
     assert all(dv[k] is None for k in ("union_tokens", "draft_universe_steps", "draft_universe_rebuilds",
                                        "forced_requests", "forced_tokens", "forced_tokens_per_request",
-                                       "eos_free_finishes", "eos_free_gated", "spec_first_rejections", "gpu_idle_pct",
-                                       "draft_universe_tokens", "requests_failed", "grammar_errors"))
+                                       "eos_free_finishes", "eos_free_gated", "gpu_idle_pct", "draft_universe_tokens",
+                                       "requests_failed", "grammar_errors"))
 
 
 def test_ttft_comes_from_the_servers_request_log(tmp_path) -> None:
