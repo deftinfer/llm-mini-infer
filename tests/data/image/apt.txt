@@ -53,7 +53,6 @@ libdebconfclient0=0.271ubuntu3 38
 libexpat1=2.6.1-2ubuntu0.6 416
 libext2fs2t64=1.47.0-2.4~exp1ubuntu4.1 538
 libffi8=3.4.6-1build1 72
-libfribidi0=1.0.13-3build1 144
 libgcc-s1=14.2.0-4ubuntu2~24.04.1 197
 libgcrypt20=1.10.3-2ubuntu0.2 1400
 libgmp10=2:6.3.0+dfsg-2ubuntu6.1 543

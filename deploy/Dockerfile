@@ -52,7 +52,6 @@ RUN printf 'Types: deb\nURIs: https://snapshot.ubuntu.com/ubuntu/%s/\nSuites: no
         libc6=2.39-0ubuntu8.9 \
         libexpat1=2.6.1-2ubuntu0.6 \
         libffi8=3.4.6-1build1 \
-        libfribidi0=1.0.13-3build1 \
         libgcc-s1=14.2.0-4ubuntu2~24.04.1 \
         liblzma5=5.6.1+really5.4.5-1ubuntu0.3 \
         libpython3.12-minimal=3.12.3-1ubuntu0.17 \
