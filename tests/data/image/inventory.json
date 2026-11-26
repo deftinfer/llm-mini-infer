@@ -3,8 +3,8 @@
  "runs": {
   "gemma": {
    "ready_s": [
-    284.1,
-    22.0
+    64.0,
+    34.0
    ],
    "caches": {
     "start0": {
@@ -25,7 +25,7 @@
    "roles": {
     "launcher": {
      "processes": 2,
-     "modules": 680,
+     "modules": 693,
      "dists": [
       "Jinja2",
       "MarkupSafe",
@@ -84,7 +84,7 @@
     },
     "llm-mini-infer-engine": {
      "processes": 2,
-     "modules": 3244,
+     "modules": 3251,
      "dists": [
       "Jinja2",
       "MarkupSafe",
@@ -184,7 +184,7 @@
     },
     "llm-mini-infer-frontend-0": {
      "processes": 2,
-     "modules": 587,
+     "modules": 599,
      "dists": [
       "Jinja2",
       "MarkupSafe",
@@ -243,7 +243,7 @@
     },
     "llm-mini-infer-pool-0": {
      "processes": 2,
-     "modules": 1320,
+     "modules": 1306,
      "dists": [
       "cuda-bindings",
       "dill",
@@ -267,7 +267,7 @@
       "apt:libgcc-s1": 1,
       "apt:liblzma5": 1,
       "apt:libpython3.12-minimal": 2,
-      "apt:libpython3.12-stdlib": 13,
+      "apt:libpython3.12-stdlib": 11,
       "apt:libssl3t64": 2,
       "apt:libstdc++6": 1,
       "apt:zlib1g": 1,
@@ -302,7 +302,7 @@
     },
     "llm-mini-infer-pool-1": {
      "processes": 2,
-     "modules": 1320,
+     "modules": 1306,
      "dists": [
       "cuda-bindings",
       "dill",
@@ -326,7 +326,7 @@
       "apt:libgcc-s1": 1,
       "apt:liblzma5": 1,
       "apt:libpython3.12-minimal": 2,
-      "apt:libpython3.12-stdlib": 13,
+      "apt:libpython3.12-stdlib": 11,
       "apt:libssl3t64": 2,
       "apt:libstdc++6": 1,
       "apt:zlib1g": 1,
@@ -361,7 +361,7 @@
     },
     "llm-mini-infer-pool-2": {
      "processes": 2,
-     "modules": 1320,
+     "modules": 1306,
      "dists": [
       "cuda-bindings",
       "dill",
@@ -385,7 +385,7 @@
       "apt:libgcc-s1": 1,
       "apt:liblzma5": 1,
       "apt:libpython3.12-minimal": 2,
-      "apt:libpython3.12-stdlib": 13,
+      "apt:libpython3.12-stdlib": 11,
       "apt:libssl3t64": 2,
       "apt:libstdc++6": 1,
       "apt:zlib1g": 1,
@@ -420,7 +420,7 @@
     },
     "llm-mini-infer-pool-3": {
      "processes": 2,
-     "modules": 1320,
+     "modules": 1306,
      "dists": [
       "cuda-bindings",
       "dill",
@@ -444,7 +444,7 @@
       "apt:libgcc-s1": 1,
       "apt:liblzma5": 1,
       "apt:libpython3.12-minimal": 2,
-      "apt:libpython3.12-stdlib": 13,
+      "apt:libpython3.12-stdlib": 11,
       "apt:libssl3t64": 2,
       "apt:libstdc++6": 1,
       "apt:zlib1g": 1,
@@ -479,7 +479,7 @@
     },
     "llm-mini-infer-pool-4": {
      "processes": 2,
-     "modules": 1320,
+     "modules": 1306,
      "dists": [
       "cuda-bindings",
       "dill",
@@ -503,7 +503,7 @@
       "apt:libgcc-s1": 1,
       "apt:liblzma5": 1,
       "apt:libpython3.12-minimal": 2,
-      "apt:libpython3.12-stdlib": 13,
+      "apt:libpython3.12-stdlib": 11,
       "apt:libssl3t64": 2,
       "apt:libstdc++6": 1,
       "apt:zlib1g": 1,
@@ -538,7 +538,7 @@
     },
     "llm-mini-infer-pool-5": {
      "processes": 2,
-     "modules": 1320,
+     "modules": 1306,
      "dists": [
       "cuda-bindings",
       "dill",
@@ -562,7 +562,7 @@
       "apt:libgcc-s1": 1,
       "apt:liblzma5": 1,
       "apt:libpython3.12-minimal": 2,
-      "apt:libpython3.12-stdlib": 13,
+      "apt:libpython3.12-stdlib": 11,
       "apt:libssl3t64": 2,
       "apt:libstdc++6": 1,
       "apt:zlib1g": 1,
@@ -597,7 +597,7 @@
     },
     "llm-mini-infer-pool-6": {
      "processes": 2,
-     "modules": 1320,
+     "modules": 1306,
      "dists": [
       "cuda-bindings",
       "dill",
@@ -621,7 +621,7 @@
       "apt:libgcc-s1": 1,
       "apt:liblzma5": 1,
       "apt:libpython3.12-minimal": 2,
-      "apt:libpython3.12-stdlib": 13,
+      "apt:libpython3.12-stdlib": 11,
       "apt:libssl3t64": 2,
       "apt:libstdc++6": 1,
       "apt:zlib1g": 1,
@@ -656,7 +656,7 @@
     },
     "llm-mini-infer-pool-7": {
      "processes": 2,
-     "modules": 1320,
+     "modules": 1306,
      "dists": [
       "cuda-bindings",
       "dill",
@@ -680,7 +680,7 @@
       "apt:libgcc-s1": 1,
       "apt:liblzma5": 1,
       "apt:libpython3.12-minimal": 2,
-      "apt:libpython3.12-stdlib": 13,
+      "apt:libpython3.12-stdlib": 11,
       "apt:libssl3t64": 2,
       "apt:libstdc++6": 1,
       "apt:zlib1g": 1,
@@ -808,7 +808,7 @@
     },
     "hostcheck": {
      "processes": 1,
-     "modules": 1518,
+     "modules": 1527,
      "dists": [
       "Jinja2",
       "MarkupSafe",
@@ -851,7 +851,7 @@
     },
     "launcher": {
      "processes": 2,
-     "modules": 677,
+     "modules": 690,
      "dists": [
       "Jinja2",
       "MarkupSafe",
@@ -886,7 +886,7 @@
     },
     "llm-mini-infer-engine": {
      "processes": 2,
-     "modules": 3244,
+     "modules": 3251,
      "dists": [
       "Jinja2",
       "MarkupSafe",
@@ -936,7 +936,7 @@
     },
     "llm-mini-infer-frontend-0": {
      "processes": 2,
-     "modules": 588,
+     "modules": 600,
      "dists": [
       "Jinja2",
       "MarkupSafe",
@@ -969,7 +969,7 @@
     },
     "llm-mini-infer-pool-0": {
      "processes": 2,
-     "modules": 1344,
+     "modules": 1330,
      "dists": [
       "PyYAML",
       "cuda-bindings",
@@ -996,7 +996,7 @@
     },
     "llm-mini-infer-pool-1": {
      "processes": 2,
-     "modules": 1344,
+     "modules": 1330,
      "dists": [
       "PyYAML",
       "cuda-bindings",
@@ -1023,7 +1023,7 @@
     },
     "llm-mini-infer-pool-2": {
      "processes": 2,
-     "modules": 1344,
+     "modules": 1330,
      "dists": [
       "PyYAML",
       "cuda-bindings",
@@ -1050,7 +1050,7 @@
     },
     "llm-mini-infer-pool-3": {
      "processes": 2,
-     "modules": 1344,
+     "modules": 1330,
      "dists": [
       "PyYAML",
       "cuda-bindings",
@@ -1077,7 +1077,7 @@
     },
     "llm-mini-infer-pool-4": {
      "processes": 2,
-     "modules": 1344,
+     "modules": 1330,
      "dists": [
       "PyYAML",
       "cuda-bindings",
@@ -1104,7 +1104,7 @@
     },
     "llm-mini-infer-pool-5": {
      "processes": 2,
-     "modules": 1344,
+     "modules": 1330,
      "dists": [
       "PyYAML",
       "cuda-bindings",
@@ -1131,7 +1131,7 @@
     },
     "llm-mini-infer-pool-6": {
      "processes": 2,
-     "modules": 1344,
+     "modules": 1330,
      "dists": [
       "PyYAML",
       "cuda-bindings",
@@ -1158,7 +1158,7 @@
     },
     "llm-mini-infer-pool-7": {
      "processes": 2,
-     "modules": 1344,
+     "modules": 1330,
      "dists": [
       "PyYAML",
       "cuda-bindings",
@@ -1201,7 +1201,7 @@
   },
   "qwen": {
    "ready_s": [
-    268.1
+    80.1
    ],
    "caches": {
     "start0": {
@@ -1215,7 +1215,7 @@
    "roles": {
     "launcher": {
      "processes": 1,
-     "modules": 680,
+     "modules": 693,
      "dists": [
       "Jinja2",
       "MarkupSafe",
@@ -1274,7 +1274,7 @@
     },
     "llm-mini-infer-engine": {
      "processes": 1,
-     "modules": 3245,
+     "modules": 3254,
      "dists": [
       "Jinja2",
       "MarkupSafe",
@@ -1373,7 +1373,7 @@
     },
     "llm-mini-infer-frontend-0": {
      "processes": 1,
-     "modules": 587,
+     "modules": 599,
      "dists": [
       "Jinja2",
       "MarkupSafe",
@@ -1432,7 +1432,7 @@
     },
     "llm-mini-infer-pool-0": {
      "processes": 1,
-     "modules": 1320,
+     "modules": 1306,
      "dists": [
       "cuda-bindings",
       "dill",
@@ -1456,7 +1456,7 @@
       "apt:libgcc-s1": 1,
       "apt:liblzma5": 1,
       "apt:libpython3.12-minimal": 2,
-      "apt:libpython3.12-stdlib": 13,
+      "apt:libpython3.12-stdlib": 11,
       "apt:libssl3t64": 2,
       "apt:libstdc++6": 1,
       "apt:zlib1g": 1,
@@ -1491,7 +1491,7 @@
     },
     "llm-mini-infer-pool-1": {
      "processes": 1,
-     "modules": 1320,
+     "modules": 1306,
      "dists": [
       "cuda-bindings",
       "dill",
@@ -1515,7 +1515,7 @@
       "apt:libgcc-s1": 1,
       "apt:liblzma5": 1,
       "apt:libpython3.12-minimal": 2,
-      "apt:libpython3.12-stdlib": 13,
+      "apt:libpython3.12-stdlib": 11,
       "apt:libssl3t64": 2,
       "apt:libstdc++6": 1,
       "apt:zlib1g": 1,
@@ -1550,7 +1550,7 @@
     },
     "llm-mini-infer-pool-2": {
      "processes": 1,
-     "modules": 1320,
+     "modules": 1306,
      "dists": [
       "cuda-bindings",
       "dill",
@@ -1574,7 +1574,7 @@
       "apt:libgcc-s1": 1,
       "apt:liblzma5": 1,
       "apt:libpython3.12-minimal": 2,
-      "apt:libpython3.12-stdlib": 13,
+      "apt:libpython3.12-stdlib": 11,
       "apt:libssl3t64": 2,
       "apt:libstdc++6": 1,
       "apt:zlib1g": 1,
@@ -1609,7 +1609,7 @@
     },
     "llm-mini-infer-pool-3": {
      "processes": 1,
-     "modules": 1320,
+     "modules": 1306,
      "dists": [
       "cuda-bindings",
       "dill",
@@ -1633,7 +1633,7 @@
       "apt:libgcc-s1": 1,
       "apt:liblzma5": 1,
       "apt:libpython3.12-minimal": 2,
-      "apt:libpython3.12-stdlib": 13,
+      "apt:libpython3.12-stdlib": 11,
       "apt:libssl3t64": 2,
       "apt:libstdc++6": 1,
       "apt:zlib1g": 1,
@@ -1668,7 +1668,7 @@
     },
     "llm-mini-infer-pool-4": {
      "processes": 1,
-     "modules": 1320,
+     "modules": 1306,
      "dists": [
       "cuda-bindings",
       "dill",
@@ -1692,7 +1692,7 @@
       "apt:libgcc-s1": 1,
       "apt:liblzma5": 1,
       "apt:libpython3.12-minimal": 2,
-      "apt:libpython3.12-stdlib": 13,
+      "apt:libpython3.12-stdlib": 11,
       "apt:libssl3t64": 2,
       "apt:libstdc++6": 1,
       "apt:zlib1g": 1,
@@ -1727,7 +1727,7 @@
     },
     "llm-mini-infer-pool-5": {
      "processes": 1,
-     "modules": 1320,
+     "modules": 1306,
      "dists": [
       "cuda-bindings",
       "dill",
@@ -1751,7 +1751,7 @@
       "apt:libgcc-s1": 1,
       "apt:liblzma5": 1,
       "apt:libpython3.12-minimal": 2,
-      "apt:libpython3.12-stdlib": 13,
+      "apt:libpython3.12-stdlib": 11,
       "apt:libssl3t64": 2,
       "apt:libstdc++6": 1,
       "apt:zlib1g": 1,
@@ -1786,7 +1786,7 @@
     },
     "llm-mini-infer-pool-6": {
      "processes": 1,
-     "modules": 1320,
+     "modules": 1306,
      "dists": [
       "cuda-bindings",
       "dill",
@@ -1810,7 +1810,7 @@
       "apt:libgcc-s1": 1,
       "apt:liblzma5": 1,
       "apt:libpython3.12-minimal": 2,
-      "apt:libpython3.12-stdlib": 13,
+      "apt:libpython3.12-stdlib": 11,
       "apt:libssl3t64": 2,
       "apt:libstdc++6": 1,
       "apt:zlib1g": 1,
@@ -1845,7 +1845,7 @@
     },
     "llm-mini-infer-pool-7": {
      "processes": 1,
-     "modules": 1320,
+     "modules": 1306,
      "dists": [
       "cuda-bindings",
       "dill",
@@ -1869,7 +1869,7 @@
       "apt:libgcc-s1": 1,
       "apt:liblzma5": 1,
       "apt:libpython3.12-minimal": 2,
-      "apt:libpython3.12-stdlib": 13,
+      "apt:libpython3.12-stdlib": 11,
       "apt:libssl3t64": 2,
       "apt:libstdc++6": 1,
       "apt:zlib1g": 1,
