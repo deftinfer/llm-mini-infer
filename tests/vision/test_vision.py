@@ -12,6 +12,7 @@ import io
 import json
 import multiprocessing as mp
 import random
+import re
 import struct
 import types
 import zlib
@@ -809,7 +810,7 @@ def test_a_requests_download_budget_is_vllms() -> None:
 
 def test_a_pool_worker_refuses_an_oversized_header_without_decoding(tmp_path) -> None:
     """The pool worker repeats the check on its job's header before anything decodes (a job past the frontend must
-    never reach torchvision's JPEG decoder, which allocates what the header says): with images.max_source_pixels
+    never reach the JPEG decoder, which allocates what the header says): with images.max_source_pixels
     100,000, a 400 x 225 image (90,000 pixels) decodes; a 400 x 300 one (120,000, perfectly decodable) is refused by
     the guard instead of decoded, and so is the poison (the guard's message, not libjpeg's); the worker stays alive
     and decodes the next image."""
@@ -1029,20 +1030,23 @@ def test_the_pool_serves_malformed_exif_as_stored_and_decodes_the_probed_format_
     from llm_mini_infer.vision.family import decode_rgb
 
     img = pattern(40, 20)
-    for fmt in ("PNG", "WEBP"):
+    for fmt in ("JPEG", "PNG", "WEBP"):
+        prefix = b"Exif\x00\x00" if fmt == "JPEG" else b""
         for junk in (b"not a tiff header at all", b"II\x2b\x00\x08\x00\x00\x00" + bytes(8)):
-            data = encoded(img, fmt, exif=junk, **({"lossless": True} if fmt == "WEBP" else {}))
-            with pytest.raises(Exception):  # noqa: B017 - Pillow's errors vary (SyntaxError, struct.error)
-                ImageOps.exif_transpose(Image.open(io.BytesIO(data)))
+            data = encoded(img, fmt, exif=prefix + junk, **({"lossless": True} if fmt == "WEBP" else {}))
+            if fmt != "JPEG":  # a JPEG's DPI read at open swallows the error: exif_transpose then finds no EXIF
+                with pytest.raises(Exception):  # noqa: B017 - Pillow's errors vary (SyntaxError, struct.error)
+                    ImageOps.exif_transpose(Image.open(io.BytesIO(data)))
+            assert pillow_orientation(data) == (1, False)
             h = probe(data)
             assert h.orientation == 1 and tuple(decode_rgb(data, h).shape) == (3, 20, 40), (fmt, junk)
-        data = encoded(img, fmt, exif=orientation_entry(3, [6, 6]))  # once orientation 1 in the probe: a 400
+        data = encoded(img, fmt, exif=prefix + orientation_entry(3, [6, 6]))  # once orientation 1 in the probe
         assert tuple(decode_rgb(data, probe(data)).shape) == (3, 40, 20)
-    raises = bytes.fromhex("4d4d002a000000080002010f000a00000004000000080112000300000001000600060000000000")
-    data = encoded(img, "PNG", exif=raises + bytes(48))
-    assert pillow_orientation(data) == (6, True) and probe(data).orientation == 6
-    with pytest.raises(ProbeError, match="is 40x20, but its header says 20x40"):
-        decode_rgb(data, probe(data))
+        raises = bytes.fromhex("4d4d002a000000080002010f000a00000004000000080112000300000001000600060000000000")
+        data = encoded(img, fmt, exif=prefix + raises + bytes(48))
+        assert pillow_orientation(data) == (6, True) and probe(data).orientation == 6
+        with pytest.raises(ProbeError, match="is 40x20, but its header says 20x40"):
+            decode_rgb(data, probe(data))
     gif = encoded(img, "GIF")
     with pytest.raises(UnidentifiedImageError):  # a GIF under a PNG header is not decoded as a GIF
         decode_rgb(gif, Header("png", 40, 20))
@@ -1260,6 +1264,202 @@ def test_the_probe_has_pillow_read_at_most_max_ifd0_entries(monkeypatch) -> None
         assert h.orientation == 1 and probe(encoded(img, "PNG", exif=block(65535))).orientation == 1
     with pytest.raises(ProbeError, match="is 20x40, but its header says 40x20"):
         decode_rgb(over, h)
+    over = encoded(img, "JPEG", exif=b"Exif\x00\x00" + block(MAX_IFD0_ENTRIES + 1))
+    with pytest.raises(ProbeError, match="is 20x40, but its header says 40x20"):
+        decode_rgb(over, probe(over))
+
+
+# The JPEG cases' file digests (the first 16 hex digits) and the pixels the decoder before Pillow gave them
+# (torchvision's decode_jpeg, oriented by the probe), as sha256 of the HWC uint8 bytes, the same on the Mac and on linux
+# x86_64
+OLD_JPEG_DIGESTS: dict[str, tuple[str, str]] = {
+    "JPEG-exif1": ("4c3561b45288bde1", "722eec33b8d1cca9e20ae1d15863626f5a2776001ec49aafde6362ad7767ee1b"),
+    "JPEG-xmp1": ("d6a5a06b2fda5f92", "722eec33b8d1cca9e20ae1d15863626f5a2776001ec49aafde6362ad7767ee1b"),
+    "JPEG-exif2": ("c4d981005d6606b8", "1a495426995a21d8cfd1971c1c5127fe217b1c7291edef5f4f501daf04ecab1e"),
+    "JPEG-xmp2": ("a08c4064b60e0e42", "1a495426995a21d8cfd1971c1c5127fe217b1c7291edef5f4f501daf04ecab1e"),
+    "JPEG-exif3": ("b483719663b5d8fb", "a953c7f20c2cd429f7c7a8f8cf2ba5d02db4b523c388b3c5da96f250f1981334"),
+    "JPEG-xmp3": ("4bd7a7c489e90ec2", "a953c7f20c2cd429f7c7a8f8cf2ba5d02db4b523c388b3c5da96f250f1981334"),
+    "JPEG-exif4": ("d7d031819823ddaa", "49928308216a0795df0d44a8f79257e4143a5cf16f3f902836c6a35f74b41f57"),
+    "JPEG-xmp4": ("134f254298db682f", "49928308216a0795df0d44a8f79257e4143a5cf16f3f902836c6a35f74b41f57"),
+    "JPEG-exif5": ("a46917b17a5609d8", "1834a80c73d59fc40857863ab39a3b8e66312b3f175d5e3245093f74b0f19c4f"),
+    "JPEG-xmp5": ("6a7343f5faa49727", "1834a80c73d59fc40857863ab39a3b8e66312b3f175d5e3245093f74b0f19c4f"),
+    "JPEG-exif6": ("6e99c44c6fbc132a", "28103de473048bb7cf971579ef192ef0ae159c1ce01adc9532861f2606524a04"),
+    "JPEG-xmp6": ("aeecd5f3f04b3a43", "28103de473048bb7cf971579ef192ef0ae159c1ce01adc9532861f2606524a04"),
+    "JPEG-exif7": ("5780cc73e47cd49e", "0cbbd575e596bacff23e372f946ddfef55b6729b8962fadc65c4ee1157bfa6d9"),
+    "JPEG-xmp7": ("2df36ad97103e583", "0cbbd575e596bacff23e372f946ddfef55b6729b8962fadc65c4ee1157bfa6d9"),
+    "JPEG-exif8": ("4add62fe11a2d388", "3c69c752f57b1a0ef1f46e582d3877d600b7782d062acdb55c6d115840bc96ae"),
+    "JPEG-xmp8": ("62aaa3773c384dba", "3c69c752f57b1a0ef1f46e582d3877d600b7782d062acdb55c6d115840bc96ae"),
+    "progressive": ("8bafc054dd7dd2d4", "e017eb4085ff7d232185e8c244ee122d6a583e3f50db393126d326b84089e7a1"),
+    "cmyk": ("ed4cf5c84091c2d4", "4c591f70eb44d1c2683a9028b774536a9759258113400eb68a92aeb7d1002919"),
+    "gray": ("3e7eb6e9119aeef7", "54e0b7a6f2281daf9ed24cdc579757dd0a31cc64a01b6227542a8c4eae038fa5"),
+    "subsampling-444": ("18f92846541cf6f4", "38c551b17e8764096409b59b9e0bd962b1d017315512da8647b1efe6df1c96db"),
+    "subsampling-422": ("b2de83491fb3563d", "5fafca7b7ea5a90bef92f6318459af5d13e8a62453350178f4fc205decbd9f1a"),
+    "subsampling-420": ("5d7a0ea84f0823b0", "7f437eefe7202e07f45c0b79b6a58539eb5d814e5e9f9af18a21cd2f825fc9f7"),
+}
+
+
+def old_jpeg_cases() -> dict[str, bytes]:
+    img = pattern(40, 30)
+    cases = {}
+    for o in range(1, 9):
+        cases[f"JPEG-exif{o}"] = encoded(img, "JPEG", exif=exif(o, big=o % 2 == 0, typ=3 if o < 5 else 4))
+        cases[f"JPEG-xmp{o}"] = encoded(img, "JPEG", xmp=xmp_packet(o))
+    cases["progressive"] = encoded(pattern(64, 48, 1), "JPEG", progressive=True)
+    cases["cmyk"] = encoded(pattern(50, 40, 2).convert("CMYK"), "JPEG")
+    cases["gray"] = encoded(pattern(50, 40, 3).convert("L"), "JPEG")
+    for ss, name in ((0, "444"), (1, "422"), (2, "420")):
+        cases[f"subsampling-{name}"] = encoded(pattern(97, 61, 4), "JPEG", subsampling=ss, quality=85)
+    return cases
+
+
+def test_jpeg_decodes_to_the_old_decoders_pixels() -> None:
+    """Pillow's decode of a JPEG gives the pixels the decoder before it gave: EXIF and XMP orientations 1 to 8,
+    progressive, CMYK, grayscale and every chroma subsampling (both are libjpeg-turbo)."""
+    import hashlib
+
+    from llm_mini_infer.vision.family import decode_rgb
+
+    for name, data in old_jpeg_cases().items():
+        file, pixels = OLD_JPEG_DIGESTS[name]
+        assert hashlib.sha256(data).hexdigest()[:16] == file, f"{name}: the encoder wrote other bytes"
+        got = decode_rgb(data, probe(data)).permute(1, 2, 0).contiguous().numpy()
+        assert hashlib.sha256(got.tobytes()).hexdigest() == pixels, name
+
+
+def test_the_resize_is_torchvisions_call_for_call() -> None:
+    """`resize_bicubic`, on torch alone, equals torchvision's uint8 antialiased bicubic resize (the dev group keeps
+    torchvision for the reference tests): up and down, odd sizes, an unchanged size, on the decode's channels-last view
+    and on a contiguous image."""
+    import torchvision.transforms.v2.functional as tvF
+
+    from llm_mini_infer.vision.family import resize_bicubic
+
+    rng = random.Random(3)
+    gen = torch.Generator().manual_seed(3)
+    for k in range(200):
+        h, w = rng.randint(1, 160), rng.randint(1, 160)
+        img = torch.randint(0, 256, (h, w, 3), dtype=torch.uint8, generator=gen).permute(2, 0, 1)
+        if k % 2:
+            img = img.contiguous()
+        th, tw = (h, w) if k % 10 == 0 else (rng.randint(1, 200), rng.randint(1, 200))
+        want = tvF.resize(img.unsqueeze(0), [th, tw], interpolation=tvF.InterpolationMode.BICUBIC, antialias=True)
+        got = resize_bicubic(img, th, tw)
+        assert got.is_contiguous() and torch.equal(got, want[0]), (h, w, th, tw, k % 2)
+
+
+def test_the_serving_code_imports_no_torchvision() -> None:
+    """torchvision is a dev dependency only: in a child that refuses to import it, the vision package and the pool
+    worker's entry import, and both families decode and resize a JPEG, a PNG and a WebP, without asking for it."""
+    import subprocess
+    import sys
+
+    code = """
+import sys
+
+asked = []
+
+
+class Refuse:
+    def find_spec(self, name, path=None, target=None):
+        if name.split(".")[0] == "torchvision":
+            asked.append(name)
+            raise ImportError(f"{name} is refused")
+
+
+sys.meta_path.insert(0, Refuse())
+from llm_mini_infer.synthetic import pattern
+from llm_mini_infer.vision import family, gemma, pool, probe, qwen
+from tests.support.vision_pool import GEMMA70, encoded, exif
+
+fams = [GEMMA70, qwen.QwenVision(start_id=1, pad_id=2, end_id=3, patch=16, merge=2, temporal=2, min_pixels=65536,
+                                 max_pixels=327680, mean=(0.5,) * 3, std=(0.5,) * 3, rescale=1 / 255, mrope=True)]
+for fmt in ("JPEG", "PNG", "WEBP"):
+    data = encoded(pattern(400, 225), fmt, exif=exif(6) if fmt == "JPEG" else exif(6)[6:])
+    h = probe.probe(data)
+    for f in fams:
+        assert tuple(f.pixels(data, h, f.size(h)).shape)[0] == 3
+assert pool.worker_main and not asked and not any(m.split(".")[0] == "torchvision" for m in sys.modules), asked
+"""
+    root = Path(__file__).resolve().parents[2]
+    proc = subprocess.run([sys.executable, "-c", code], cwd=root, capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, proc.stderr[-3000:]
+
+
+def test_a_truncated_or_corrupt_jpeg_is_a_400_with_pillows_words(tmp_path) -> None:
+    """JPEG decodes through Pillow, as PNG and WebP do: a truncated file and one with a broken Huffman table fail
+    their request with a 400 that names Pillow's error; the worker stays up and decodes the next image."""
+    import base64
+    import shutil
+
+    from llm_mini_infer.api.images import ImageInputs
+    from llm_mini_infer.api.protocol import ApiError
+    from llm_mini_infer.engine import ipc as engine_ipc
+
+    gemma = tmp_path / "gemma"  # a Gemma 4 checkpoint's config.json alone
+    gemma.mkdir()
+    (gemma / "config.json").write_text(json.dumps({"model_type": "gemma4", "vision_config": {
+        "patch_size": 16, "pooling_kernel_size": 3, "default_output_length": 70}}))
+    jpg = encoded(pattern(400, 225), "JPEG", quality=90)
+    dht = jpg.index(b"\xff\xc4")
+    bad = {"truncated": jpg[:len(jpg) // 2], "a broken Huffman table": jpg[:dht + 5] + b"\xff" * 16 + jpg[dht + 21:]}
+    words = {"truncated": r"image: OSError: image file is truncated \(\d+ bytes not processed\)",
+             "a broken Huffman table": r"image: OSError: broken data stream when reading image file"}
+
+    def uri(data: bytes) -> str:
+        return "data:image/jpeg;base64," + base64.b64encode(data).decode()
+
+    ipc = engine_ipc.ipc_dir()
+    arena = str(tmp_path / "arena")
+    px_arena.create(arena, 1 << 22)
+    proc = None
+
+    async def main() -> None:
+        images = ImageInputs(GEMMA70, index=0, num_frontends=1, arena_bytes=1 << 22, pool_dir=ipc, workers=1,
+                             max_bytes=1 << 20, fetch_timeout_s=1.0, max_per_request=1)
+        images.start()
+        try:
+            for name, data in bad.items():
+                prep = await images.prepare([uri(data)])
+                with pytest.raises(ApiError) as err:
+                    await asyncio.wait_for(images.wait(prep), 60)
+                assert err.value.status == 400 and re.fullmatch(words[name], err.value.message), err.value.message
+                images.discard(prep)
+            prep = await images.prepare([uri(jpg)])
+            await asyncio.wait_for(images.wait(prep), 60)
+            images.discard(prep)
+        finally:
+            await images.close()
+
+    try:
+        proc, ready = spawn_pool_worker(gemma, None, None, ipc, arena)
+        assert ready, f"the worker exited before it was ready (exit code {proc.exitcode})"
+        asyncio.run(main())
+        assert proc.is_alive()
+    finally:
+        if proc is not None:
+            proc.kill()
+            proc.join(10)
+        px_arena.remove(arena)
+        shutil.rmtree(ipc, ignore_errors=True)
+
+
+def test_an_image_past_pillows_pixel_limit_warns_and_twice_it_fails(monkeypatch) -> None:
+    """Every format decodes through Pillow, JPEG too: a stored size above Image.MAX_IMAGE_PIXELS decodes with
+    Pillow's DecompressionBombWarning, and above twice it is Pillow's DecompressionBombError (a 400 from the pool).
+    images.max_source_pixels is at most twice Pillow's default, so the probe refuses such an image first."""
+    from llm_mini_infer.vision.family import decode_rgb
+    from llm_mini_infer.vision.probe import MAX_SOURCE_PIXELS
+
+    assert MAX_SOURCE_PIXELS == 2 * Image.MAX_IMAGE_PIXELS
+    img = pattern(40, 20)
+    for fmt in ("JPEG", "PNG", "WEBP"):
+        data = encoded(img, fmt)
+        monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 40 * 20 - 1)
+        with pytest.warns(Image.DecompressionBombWarning):
+            assert tuple(decode_rgb(data, probe(data)).shape) == (3, 20, 40)
+        monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 40 * 20 // 2 - 1)
+        with pytest.raises(Image.DecompressionBombError):
+            decode_rgb(data, probe(data))
 
 
 # -- transparency: vLLM's composite onto white ------------------------------------------------------------------------

@@ -7,9 +7,9 @@
 - **Sizing** (`size`): transformers' `smart_resize` with factor = patch × merge (32), operation for operation, taken
   after the orientation. The grid is (1, h / 16, w / 16) patches and the image takes h × w / (16 × 16 × 4) tokens: 84
   for a 400×225 photo (384 × 224).
-- **Pixels** (`pixels`, in the image pool): the shared exact uint8 path (`family.decode_rgb`), then torchvision's
-  antialiased bicubic resize on uint8, as the processor's torchvision backend runs it. Normalisation and patchifying
-  run on the GPU (`models.qwen3_5.vision`).
+- **Pixels** (`pixels`, in the image pool): the shared exact uint8 path (`family.decode_rgb`), then the antialiased
+  bicubic resize on uint8 the processor's torchvision backend runs (`family.resize_bicubic`). Normalisation and
+  patchifying run on the GPU (`models.qwen3_5.vision`).
 - **Positions** (`positions`): interleaved M-RoPE, transformers' `get_rope_index`. Text continues the running position;
   an image's tokens take (t, h, w) = (s, s + row, s + column) over its merged grid, row-major, where s is the position
   the next text token would have had, and the text after it continues from s + max(rows, columns). Every token after

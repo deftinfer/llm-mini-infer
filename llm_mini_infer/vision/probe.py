@@ -11,17 +11,18 @@ vLLM and Hugging Face's `load_image` decode with Pillow and apply it (`orientati
   counts as 1 (`exif_transpose` leaves the image as stored). Orientations 5..8 swap width and height.
 
 Formats: JPEG, PNG, GIF, WebP and BMP (their first frame, as Pillow opens it). Anything else is a `ProbeError` (a
-400 for the client). The image pool checks the decoded size against the probe (`family.decode_rgb`), so a header
-this module reads differently from Pillow fails the request instead of mis-sizing it.
+400 for the client). The image pool decodes with Pillow and checks the decoded size against the probe
+(`family.decode_rgb`), so a header this module reads differently from Pillow fails the request instead of mis-sizing
+it.
 
 **On the event loop** (`api.images`), the probe's work is bounded: a stored size above `images.max_source_pixels` (by
 default 178,956,970, Pillow's decompression-bomb bound) is a `ProbeError` before anything decodes the image (a JPEG
 declares its size in 4 bytes of its SOF and the decoder allocates what it says: a few hundred bytes can ask for
-65,500² pixels, 12.9 GB of RGB; Pillow refuses the other formats at that size, but only in the pool); a PNG text chunk
+65,500² pixels, 12.9 GB of RGB; Pillow refuses an image at that size too, but only in the pool); a PNG text chunk
 that inflates past `MAX_TEXT_CHUNK`, or text past `MAX_TEXT_MEMORY`, is a `ProbeError`, as Pillow refuses the image
 (zlib inflates about 1,000 times); and EXIF whose IFD0 has more than `MAX_IFD0_ENTRIES` entries counts as orientation
-1 here, because Pillow's loader costs about a microsecond of Python an entry (the pool's decode may still orient such
-an image, and an orientation of 5..8 then fails its size check: a 400).
+1 here, because Pillow's loader costs about a microsecond of Python an entry (the pool's decode still orients such an
+image by Pillow, and an orientation of 5..8 then fails its size check: a 400).
 """
 
 from __future__ import annotations

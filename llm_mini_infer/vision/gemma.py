@@ -13,9 +13,9 @@ the processor class `processor_config.json` names) and `Gemma4Processor`'s promp
   thin strips at small budgets, where vLLM's count is one lower.)
 - **The budget** is `images.max_soft_tokens`, server-wide, else the checkpoint's (`from_model_dir`). `min_pixels` /
   `max_pixels` follow from it and cannot be set apart.
-- **Pixels** (`pixels`, in the image pool): the shared exact uint8 path (`family.decode_rgb`), then torchvision's
-  antialiased bicubic resize on uint8, skipped when the target is the image's own size (HF skips it too). Rescaling and
-  patchifying run on the GPU (`models.gemma4.vision`).
+- **Pixels** (`pixels`, in the image pool): the shared exact uint8 path (`family.decode_rgb`), then the backend's
+  antialiased bicubic resize on uint8 (`family.resize_bicubic`), skipped when the target is the image's own size (HF
+  skips it too). Rescaling and patchifying run on the GPU (`models.gemma4.vision`).
 - **The prompt:** the chat template renders one `<|image|>` per image; the frontend expands it to `<|image>`, the
   image's soft tokens (`<|image|>` each: the span) and `<image|>`, as HF's processor does in text. Only the soft
   tokens are the span: they take the encoder's embeddings and, in the sliding layers, attend to each other in both

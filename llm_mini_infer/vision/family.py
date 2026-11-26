@@ -127,66 +127,36 @@ def load(model_dir: str | Path, *, min_pixels: int | None = None, max_pixels: in
 # -- the pool's exact CPU path, shared by the families ----------------------------------------------------------------
 
 
-def orient(t: Any, orientation: int) -> Any:
-    """Pillow's `exif_transpose` on a uint8 [C, H, W] tensor (exact: flips and transposes only)."""
-    import torch
-
-    if orientation == 2:  # FLIP_LEFT_RIGHT
-        return t.flip(2)
-    if orientation == 3:  # ROTATE_180
-        return t.flip(1).flip(2)
-    if orientation == 4:  # FLIP_TOP_BOTTOM
-        return t.flip(1)
-    if orientation == 5:  # TRANSPOSE
-        return t.transpose(1, 2)
-    if orientation == 6:  # ROTATE_270 (clockwise)
-        return torch.rot90(t, -1, (1, 2))
-    if orientation == 7:  # TRANSVERSE
-        return t.transpose(1, 2).flip(1).flip(2)
-    if orientation == 8:  # ROTATE_90 (counter-clockwise)
-        return torch.rot90(t, 1, (1, 2))
-    return t
-
-
 def decode_rgb(data: bytes, header: Header) -> Any:
-    """The image as vLLM hands it to HF's processors, uint8 [3, H, W] after the orientation: JPEG through
-    torchvision's `decode_jpeg` (libjpeg-turbo, the same pixels as Pillow's decode), oriented by the probed orientation;
-    every other format through Pillow, opened as the probed format only (`exif_transpose`, then `convert("RGB")`;
-    EXIF that `exif_transpose` cannot read leaves the image as stored). An image with transparency (RGBA, LA, PA, or a
-    `transparency` entry: a PNG tRNS chunk, an RGB one's colour key included, a GIF's transparent index) is pasted onto
-    white through its alpha instead, as vLLM's `convert_image_mode` does.
-    Raises ProbeError when the decoded size disagrees with the header: after the decode and its orientation (JPEG's only
-    check: libjpeg reads the first SOF, as the probe does, and refuses a second), and for Pillow's formats before it too
-    (a GIF's first frame may extend past the logical screen the probe reads, and Pillow sizes the image by it)."""
+    """The image as vLLM hands it to HF's processors, uint8 [3, H, W] after the orientation: through Pillow, opened as
+    the probed format only (`exif_transpose`, then `convert("RGB")`; EXIF that `exif_transpose` cannot read leaves the
+    image as stored, as vLLM's `normalize_image` does). An image with transparency (RGBA, LA, PA, or a `transparency`
+    entry: a PNG tRNS chunk, an RGB one's colour key included, a GIF's transparent index) is pasted onto white through
+    its alpha instead, as vLLM's `convert_image_mode` does.
+    Raises ProbeError when the decoded size disagrees with the header: before the decode (a GIF's first frame may
+    extend past the logical screen the probe reads, and Pillow sizes the image by it) and after the orientation."""
     import contextlib
     import io
 
     import torch
+    from PIL import Image, ImageOps
 
     from .probe import ProbeError
 
-    if header.format == "jpeg":
-        from torchvision.io import ImageReadMode, decode_jpeg
-
-        raw = torch.frombuffer(bytearray(data), dtype=torch.uint8)
-        img = orient(decode_jpeg(raw, mode=ImageReadMode.RGB, apply_exif_orientation=False), header.orientation)
-    else:
-        from PIL import Image, ImageOps
-
-        im = Image.open(io.BytesIO(data), formats=(header.format.upper(),))  # the header only (and Pillow's bomb check)
-        if im.size != (header.width, header.height):
-            raise ProbeError(f"the decoded image is {im.size[0]}x{im.size[1]}, but its header says "
-                             f"{header.width}x{header.height}")
-        im.load()  # the pixels first, so that only the EXIF's errors are suppressed: a truncated image still fails
-        with contextlib.suppress(Exception):  # a broken EXIF leaves the image as stored
-            im = ImageOps.exif_transpose(im)
-        if im.mode in ("RGBA", "LA", "PA") or "transparency" in im.info:
-            rgba = im if im.mode == "RGBA" else im.convert("RGBA")  # pasted onto white, as vLLM does
-            im = Image.new("RGB", rgba.size, (255, 255, 255))
-            im.paste(rgba, mask=rgba.getchannel("A"))
-        elif im.mode != "RGB":
-            im = im.convert("RGB")
-        img = torch.from_numpy(np.asarray(im).copy()).permute(2, 0, 1)
+    im = Image.open(io.BytesIO(data), formats=(header.format.upper(),))  # the header only (and Pillow's bomb check)
+    if im.size != (header.width, header.height):
+        raise ProbeError(f"the decoded image is {im.size[0]}x{im.size[1]}, but its header says "
+                         f"{header.width}x{header.height}")
+    im.load()  # the pixels first, so that only the EXIF's errors are suppressed: a truncated image still fails
+    with contextlib.suppress(Exception):  # a broken EXIF leaves the image as stored
+        im = ImageOps.exif_transpose(im)
+    if im.mode in ("RGBA", "LA", "PA") or "transparency" in im.info:
+        rgba = im if im.mode == "RGBA" else im.convert("RGBA")  # pasted onto white, as vLLM does
+        im = Image.new("RGB", rgba.size, (255, 255, 255))
+        im.paste(rgba, mask=rgba.getchannel("A"))
+    elif im.mode != "RGB":
+        im = im.convert("RGB")
+    img = torch.from_numpy(np.asarray(im).copy()).permute(2, 0, 1)
     if tuple(img.shape[1:]) != (header.oriented[1], header.oriented[0]):
         raise ProbeError(f"the decoded image is {img.shape[2]}x{img.shape[1]}, but its header says "
                          f"{header.oriented[0]}x{header.oriented[1]}")
@@ -194,9 +164,16 @@ def decode_rgb(data: bytes, header: Header) -> Any:
 
 
 def resize_bicubic(img: Any, height: int, width: int) -> Any:
-    """torchvision's antialiased bicubic resize on uint8, as the processors' torchvision backend runs it (exact with
-    HF's pixels)."""
-    import torchvision.transforms.v2.functional as tvF
+    """The processors' torchvision backend's antialiased bicubic resize on uint8 (exact with HF's pixels), on torch
+    alone, call for call as torchvision 0.29's `resize` runs it on a CPU uint8 tensor: the image itself at an unchanged
+    size (`interpolate` there is not promised to be the identity); else, for a channels-last input (a decoded image's
+    permuted view), the batch stride a batch of one needs to read as channels-last; then `interpolate`."""
+    import torch
 
-    out = tvF.resize(img.unsqueeze(0), [height, width], interpolation=tvF.InterpolationMode.BICUBIC, antialias=True)
+    if (height, width) == tuple(img.shape[1:]):
+        return img.contiguous()
+    x = img.unsqueeze(0)
+    if x.is_contiguous(memory_format=torch.channels_last) and x.stride(0) != x.numel():
+        x = x.as_strided(x.shape, (x.numel(), *x.stride()[1:]))
+    out = torch.nn.functional.interpolate(x, size=[height, width], mode="bicubic", align_corners=False, antialias=True)
     return out[0].contiguous()
