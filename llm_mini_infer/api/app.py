@@ -302,6 +302,8 @@ class App:
         self.images: ImageInputs | None = None
         im = cfg.images
         if im.enabled:
+            import PIL.Image  # noqa: F401 - the probe reads EXIF with Pillow's loader: imported at start, not per request
+
             from ..vision import family as vf
 
             fam = vf.load(cfg.model.path, min_pixels=im.min_pixels, max_pixels=im.max_pixels,
