@@ -1077,20 +1077,48 @@ def verdict(key: str, value: float, host: dict[str, Any] | None = None) -> str:
 def build_parser() -> argparse.ArgumentParser:
     from . import synthetic  # the defaults in the help
 
-    ap = argparse.ArgumentParser(prog="llm-mini-infer hostcheck", description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--config", default=os.environ.get("LLM_MINI_INFER_CONFIG", "/etc/llm-mini-infer/config.yaml"),
-                help="the YAML configuration file (default: %(default)s; LLM_MINI_INFER_CONFIG overrides it)")
-    ap.add_argument("--port", type=int, default=18900, help="TCP port for the hostcheck server (default: %(default)s; "
-                    "independent of the service's port)")
-    ap.add_argument("--starts", type=int, default=2,
-                help="number of server starts to measure (default %(default)s)")
-    ap.add_argument("--no-server", action="store_true",
-                help="skip server startup and load tests; run only GPU, host and CPU benchmarks")
-    ap.add_argument("--out", type=Path, help="the JSON report (default: /cache/hostcheck/<time>.json, else "
-                    "./hostcheck/<time>.json)")
-    ap.add_argument("--set", action="append", default=[], metavar="GROUP.KEY=VALUE",
-                help="override a configuration value; repeat for multiple overrides (default: none)")
+    ap = argparse.ArgumentParser(
+        prog="llm-mini-infer hostcheck",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument(
+        "--config",
+        default=os.environ.get("LLM_MINI_INFER_CONFIG", "/etc/llm-mini-infer/config.yaml"),
+        help="YAML configuration file (default: %(default)s; LLM_MINI_INFER_CONFIG overrides it)",
+    )
+    ap.add_argument(
+        "--port",
+        type=int,
+        default=18900,
+        help="TCP port for the hostcheck server (default: %(default)s; independent of the service's port)",
+    )
+    ap.add_argument(
+        "--starts",
+        type=int,
+        default=2,
+        help="number of server starts to measure (default: %(default)s)",
+    )
+    ap.add_argument(
+        "--no-server",
+        action="store_true",
+        help="skip server startup and load tests; run only GPU, host and CPU benchmarks",
+    )
+    ap.add_argument(
+        "--out",
+        type=Path,
+        help="JSON report (default: /cache/hostcheck/<time>.json, else ./hostcheck/<time>.json)",
+    )
+    ap.add_argument(
+        "--set",
+        action="append",
+        default=[],
+        metavar="GROUP.KEY=VALUE",
+        help=(
+            "override a configuration value for the server started by hostcheck; "
+            "repeat for multiple overrides (default: none)"
+        ),
+    )
     ap.add_argument(
         "--duration",
         type=float,
@@ -1100,33 +1128,86 @@ def build_parser() -> argparse.ArgumentParser:
             "Qwen: 20 per GPU-idle concurrency)"
         ),
     )
+
     g = ap.add_argument_group("Gemma 4: the open loop")
-    g.add_argument("--inputs", type=Path, help="the mounted mode: a folder with frames/ (.jpg or .jpeg images), "
-                   "prompt.md or prompt.txt (the system prompt), schema.json (the json_schema), optionally user.txt "
-                   "(the user turn's text) and reference.json (references for this workload); else the synthetic one")
-    g.add_argument("--rates", default="2,4", help="requests/s of each load (default %(default)s)")
-    g.add_argument("--slots", default="32,64", help="requests in flight at most, per load (default %(default)s; an "
-                   "arrival beyond is dropped and counted)")
-    g.add_argument("--load-warmup", type=float, default=30.0, help="unmeasured seconds of arrivals before each window "
-                   "(default %(default)s)")
-    g.add_argument("--tail", type=float, default=15.0, help="seconds of arrivals after the window, while a measured "
-                   "request is in flight (default %(default)s)")
-    g.add_argument("--seed", type=int, default=0, help="the first load's arrival schedule (default %(default)s; the "
-                   "next: +1)")
-    g.add_argument("--schema-name", help="response_format's json_schema name (default: the schema's title in lower "
-                   "case, else `response`)")
-    g.add_argument("--max-tokens", type=int, default=1024, help="each request's max_tokens (default %(default)s)")
-    g.add_argument("--prompt-tokens", type=int, default=None, help="the synthetic mode: the system prompt's length in "
-                   f"the model's tokens (default: llm_mini_infer.synthetic.PROMPT_TOKENS, {synthetic.PROMPT_TOKENS})")
-    g.add_argument("--tall-share", type=float, default=None, help="the synthetic mode: the share of tall images, 0 to "
-                   f"1 (default: llm_mini_infer.synthetic.TALL_SHARE, {synthetic.TALL_SHARE:g})")
+    g.add_argument(
+        "--inputs",
+        type=Path,
+        help=(
+            "mounted mode: a folder with frames/ (.jpg or .jpeg images), "
+            "prompt.md or prompt.txt (the system prompt), schema.json (the json_schema), "
+            "optionally user.txt (the user turn's text) and reference.json "
+            "(references for this workload); otherwise the synthetic workload"
+        ),
+    )
+    g.add_argument("--rates", default="2,4", help="requests/s of each load (default: %(default)s)")
+    g.add_argument(
+        "--slots",
+        default="32,64",
+        help="maximum requests in flight per load (default: %(default)s; excess arrivals are dropped and counted)",
+    )
+    g.add_argument(
+        "--load-warmup",
+        type=float,
+        default=30.0,
+        help="unmeasured seconds of arrivals before each window (default: %(default)s)",
+    )
+    g.add_argument(
+        "--tail",
+        type=float,
+        default=15.0,
+        help="seconds of arrivals after the window while a measured request is in flight (default: %(default)s)",
+    )
+    g.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="the first load's arrival schedule (default: %(default)s; the next: +1)",
+    )
+    g.add_argument(
+        "--schema-name",
+        help="response_format's json_schema name (default: schema title in lowercase, else `response`)",
+    )
+    g.add_argument(
+        "--max-tokens",
+        type=int,
+        default=1024,
+        help="max_tokens per request (default: %(default)s)",
+    )
+    g.add_argument(
+        "--prompt-tokens",
+        type=int,
+        default=None,
+        help=(
+            "synthetic mode: system prompt length in model tokens "
+            f"(default: {synthetic.PROMPT_TOKENS})"
+        ),
+    )
+    g.add_argument(
+        "--tall-share",
+        type=float,
+        default=None,
+        help=f"synthetic mode: share of tall images, 0 to 1 (default: {synthetic.TALL_SHARE:g})",
+    )
+
     q = ap.add_argument_group("Qwen3.8: the closed loops")
-    q.add_argument("--requests", type=int, default=150, help="measured TTFT requests at concurrency 1 (default "
-                   "%(default)s)")
-    q.add_argument("--warmup", type=int, default=50,
-               help="unmeasured warm-up requests before the TTFT measurement (default %(default)s)")
-    q.add_argument("--levels", default="1,8,32",
-               help="comma-separated concurrency levels for GPU-idle measurements (default %(default)s)")
+    q.add_argument(
+        "--requests",
+        type=int,
+        default=150,
+        help="measured TTFT requests at concurrency 1 (default: %(default)s)",
+    )
+    q.add_argument(
+        "--warmup",
+        type=int,
+        default=50,
+        help="unmeasured warm-up requests before the TTFT measurement (default: %(default)s)",
+    )
+    q.add_argument(
+        "--levels",
+        default="1,8,32",
+        help="comma-separated concurrency levels for GPU-idle measurements (default: %(default)s)",
+    )
     return ap
 
 
