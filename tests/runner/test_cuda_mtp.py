@@ -200,7 +200,7 @@ def test_outputs_equal_with_a_reduced_draft_head(model, params) -> None:
 def test_draft_head_ranking() -> None:
     """The ranking: before traffic, the lowest ids and the special tokens; emitted tokens outside the head are counted
     and, past the miss tolerance, ranked in at the next check and installed by `apply`; the logits are the head's
-    rows."""
+    rows. With size 0 the head is the whole one: no ids, the full vocabulary, the head itself and no copy of it."""
     from llm_mini_infer.runner.cuda import draft_head as dh
 
     torch.manual_seed(2)
@@ -217,6 +217,10 @@ def test_draft_head_ranking() -> None:
     assert torch.equal(d.logits(hidden), torch.nn.functional.linear(hidden, head[d.ids.long()]).float())
     d.observe(burst)  # nothing missed now: no new ranking
     assert not d.apply()
+    full = dh.DraftHead(head, size=0)
+    assert not full.reduced and full.ids is None and full.w is None and full.size == full.V == 1024
+    assert full.full is head and full.bytes == 0 and full.describe() == "the whole vocabulary, float32"
+    assert torch.equal(full.logits(hidden), torch.nn.functional.linear(hidden, head).float())
 
 
 def test_drafts_take_the_noise_of_the_positions_they_fill(model) -> None:

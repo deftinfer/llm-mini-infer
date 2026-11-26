@@ -155,15 +155,43 @@ def test_rows_crossing_pages_together_share_a_window() -> None:
     """Ten requests resume from one window (a 40-token prompt another request computed) and decode in step: every 4
     tokens their rows cross a window page boundary together, every 20 a full page's too, and past the window they give
     back the pages of the window they share, then their own. The strict fake checks every row's window, and the
-    scheduler's accounting is checked at every turn."""
+    scheduler's accounting is checked at every turn. On the steps whose plan is the ten rows alone (a token each), the
+    scheduler's `_grow` calls that take pages and its `_wrelease` calls that give pages back are counted: all ten rows
+    take a full page in one step, and give back in one step pages of which one was held by two rows (the window they
+    resumed from)."""
     prompt = stem(7, 40)
     specs = [Spec(rid=0, prompt_len=0, prompt=prompt, max_tokens=2, seed=70)]
     specs += [Spec(rid=i, prompt_len=0, prompt=prompt, max_tokens=60, seed=70 + i, arrive=8, ignore_eos=True)
               for i in range(1, 11)]
     h = harness(specs, max_num_seqs=10)
+    s, steps, cur = h.sched, [], {"grow": 0, "released": []}
+    grow, release, schedule = s._grow, s._wrelease, s.schedule
+
+    def counted_grow(slot: int, n: int) -> None:
+        cur["grow"] += n > 0  # the decode loop also calls it for rows that need only a window page (n <= 0)
+        grow(slot, n)
+
+    def counted_release(slot: int, q: int) -> None:
+        a, lo = int(s.wlo[slot]), s._wlow(q)
+        if lo > a:  # the row gives pages back: those it holds below its next query's window
+            cur["released"].append([p for p in s.slot_req[slot].wpages[a:lo] if p])
+        release(slot, q)
+
+    def counted_schedule():  # one step's calls, with what its plan holds
+        cur.update(grow=0, released=[])
+        planned = schedule()
+        if planned is not None:
+            inf, held = planned[1], [p for got in cur["released"] for p in got]
+            steps.append((len(inf.slots), inf.n_tokens, cur["grow"], len(cur["released"]), len(set(held)) < len(held)))
+        return planned
+
+    s._grow, s._wrelease, s.schedule = counted_grow, counted_release, counted_schedule
     h.run(check_every_turn=True)
     h.check()
     assert all(h.results[i].cached == 36 for i in range(1, 11))  # in step: the prompt's end on the page grid
+    decode = [st for st in steps if st[:2] == (10, 10)]  # the ten rows alone, a token each
+    assert any(g == 10 for _, _, g, _, _ in decode), steps  # the ten cross a full page boundary in one step
+    assert any(r == 10 and two for _, _, _, r, two in decode), steps  # and give back a page two of them held
 
 
 def test_preemption_mid_prefill_resumes_from_its_window() -> None:

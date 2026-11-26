@@ -509,7 +509,8 @@ def _moved(data: dict[str, Any], prefix: str = "") -> list[str]:
 # any) and what holds now. A file or an override that sets one, in the dev group or outside it (where `_moved` no
 # longer knows it), is refused naming it, before the schema's own message
 RETIRED: dict[tuple[str, str | None], str] = {
-    ("dev.speculative.draft_head_dtype", None): "the drafter's head has the target head's dtype",
+    ("dev.speculative.draft_head_dtype", None): "the drafter's head is in the model dtype, dev.runner.cuda.dtype's: on "
+                                                "Gemma 4 the assistant's own head, on Qwen3.8 the target's",
     ("dev.runner.cuda.prefill_split_from", None): "the full layers' prefill split starts at the kernels' threshold, "
                                                   "kernels.attn512.PREFILL_FROM",
     ("dev.runner.cuda.fp8_gemm", "flashinfer"): "the FP8 GEMMs take auto, cutlass, sglang or torch",
