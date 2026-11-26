@@ -1414,6 +1414,26 @@ def test_the_probe_reads_exif_tags_at_once_as_pillows_safe_read_reads_them() -> 
     assert probe(encoded(pattern(40, 20), "PNG", exif=big)).orientation == 6
 
 
+def test_the_exif_block_is_handed_to_pillow_cut_past_the_prefixes_it_strips() -> None:
+    """Exif.load strips up to two `Exif\\0\\0` by a copy; the probe hands it the block cut once past them, which
+    Pillow then reads unchanged, whatever the prefixes: the same block after Pillow's strip, with none, one, two or
+    more, before the data or in Pillow's info already (a PNG eXIf)."""
+    import re as regex
+
+    from llm_mini_infer.vision.probe import _exif_block
+
+    def strip(x: bytes) -> bytes:
+        return regex.sub(b"^(Exif\x00\x00){1,2}", b"", x)
+
+    tiff = exif(6)[6:]
+    for k in range(5):
+        for prefixed in (0, 1):
+            b = b"junk" + b"Exif\x00\x00" * k + tiff
+            got = _exif_block(b, 4, len(b), prefixed)
+            assert strip(got) == strip(b"Exif\x00\x00" * prefixed + b[4:]), (k, prefixed)
+            assert strip(got) is got or k + prefixed > 2, (k, prefixed)  # no second copy, but past two prefixes
+
+
 def test_the_xmp_orientation_is_getexifs_first_match_up_to_the_decoys() -> None:
     """The probe finds `tiff:Orientation` by memchr and reads what follows (`="N` or `>N`), as getexif's regex
     matches; occurrences that do not match are passed over, up to _XMP_DECOYS of them, after which the XMP counts

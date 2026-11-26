@@ -277,6 +277,20 @@ def _ifd0_entries(exif: bytes | str) -> int:
     return min(struct.unpack_from(e + "H", exif, ifd)[0], (len(exif) - ifd - 2) // 12)  # Pillow stops at the end
 
 
+def _exif_block(b: bytes, s: int, e: int, prefixed: int = 0) -> bytes:
+    """The EXIF block b[s:e], after `prefixed` `Exif\\0\\0` that Pillow's info already holds before it, cut once at
+    the TIFF header: Exif.load strips up to two prefixes, by a copy (a fresh 20 MiB on linux is milliseconds of page
+    faults), so the probe hands it the block without them when that is the same to Pillow; with a prefix past the
+    two it strips, the block as Pillow's info holds it."""
+    p = s
+    for _ in range(2 - prefixed):
+        if b.startswith(b"Exif\x00\x00", p, e):
+            p += 6
+    if not b.startswith(b"Exif\x00\x00", p, e):
+        return b[p:e]
+    return b"Exif\x00\x00" * prefixed + b[s:e]
+
+
 # -- formats ---------------------------------------------------------------------------------------------------------
 
 
@@ -429,6 +443,7 @@ class _PngText:
         self.chunks: tuple[deque[int], ...] = tuple(deque(maxlen=n) for _ in range(4))
         self.work = 0
         self.values: dict[str, object] = {}
+        self.where: dict[int, tuple[bytes, int, int]] = {}
         self.read: dict[int, tuple[bytes, bytes]] = {}
         self.itxt: dict[int, tuple[bytes, bytes, bytes] | None] = {}
 
@@ -441,11 +456,10 @@ class _PngText:
 
     def _exif(self) -> bytes | str | None:
         for i in reversed(self.chunks[0]):
+            kind, s, e = self._at(i)
+            if kind in (b"eXIf", b"tEXt"):  # eXIf: Pillow's info holds `Exif\0\0` and the data
+                return _exif_block(self.b, s, e, kind == b"eXIf")
             kind, v = self._chunk(i)
-            if kind == b"eXIf":  # Pillow's info holds `Exif\0\0` + v, and Exif.load strips one or two prefixes
-                return v if not v.startswith(b"Exif\x00\x00") else b"Exif\x00\x00" + v
-            if kind == b"tEXt":
-                return v
             if kind == b"zTXt":
                 self._inflate(v[1:])  # its text, whatever it holds: as Pillow refuses past MAX_TEXT_CHUNK
                 return ""
@@ -503,15 +517,22 @@ class _PngText:
                 return ""
         return None
 
-    def _chunk(self, i: int) -> tuple[bytes, bytes]:
-        """The chunk at `i`: its type and its data (a text chunk's after its key's NUL), counted once."""
-        if i not in self.read:
+    def _at(self, i: int) -> tuple[bytes, int, int]:
+        """The chunk at `i`: its type and where its data lies (a text chunk's after its key's NUL), counted once."""
+        if i not in self.where:
             self._spend(_TEXT_CHUNK_COST)
             b = self.b
             (length,) = _U32(b, i)
             kind = b[i + 4:i + 8]
             key = 0 if kind == b"eXIf" else len(_PNG_TEXT[b[i + 8]][0])
-            self.read[i] = (kind, b[i + 8 + key:i + 8 + length])
+            self.where[i] = (kind, min(i + 8 + key, len(b)), min(i + 8 + length, len(b)))
+        return self.where[i]
+
+    def _chunk(self, i: int) -> tuple[bytes, bytes]:
+        """The chunk at `i`: its type and its data, cut once."""
+        if i not in self.read:
+            kind, s, e = self._at(i)
+            self.read[i] = (kind, self.b[s:e])
         return self.read[i]
 
     def _itxt_parts(self, i: int) -> tuple[bytes, bytes, bytes] | None:
@@ -626,7 +647,8 @@ def _webp(b: bytes | memoryview) -> Header:
         elif kind in (b"EXIF", b"XMP ") and kind not in seen and flags & (0x08 if kind == b"EXIF" else 0x04):
             seen.add(kind)
             if length:
-                info["exif" if kind == b"EXIF" else "xmp"] = b[d:d + length]
+                info["exif" if kind == b"EXIF" else "xmp"] = _exif_block(b, d, d + length) if kind == b"EXIF" else \
+                    b[d:d + length]
         i = d + length + (length & 1)
     if size is None:
         raise ProbeError("broken WebP header: no VP8, VP8L or VP8X chunk")
