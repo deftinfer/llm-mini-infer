@@ -6,6 +6,17 @@ Breaking:
 - The dev settings `dev.speculative.draft_head_dtype` and `dev.runner.cuda.prefill_split_from` are removed, and so is the value `flashinfer` of `dev.runner.cuda.fp8_gemm`. A configuration that sets one fails the load (exit 2) with a message that names it and says what holds now: the drafter's head is in the model dtype (`dev.runner.cuda.dtype`; on Gemma 4 the assistant's own head, on Qwen3.8 the target's), the full layers' prefill split starts at the kernels' threshold (`kernels.attn512.PREFILL_FROM`), and the FP8 GEMMs take `auto`, `cutlass`, `sglang` or `torch`.
 - `/metrics` no longer serves `llm_mini_infer:spec_first_rejections_total` and `llm_mini_infer:spec_window_mask_tokens`, and the host check's report no longer has the `spec_first_rejections` key.
 
+Changed:
+- The image no longer ships torchvision. The image pool decodes JPEG with Pillow, as it decodes the other formats and as vLLM does, and resizes with torch alone; the pixels are the same. A pool worker starts faster and holds less memory; a large JPEG takes longer to decode.
+- A truncated JPEG gets a 400 with Pillow's error, `image: OSError: image file is truncated (...)`, instead of torchvision's `RuntimeError`, which named its source file; a JPEG whose decode fails otherwise gets Pillow's text too, for example `broken data stream when reading image file`.
+- A JPEG above Pillow's `MAX_IMAGE_PIXELS` (89,478,485 pixels) decodes with Pillow's `DecompressionBombWarning` in the log, as PNG and WebP do. `images.max_source_pixels` still refuses an image above twice that.
+- A JPEG whose EXIF Pillow reads but then fails to rewrite after turning the image (crafted values) is served as stored, as PNG and WebP are, so at orientations 5 to 8 it gets a 400; vLLM serves it as stored.
+
+Fixed:
+- An image's orientation is the one Pillow's `ImageOps.exif_transpose` applies, read by Pillow's own EXIF loader. An EXIF block behind two `Exif\0\0` prefixes is read: a JPEG was served as stored, and a PNG or WebP at orientations 5 to 8 got a 400. EXIF that Pillow cannot load leaves the image as stored even beside an XMP orientation: a JPEG was turned by the XMP's value, and a PNG at orientations 5 to 8 got a 400.
+- A WebP's EXIF and XMP count only where Pillow reads them, in a VP8X file whose flags declare them, the first chunk of each. A PNG's text chunks count by Pillow's rules for each key, up to where Pillow stops reading, and a PNG with more than 64 MiB of text that the server reads is refused before it is decoded, as Pillow refuses it.
+- An image whose EXIF holds more than 1,000 IFD0 entries is sized as stored, without reading them on the event loop; its decode still applies Pillow's orientation, so at 5 to 8 the request gets a 400.
+
 ## 0.8.0
 
 This is the first public release of llm-mini-infer. It is an LLM inference server for Gemma 4 31B and Qwen3.8 27B. It runs on one NVIDIA SM120 GPU, such as the RTX PRO 6000 Blackwell. It ships as a container image with prebuilt kernels and as a Helm chart. The [README](README.md#quickstart) has the quickstart.
