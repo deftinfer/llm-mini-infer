@@ -26,13 +26,13 @@ reads on, for crafted files (no encoder comes near them):
 - of PNG text, the probe reads only the values `getexif` uses, each from the last chunk Pillow keeps, and refuses
   past `MAX_TEXT_WORK`: bytes inflated, kept or not, text decoded or parsed, compressed bytes fed to zlib (which
   spends up to about 60 ns on a byte of crafted input), and the EXIF and XMP it then reads;
-- EXIF whose IFD0 has more than `MAX_IFD0_ENTRIES` entries, and a "Raw profile type exif" longer than
-  `MAX_TEXT_CHUNK`, count as orientation 1 (Pillow's loader costs about a microsecond of Python an entry); XMP is
-  searched in its first `MAX_TEXT_CHUNK` bytes, up to `_XMP_DECOYS` `tiff:Orientation` that do not match; of the
-  Orientation tag, one value is unpacked, whatever its count; meanwhile Pillow's TIFF loader logs nothing (one
-  record an entry at debug level) and reads each tag's data at once (`_read_at_once`). The pool's decode still
-  orients by Pillow, and an orientation the probe read otherwise then fails its size check if it swaps the sides (a
-  400).
+- EXIF whose IFD0 has more than `MAX_IFD0_ENTRIES` entries, a JPEG's APP1 Exif data of more than `MAX_JPEG_EXIF` and a
+  "Raw profile type exif" longer than `MAX_TEXT_CHUNK` count as orientation 1 (Pillow's loader costs about a
+  microsecond of Python an entry); XMP is searched in its first `MAX_TEXT_CHUNK` bytes, up to `_XMP_DECOYS`
+  `tiff:Orientation` that do not match; of the Orientation tag, one value is unpacked, whatever its count; meanwhile
+  Pillow's TIFF loader logs nothing (one record an entry at debug level) and reads each tag's data at once, as a view
+  (`_read_at_once`). The pool's decode still orients by Pillow, and an orientation the probe read otherwise then fails
+  its size check if it swaps the sides (a 400).
 """
 
 from __future__ import annotations
@@ -82,8 +82,10 @@ _TEXT_CHUNK_COST = 1 << 12
 _ENTRY_COST = 1 << 12  # an IFD0 entry Pillow's loader reads, from PNG text or eXIf (up to about 4 µs)
 _INFLATE_STEP = 1 << 14
 _TEXT_FEED = 1 << 12
-# The most IFD0 entries the probe has Pillow read (module docstring): cameras write a few dozen
+# The most IFD0 entries the probe has Pillow read, and the most APP1 Exif data it joins in a JPEG (module docstring):
+# cameras write a few dozen entries, and a segment holds 64 KiB
 MAX_IFD0_ENTRIES = 256
+MAX_JPEG_EXIF = MAX_TEXT_CHUNK
 # The chunks the probe reads: 0 IEND, 1 eXIf, 2 text, 3 acTL, 4 fcTL, 5 the image data
 _PNG_KIND = {b"IEND": 0, b"eXIf": 1, b"tEXt": 2, b"zTXt": 2, b"iTXt": 2, b"acTL": 3, b"fcTL": 4, b"IDAT": 5,
              b"fdAT": 5}
@@ -178,8 +180,9 @@ def orientation(info) -> int:
                     return 1
                 if charge:
                     charge(_ENTRY_COST * entries + len(exif) // 16)
-                if safe_read is not None:
-                    ImageFile._safe_read = _read_at_once
+                if safe_read is not None:  # Exif.load's BytesIO is the block itself when it holds no prefix to strip
+                    src = exif if isinstance(exif, bytes) and not exif.startswith(b"Exif\x00\x00") else None
+                    ImageFile._safe_read = lambda fp, size: _read_at_once(fp, size, src)
                 e.load(exif)
             if 0x0112 in e:
                 return _TRANSPOSED.get(_orientation_tag(e), 1)
@@ -197,13 +200,20 @@ def orientation(info) -> int:
             ImageFile._safe_read = safe_read
 
 
-def _read_at_once(fp, size: int) -> bytes:
+def _read_at_once(fp, size: int, src: bytes | None = None) -> bytes | memoryview:
     """Pillow's `ImageFile._safe_read` on the BytesIO that Exif.load reads: the same bytes and the same error, in one
-    read. Pillow's own reads a tag of more than a MiB in 1 MiB blocks and joins them, which on linux faults every block
-    in afresh (a 15 MiB tag: about 20 ms). Set only while the probe's Exif.load runs (`orientation`)."""
+    read, and with `src` (the bytes that BytesIO holds) a view of them, without a copy. Pillow's own reads a tag of
+    more than a MiB in 1 MiB blocks and joins them, and a copy of a large tag is a fresh allocation, which on linux is
+    milliseconds of page faults. The loader only measures and stores what it reads; the probe unpacks no more than
+    one numeric value of it (`_orientation_tag`). Set only while the probe's Exif.load runs (`orientation`)."""
     if size <= 0:
         return b""
-    data = fp.read(size)
+    if src is None:
+        data: bytes | memoryview = fp.read(size)
+    else:
+        pos = fp.tell()
+        data = memoryview(src)[pos:pos + size]
+        fp.seek(pos + len(data))
     if len(data) < size:
         raise OSError("Truncated File Read")
     return data
@@ -367,6 +377,8 @@ def _jpeg(b: bytes | memoryview) -> Header:
     if xmp:
         info["xmp"] = b[xmp[0]:xmp[1]]
     if exif:
+        if sum(e - s for s, e in exif) > MAX_JPEG_EXIF:
+            return Header("jpeg", size[0], size[1], 1)  # module docstring
         view = memoryview(b)
         exif[0] = (exif[0][0] + 6, exif[0][1])  # one copy, without the prefix Exif.load would strip by copying
         block = b"".join(view[s:e] for s, e in exif)

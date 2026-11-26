@@ -1315,6 +1315,27 @@ def test_the_jpeg_walk_skips_stray_bytes_and_fill_at_once_and_bounds_the_rest() 
     assert agrees_with_pillow(jpeg[:after] + b"\xff\xfe\x00\x00" * room + app1 + jpeg[after:]) == 6
 
 
+def test_a_jpegs_exif_segments_are_joined_up_to_max_jpeg_exif() -> None:
+    """Pillow joins a JPEG's APP1 Exif segments into one block; the probe joins at most MAX_JPEG_EXIF of their data (a
+    segment holds 64 KiB) and counts more as orientation 1, without the copy (the pool's decode orients by Pillow)."""
+    from llm_mini_infer.vision.probe import MAX_JPEG_EXIF
+
+    jpeg = encoded(pattern(40, 20), "JPEG")
+    sof = jpeg.index(b"\xff\xc0")
+    after = sof + 2 + struct.unpack_from(">H", jpeg, sof + 2)[0]
+    first = exif(6) + bytes(65000 - len(exif(6)))
+    more = b"Exif\x00\x00" + bytes(65000)
+    segments = [first] + [more] * (MAX_JPEG_EXIF // 65006)
+
+    def app1(s: bytes) -> bytes:
+        return b"\xff\xe1" + struct.pack(">H", 2 + len(s)) + s
+
+    under = jpeg[:after] + b"".join(app1(s) for s in segments[:-1]) + jpeg[after:]
+    over = jpeg[:after] + b"".join(app1(s) for s in [*segments, more]) + jpeg[after:]
+    assert probe(under).orientation == pillow_orientation(under)[0] == 6
+    assert pillow_orientation(over)[0] == 6 and probe(over).orientation == 1
+
+
 @contextlib.contextmanager
 def unpacked():
     """The lengths of the data Pillow's TIFF value loaders unpack meanwhile (`ImageFileDirectory_v2._load_dispatch`),
@@ -1387,8 +1408,9 @@ def test_pillows_tiff_loader_logs_nothing_while_the_probe_reads_exif() -> None:
 
 def test_the_probe_reads_exif_tags_at_once_as_pillows_safe_read_reads_them() -> None:
     """While the probe's Exif.load runs, Pillow's `ImageFile._safe_read` (a tag over a MiB read in 1 MiB blocks and
-    joined: on linux every block faulted in afresh) is `_read_at_once`: the same bytes and the same error on the
-    loader's BytesIO, at every size; and Pillow's own is back afterwards, whatever the probe answers."""
+    joined: on linux every block faulted in afresh) is `_read_at_once`: the same bytes (as a view of the block it
+    holds) and the same error on the loader's BytesIO, at every size; and Pillow's own is back afterwards, whatever
+    the probe answers."""
     from PIL import ImageFile
 
     from llm_mini_infer.vision.probe import _read_at_once
@@ -1397,14 +1419,14 @@ def test_the_probe_reads_exif_tags_at_once_as_pillows_safe_read_reads_them() -> 
     for start in (0, 5):
         for size in (-1, 0, 1, 4, ImageFile.SAFEBLOCK, ImageFile.SAFEBLOCK + 1, len(data) - start, len(data) + 1):
             got = []
-            for read in (ImageFile._safe_read, _read_at_once):
+            for read in (ImageFile._safe_read, _read_at_once, lambda fp, n: _read_at_once(fp, n, data)):
                 fp = io.BytesIO(data)
                 fp.seek(start)
                 try:
-                    got.append((read(fp, size), fp.tell()))
+                    got.append((bytes(read(fp, size)), fp.tell()))
                 except OSError as exc:
                     got.append((type(exc), str(exc)))
-            assert got[0] == got[1], (start, size)
+            assert got[0] == got[1] == got[2], (start, size)
     own = ImageFile._safe_read
     big = orientation_entry(5, [(6, 1)] + [(0, 1)] * ((3 << 20) // 8))  # a 3 MiB RATIONAL tag, as the review's case
     for data in (encoded(pattern(40, 20), "PNG", exif=big), b"\x89PNG\r\n\x1a\n"):
