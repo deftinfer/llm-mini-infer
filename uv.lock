@@ -860,8 +860,6 @@ images = [
     { name = "pybase64" },
     { name = "torch", version = "2.14.1", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux'" },
     { name = "torch", version = "2.14.1+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux'" },
-    { name = "torchvision", version = "0.29.1", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux'" },
-    { name = "torchvision", version = "0.29.1+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux'" },
 ]
 
 [package.dev-dependencies]
@@ -914,8 +912,6 @@ requires-dist = [
     { name = "torch", marker = "sys_platform == 'linux' and extra == 'images'", specifier = ">=2.14.1", index = "https://download.pytorch.org/whl/cu130" },
     { name = "torch", marker = "sys_platform != 'linux' and extra == 'cuda'", specifier = ">=2.14.1" },
     { name = "torch", marker = "sys_platform != 'linux' and extra == 'images'", specifier = ">=2.14.1" },
-    { name = "torchvision", marker = "sys_platform == 'linux' and extra == 'images'", specifier = ">=0.29.1", index = "https://download.pytorch.org/whl/cu130" },
-    { name = "torchvision", marker = "sys_platform != 'linux' and extra == 'images'", specifier = ">=0.29.1" },
     { name = "uvicorn", specifier = ">=0.54.0" },
     { name = "uvloop", specifier = ">=0.23.0" },
     { name = "watchfiles", marker = "extra == 'image'", specifier = ">=1.3.0" },

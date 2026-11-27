@@ -50,8 +50,10 @@ APT = DATA / "apt.txt"
 CHART = ROOT / "deploy" / "helm" / "llm-mini-infer"
 # The five packages of the GPU-validated stack, and what they constrain on linux: FlashInfer's AOT providers by GPU,
 # torch's and FlashInfer's CUDA stack, FlashInfer's FFI and NCCL bindings, and triton (torch's pin)
-FIVE = {"torch", "torchvision", "flashinfer-python", "flashinfer-jit-cache", "flashinfer-cubin", "llguidance",
-        "tokenizers", "pillow"}
+FIVE = {"torch", "flashinfer-python", "flashinfer-jit-cache", "flashinfer-cubin", "llguidance", "tokenizers", "pillow"}
+# Pinned for the dev group alone, not in the image: torch's own release of torchvision, the backend of the reference
+# image processors the tests compare with
+DEV_PINNED = {"torchvision"}
 # What the image leaves out of the lock's closure: FlashInfer's cubins (none is opened on SM120) and the AOT modules
 # of every GPU but SM120's
 LEFT_OUT = ("flashinfer-cubin", "flashinfer-jit-cache-sm80", "flashinfer-jit-cache-sm89", "flashinfer-jit-cache-sm90a",
@@ -81,12 +83,12 @@ def test_the_five_and_what_they_constrain_are_the_recorded_stacks() -> None:
     assert parity >= FIVE and len(parity) > 30 and left_out <= parity
     assert {n: (locked[n], frozen.get(n)) for n in parity - left_out if locked[n] != frozen.get(n)} == {}
     assert not left_out & set(frozen) and {locked[n].split("+")[0] for n in left_out} == {locked["flashinfer-python"]}
-    for name, ver in (("torch", "2.14.1+cu130"), ("torchvision", "0.29.1+cu130"), ("flashinfer-python", "0.7.2"),
+    for name, ver in (("torch", "2.14.1+cu130"), ("flashinfer-python", "0.7.2"),
                       ("flashinfer-jit-cache", "0.7.2+cu130"), ("flashinfer-jit-cache-sm120f", "0.7.2+cu130"),
                       ("llguidance", "1.9.1"), ("tokenizers", "0.23.3"), ("pillow", "13.0.0"), ("triton", "3.8.0"),
                       ("nvidia-nccl-cu13", "2.30.7")):
         assert locked[name] == ver == frozen[name]
-    assert "vllm" not in locked  # llm_mini_infer never imports vllm
+    assert "vllm" not in locked and not DEV_PINNED & (set(locked) | set(frozen))  # never imported by llm_mini_infer
 
 
 def test_the_cu12_flavour_of_cute_dsl_and_the_aarch64_providers_are_left_out() -> None:
@@ -103,12 +105,14 @@ def test_the_cu12_flavour_of_cute_dsl_and_the_aarch64_providers_are_left_out() -
 
 def test_pyproject_pins_them_where_uv_resolves() -> None:
     """The pins are pyproject's [tool.uv] constraints, each at the locked version and the installed ones at the recorded
-    freeze's (without the local `+cu130`, so macOS's CPU wheels match too); NCCL among them, at torch's own pin."""
+    freeze's (without the local `+cu130`, so macOS's CPU wheels match too); NCCL among them, at torch's own pin, and
+    the dev group's torchvision."""
     uv = pyproject()["tool"]["uv"]
     pins = {norm(r.name): str(r.specifier) for r in map(Requirement, uv["constraint-dependencies"])}
     frozen, locked = freeze(), closure()
-    assert set(pins) == {n for n in locked if n in FIVE or constrained(n)} and "nvidia-nccl-cu13" in pins
-    assert all(spec == f"=={locked[n].split('+')[0]}" for n, spec in pins.items()), pins
+    dev = {p["name"]: p["version"] for p in lock()["package"] if p["name"] in DEV_PINNED}
+    assert set(pins) == {n for n in locked if n in FIVE or constrained(n)} | DEV_PINNED and "nvidia-nccl-cu13" in pins
+    assert all(spec == f"=={(locked.get(n) or dev[n]).split('+')[0]}" for n, spec in pins.items()), pins
     assert all(spec == f"=={frozen[n].split('+')[0]}" for n, spec in pins.items() if n in frozen), pins
 
 
@@ -191,8 +195,7 @@ def test_the_bases_are_pinned() -> None:
     assert re.search(r"^ARG UV_IMAGE=ghcr\.io/astral-sh/uv:[0-9.]+@sha256:[0-9a-f]{64}$", text, re.M)
     # the label's stack: the five's versions in the image, as its freeze records them
     stack, frozen = dict(p.split("==") for p in dockerfile_arg("STACK").split()), freeze()
-    assert stack == {n: frozen[n] for n in ("torch", "torchvision", "flashinfer-python", "llguidance", "tokenizers",
-                                            "pillow")}
+    assert stack == {n: frozen[n] for n in ("torch", "flashinfer-python", "llguidance", "tokenizers", "pillow")}
     assert re.fullmatch(r"\d{8}T\d{6}Z", dockerfile_arg("UBUNTU_SNAPSHOT"))
     # runtime last: the default target, so a build without one is the release
     assert list(stages()) == ["", "uv", "os", "deps", "kernels", "debs", "test-debs", "project", "runtime"]

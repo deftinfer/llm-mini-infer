@@ -7,10 +7,12 @@ format, colour mode and EXIF/XMP orientation the probe reads, and random pixels 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import io
 import json
 import multiprocessing as mp
 import random
+import re
 import struct
 import types
 from pathlib import Path
@@ -807,7 +809,7 @@ def test_a_requests_download_budget_is_vllms() -> None:
 
 def test_a_pool_worker_refuses_an_oversized_header_without_decoding(tmp_path) -> None:
     """The pool worker repeats the check on its job's header before anything decodes (a job past the frontend must
-    never reach torchvision's JPEG decoder, which allocates what the header says): with images.max_source_pixels
+    never reach the JPEG decoder, which allocates what the header says): with images.max_source_pixels
     100,000, a 400 x 225 image (90,000 pixels) decodes; a 400 x 300 one (120,000, perfectly decodable) is refused by
     the guard instead of decoded, and so is the poison (the guard's message, not libjpeg's); the worker stays alive
     and decodes the next image."""
@@ -919,7 +921,7 @@ ORIENTATIONS = [  # (Orientation entry, the orientation Pillow applies)
     (ifd0([(0x0112, 3, 0, b"\6\0\0\0"), (0x0112, 3, 1, b"\5\0\0\0")]), 5),
     (ifd0([(0x0112, 1, 1, b"\6\0\0\0"), (0x0112, 3, 1, b"\6\0\0\0")]), 1),
     # data past the block's end: Pillow stops reading IFD0; past its running bound of the block's length: skipped
-    (ifd0([(0x0112, 3, 4, b"\xf0\0\0\0")]), 1),
+    (ifd0([(0x0112, 3, 4, b"\xf0\0\0\0")]), 1), (ifd0([(0x010F, 2, 6, b"\x40\0\0\0"), (0x0112, 3, 1, b"\6\0\0\0")]), 1),
     (ifd0([(0x010F, 2, 60, b"\x08\0\0\0"), (0x0112, 3, 4, b"\x08\0\0\0"), (0x0112, 3, 1, b"\6\0\0\0")]), 6),
 ]
 
@@ -938,7 +940,7 @@ def test_the_probe_reads_the_orientation_pillow_applies(tiff, want) -> None:
 def random_ifd0(rng: random.Random) -> tuple[bytes, bool]:
     """IFD0 with an Orientation entry among 0-3 others, of random types, counts, offsets and trailers (with the
     orientation's values encoded in its type); and whether Pillow stops reading IFD0 at an earlier entry whose data
-    lies past the block's end, which the probe does not follow (left as a known, rare difference)."""
+    lies past the block's end (the probe stops there too)."""
     from PIL import TiffImagePlugin
 
     big = rng.random() < 0.5
@@ -1003,10 +1005,10 @@ def entries_of(tiff: bytes) -> list[tuple[int, int, int]]:
 
 
 def test_the_probe_agrees_with_pillow_on_random_ifd0s() -> None:
-    """Random IFD0s in JPEG, PNG and WebP: the probe's orientation is the one `exif_transpose` applies, but for the two
-    known differences (rare: malformed EXIF): Pillow stopping at an earlier tag's truncated data, and `exif_transpose`
-    raising after it read an orientation (it fails rewriting the EXIF; the image is served as stored, the probe
-    orients it)."""
+    """Random IFD0s in JPEG, PNG and WebP: the probe's orientation is the one `exif_transpose` applies, Pillow stopping
+    at an earlier tag's data past the block's end included, but for one known difference (rare: malformed EXIF):
+    `exif_transpose` raising after it read an orientation (it fails rewriting the EXIF; the image is served as stored,
+    the probe orients it)."""
     import warnings
 
     rng = random.Random(1)
@@ -1022,16 +1024,17 @@ def test_the_probe_agrees_with_pillow_on_random_ifd0s() -> None:
             except Exception:
                 continue
             want, raises = pillow_orientation(data)
-            if stops_early or raises:
-                seen["stops early" if stops_early else "raises"] += 1
+            if raises:
+                seen["raises"] += 1
                 continue
             assert probe(data).orientation == want, (fmt, tiff.hex())
             seen["agree"] += 1
+            seen["stops early"] += stops_early
             if want != 1:
                 n, typ = next((c, t) for tag, t, c in entries_of(tiff) if tag == 0x0112 and t != 99 and c)
                 seen["count"] += n != 1
                 seen["type"] += typ not in (3, 4)
-    assert seen["agree"] > 1000 and seen["count"] > 30 and seen["type"] > 30, seen
+    assert seen["agree"] > 1000 and seen["count"] > 30 and seen["type"] > 30 and seen["stops early"] > 50, seen
 
 
 def test_the_pool_serves_malformed_exif_as_stored_and_decodes_the_probed_format_only() -> None:
@@ -1043,24 +1046,348 @@ def test_the_pool_serves_malformed_exif_as_stored_and_decodes_the_probed_format_
     from llm_mini_infer.vision.family import decode_rgb
 
     img = pattern(40, 20)
-    for fmt in ("PNG", "WEBP"):
+    for fmt in ("JPEG", "PNG", "WEBP"):
+        prefix = b"Exif\x00\x00" if fmt == "JPEG" else b""
         for junk in (b"not a tiff header at all", b"II\x2b\x00\x08\x00\x00\x00" + bytes(8)):
-            data = encoded(img, fmt, exif=junk, **({"lossless": True} if fmt == "WEBP" else {}))
-            with pytest.raises(Exception):  # noqa: B017 - Pillow's errors vary (SyntaxError, struct.error)
-                ImageOps.exif_transpose(Image.open(io.BytesIO(data)))
+            data = encoded(img, fmt, exif=prefix + junk, **({"lossless": True} if fmt == "WEBP" else {}))
+            if fmt != "JPEG":  # a JPEG's DPI read at open swallows the error: exif_transpose then finds no EXIF
+                with pytest.raises(Exception):  # noqa: B017 - Pillow's errors vary (SyntaxError, struct.error)
+                    ImageOps.exif_transpose(Image.open(io.BytesIO(data)))
+            assert pillow_orientation(data) == (1, False)
             h = probe(data)
             assert h.orientation == 1 and tuple(decode_rgb(data, h).shape) == (3, 20, 40), (fmt, junk)
-        data = encoded(img, fmt, exif=orientation_entry(3, [6, 6]))  # once orientation 1 in the probe: a 400
+        data = encoded(img, fmt, exif=prefix + orientation_entry(3, [6, 6]))  # once orientation 1 in the probe
         assert tuple(decode_rgb(data, probe(data)).shape) == (3, 40, 20)
-    raises = bytes.fromhex("4d4d002a000000080002010f000a00000004000000080112000300000001000600060000000000")
-    data = encoded(img, "PNG", exif=raises + bytes(48))
-    assert pillow_orientation(data) == (6, True) and probe(data).orientation == 6
-    with pytest.raises(ProbeError, match="is 40x20, but its header says 20x40"):
-        decode_rgb(data, probe(data))
+        raises = bytes.fromhex("4d4d002a000000080002010f000a00000004000000080112000300000001000600060000000000")
+        data = encoded(img, fmt, exif=prefix + raises + bytes(48))
+        assert pillow_orientation(data) == (6, True) and probe(data).orientation == 6
+        with pytest.raises(ProbeError, match="is 40x20, but its header says 20x40"):
+            decode_rgb(data, probe(data))
     gif = encoded(img, "GIF")
     with pytest.raises(UnidentifiedImageError):  # a GIF under a PNG header is not decoded as a GIF
         decode_rgb(gif, Header("png", 40, 20))
     assert tuple(decode_rgb(gif, probe(gif)).shape) == (3, 20, 40)
+
+
+def xmp_packet(o: int) -> bytes:
+    return (f'<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF><rdf:Description tiff:Orientation="{o}"/>'
+            f"</rdf:RDF></x:xmpmeta>").encode()
+
+
+def pillow_pixels(data: bytes) -> torch.Tensor:
+    """The image as vLLM decodes it (`normalize_image`: `exif_transpose`, the image as stored when it raises), RGB."""
+    im = Image.open(io.BytesIO(data))
+    with contextlib.suppress(Exception):
+        im = ImageOps.exif_transpose(im)
+    return torch.from_numpy(np.asarray(im.convert("RGB")).copy()).permute(2, 0, 1)
+
+
+def agrees_with_pillow(data: bytes) -> int:
+    """The probe's orientation, checked against Pillow's: the orientation it reads, the oriented size, the pixels."""
+    from llm_mini_infer.vision.family import decode_rgb
+
+    h = probe(data)
+    want = pillow_pixels(data)
+    assert h.orientation == pillow_orientation(data)[0]
+    assert h.oriented == (want.shape[2], want.shape[1])
+    assert torch.equal(decode_rgb(data, h), want)
+    return h.orientation
+
+
+def test_a_doubled_exif_prefix_and_junk_exif_beside_xmp_are_read_as_pillow_reads_them() -> None:
+    """#23's two cases, at orientations 2..8: an EXIF block behind two `Exif\\0\\0` prefixes, which Pillow strips
+    (JPEG APP1, PNG eXIf, WebP EXIF); and EXIF Pillow cannot parse beside an XMP orientation (JPEG and PNG), where
+    getexif raises before it reads the XMP and exif_transpose leaves the image as stored, as vLLM serves it."""
+    img = pattern(40, 20)
+    for o in range(2, 9):
+        tiff = exif(o)[6:]
+        doubled = [encoded(img, "JPEG", exif=b"Exif\x00\x00" * 2 + tiff),
+                   encoded(img, "PNG", exif=b"Exif\x00\x00" * 2 + tiff),  # Pillow writes the eXIf chunk one prefix off
+                   encoded(img, "WEBP", exif=b"Exif\x00\x00" * 3 + tiff, lossless=True)]  # and the WebP chunk
+        for data in doubled:
+            assert Image.open(io.BytesIO(data)).info["exif"] == b"Exif\x00\x00" * 2 + tiff
+            assert agrees_with_pillow(data) == o
+        info = PngImagePlugin.PngInfo()
+        info.add_itxt("XML:com.adobe.xmp", xmp_packet(o).decode())
+        junk = [encoded(img, "JPEG", exif=b"Exif\x00\x00not a tiff header", xmp=xmp_packet(o)),
+                encoded(img, "PNG", exif=b"not a tiff header", pnginfo=info)]
+        for data in junk:
+            assert agrees_with_pillow(data) == 1
+
+
+def test_exif_without_an_orientation_falls_back_to_xmp_and_exif_pillow_cannot_parse_is_1() -> None:
+    """An EXIF block beside an XMP orientation of 6, in JPEG, PNG and WebP, read as Pillow's getexif reads it: IFD0's
+    orientation when it has one (a TIFF header of either byte order of 42, or a big-endian 43, which Pillow reads as
+    classic TIFF); the XMP's when Pillow finds none (the block empty once its prefixes are stripped, no Orientation
+    tag, IFD0 or the Orientation's data past the block's end, an entry cut short); 1 when Pillow cannot parse it
+    (shorter than a TIFF header, another byte order, another magic number, a little-endian BigTIFF, a third prefix):
+    getexif raises before it reads the XMP, and the image is served as stored."""
+    p, o3, o3be = b"Exif\x00\x00", orientation_entry(3, [3]), orientation_entry(3, [3], big=True)
+    cases = [(p + o3, 3), (p + o3[:2] + b"\x00\x2a" + o3[4:], 3), (p + o3be[:2] + b"\x2a\x00" + o3be[4:], 3),
+             (p + o3be[:2] + b"\x00\x2b" + o3be[4:], 3),
+             (p, 6), (p * 2, 6), (p + ifd0([(0x010F, 2, 4, b"abc\0")]), 6), (p + b"II*\x00" + struct.pack("<I", 99), 6),
+             (p + orientation_entry(3, [3, 3, 3])[:26], 6), (p + ifd0([(0x010F, 2, 4, b"abc\0")] * 2)[:22], 6),
+             (p + b"M", 1), (p + o3[:6], 1), (p + o3[:7], 1), (p + b"XY" + o3[2:], 1),
+             (p + b"II\x2b\x00" + o3[4:], 1), (p + b"II\x2c\x00" + o3[4:], 1), (p * 3 + o3, 1)]
+    img = pattern(40, 20)
+    info = PngImagePlugin.PngInfo()
+    info.add_itxt("XML:com.adobe.xmp", xmp_packet(6).decode())
+    for block, want in cases:
+        for data in (encoded(img, "JPEG", exif=block, xmp=xmp_packet(6)), encoded(img, "PNG", exif=block, pnginfo=info),
+                     encoded(img, "WEBP", exif=p + block, xmp=xmp_packet(6), lossless=True)):
+            assert agrees_with_pillow(data) == want, (data[:4], block)
+
+
+def test_ifd0_ends_at_the_first_entry_whose_data_lies_past_the_block_as_in_pillow() -> None:
+    """Pillow stops reading IFD0 at the first entry whose data lies past the block's end, whatever its tag: an
+    Orientation after it is not read, so an XMP orientation counts, else 1. Data past Pillow's running bound of the
+    block's length is skipped instead, and the Orientation after it is read. JPEG, PNG and WebP at orientations 2 to 8,
+    against Pillow's orientation, size and pixels."""
+    img = pattern(40, 20)
+    p = b"Exif\x00\x00"
+    for o in range(2, 9):
+        x = 2 if o != 2 else 3
+        past = ifd0([(0x010F, 2, 6, b"\x40\0\0\0"), (0x0112, 3, 1, bytes([o, 0, 0, 0]))])  # 6 bytes at 64 of 38
+        skipped = ifd0([(0x010F, 2, 60, b"\x08\0\0\0"), (0x0112, 3, 1, bytes([o, 0, 0, 0]))])  # 60 > 38 in all
+        info = PngImagePlugin.PngInfo()
+        info.add_itxt("XML:com.adobe.xmp", xmp_packet(x).decode())
+        for block, xmp, want in ((past, None, 1), (past, x, x), (skipped, x, o)):
+            extra = {} if xmp is None else {"xmp": xmp_packet(xmp)}
+            for data in (encoded(img, "JPEG", exif=p + block, **extra),
+                         encoded(img, "PNG", exif=block, **({} if xmp is None else {"pnginfo": info})),
+                         encoded(img, "WEBP", exif=p + block, lossless=True, **extra)):
+                assert agrees_with_pillow(data) == want, (o, xmp, data[:4])
+
+
+# The JPEG cases' file digests (the first 16 hex digits) and the pixels the decoder before Pillow gave them
+# (torchvision's decode_jpeg, oriented by the probe), as sha256 of the HWC uint8 bytes, the same on the Mac and on linux
+# x86_64
+OLD_JPEG_DIGESTS: dict[str, tuple[str, str]] = {
+    "JPEG-exif1": ("4c3561b45288bde1", "722eec33b8d1cca9e20ae1d15863626f5a2776001ec49aafde6362ad7767ee1b"),
+    "JPEG-xmp1": ("d6a5a06b2fda5f92", "722eec33b8d1cca9e20ae1d15863626f5a2776001ec49aafde6362ad7767ee1b"),
+    "JPEG-exif2": ("c4d981005d6606b8", "1a495426995a21d8cfd1971c1c5127fe217b1c7291edef5f4f501daf04ecab1e"),
+    "JPEG-xmp2": ("a08c4064b60e0e42", "1a495426995a21d8cfd1971c1c5127fe217b1c7291edef5f4f501daf04ecab1e"),
+    "JPEG-exif3": ("b483719663b5d8fb", "a953c7f20c2cd429f7c7a8f8cf2ba5d02db4b523c388b3c5da96f250f1981334"),
+    "JPEG-xmp3": ("4bd7a7c489e90ec2", "a953c7f20c2cd429f7c7a8f8cf2ba5d02db4b523c388b3c5da96f250f1981334"),
+    "JPEG-exif4": ("d7d031819823ddaa", "49928308216a0795df0d44a8f79257e4143a5cf16f3f902836c6a35f74b41f57"),
+    "JPEG-xmp4": ("134f254298db682f", "49928308216a0795df0d44a8f79257e4143a5cf16f3f902836c6a35f74b41f57"),
+    "JPEG-exif5": ("a46917b17a5609d8", "1834a80c73d59fc40857863ab39a3b8e66312b3f175d5e3245093f74b0f19c4f"),
+    "JPEG-xmp5": ("6a7343f5faa49727", "1834a80c73d59fc40857863ab39a3b8e66312b3f175d5e3245093f74b0f19c4f"),
+    "JPEG-exif6": ("6e99c44c6fbc132a", "28103de473048bb7cf971579ef192ef0ae159c1ce01adc9532861f2606524a04"),
+    "JPEG-xmp6": ("aeecd5f3f04b3a43", "28103de473048bb7cf971579ef192ef0ae159c1ce01adc9532861f2606524a04"),
+    "JPEG-exif7": ("5780cc73e47cd49e", "0cbbd575e596bacff23e372f946ddfef55b6729b8962fadc65c4ee1157bfa6d9"),
+    "JPEG-xmp7": ("2df36ad97103e583", "0cbbd575e596bacff23e372f946ddfef55b6729b8962fadc65c4ee1157bfa6d9"),
+    "JPEG-exif8": ("4add62fe11a2d388", "3c69c752f57b1a0ef1f46e582d3877d600b7782d062acdb55c6d115840bc96ae"),
+    "JPEG-xmp8": ("62aaa3773c384dba", "3c69c752f57b1a0ef1f46e582d3877d600b7782d062acdb55c6d115840bc96ae"),
+    "progressive": ("8bafc054dd7dd2d4", "e017eb4085ff7d232185e8c244ee122d6a583e3f50db393126d326b84089e7a1"),
+    "cmyk": ("ed4cf5c84091c2d4", "4c591f70eb44d1c2683a9028b774536a9759258113400eb68a92aeb7d1002919"),
+    "gray": ("3e7eb6e9119aeef7", "54e0b7a6f2281daf9ed24cdc579757dd0a31cc64a01b6227542a8c4eae038fa5"),
+    "subsampling-444": ("18f92846541cf6f4", "38c551b17e8764096409b59b9e0bd962b1d017315512da8647b1efe6df1c96db"),
+    "subsampling-422": ("b2de83491fb3563d", "5fafca7b7ea5a90bef92f6318459af5d13e8a62453350178f4fc205decbd9f1a"),
+    "subsampling-420": ("5d7a0ea84f0823b0", "7f437eefe7202e07f45c0b79b6a58539eb5d814e5e9f9af18a21cd2f825fc9f7"),
+}
+
+
+def old_jpeg_cases() -> dict[str, bytes]:
+    img = pattern(40, 30)
+    cases = {}
+    for o in range(1, 9):
+        cases[f"JPEG-exif{o}"] = encoded(img, "JPEG", exif=exif(o, big=o % 2 == 0, typ=3 if o < 5 else 4))
+        cases[f"JPEG-xmp{o}"] = encoded(img, "JPEG", xmp=xmp_packet(o))
+    cases["progressive"] = encoded(pattern(64, 48, 1), "JPEG", progressive=True)
+    cases["cmyk"] = encoded(pattern(50, 40, 2).convert("CMYK"), "JPEG")
+    cases["gray"] = encoded(pattern(50, 40, 3).convert("L"), "JPEG")
+    for ss, name in ((0, "444"), (1, "422"), (2, "420")):
+        cases[f"subsampling-{name}"] = encoded(pattern(97, 61, 4), "JPEG", subsampling=ss, quality=85)
+    return cases
+
+
+def test_jpeg_decodes_to_the_old_decoders_pixels() -> None:
+    """Pillow's decode of a JPEG gives the pixels the decoder before it gave: EXIF and XMP orientations 1 to 8,
+    progressive, CMYK, grayscale and every chroma subsampling (both are libjpeg-turbo)."""
+    import hashlib
+
+    from llm_mini_infer.vision.family import decode_rgb
+
+    for name, data in old_jpeg_cases().items():
+        file, pixels = OLD_JPEG_DIGESTS[name]
+        assert hashlib.sha256(data).hexdigest()[:16] == file, f"{name}: the encoder wrote other bytes"
+        got = decode_rgb(data, probe(data)).permute(1, 2, 0).contiguous().numpy()
+        assert hashlib.sha256(got.tobytes()).hexdigest() == pixels, name
+
+
+def test_the_decode_packs_pillows_pixels_as_tobytes_does() -> None:
+    """The decode's tensor is Pillow's own bytes, packed straight into one writable buffer: equal to `np.asarray` at
+    1 x 1, a single row and column, odd sizes and rows wider than one of the encoder's chunks."""
+    from llm_mini_infer.vision.family import _rgb
+
+    rng = np.random.default_rng(5)
+    for w, h in ((1, 1), (1, 7), (9, 1), (37, 23), (20000, 3), (3, 20000), (641, 479)):
+        im = Image.fromarray(rng.integers(0, 256, (h, w, 3), dtype=np.uint8), "RGB")
+        got = _rgb(im, torch)
+        assert got.shape == (h, w, 3) and np.array_equal(got.numpy(), np.asarray(im)), (w, h)
+        got[0, 0, 0] = 7  # writable: its own buffer
+
+
+def test_a_pillow_without_its_private_encoder_takes_the_public_path(monkeypatch) -> None:
+    """`Image._getencoder` is Pillow's private name: without it (a `PIL.Image` that lacks only that name, as the
+    decode imports it; Pillow's own calls keep theirs), the decode packs the same pixels through numpy, every JPEG case
+    of the old decoder's and an odd size included."""
+    import PIL
+
+    from llm_mini_infer.vision.family import _rgb, decode_rgb
+
+    class Without:
+        def __getattr__(self, name: str):
+            if name == "_getencoder":
+                raise AttributeError(name)
+            return getattr(Image, name)
+
+    cases = list(old_jpeg_cases().values())
+    want = [decode_rgb(data, probe(data)) for data in cases]
+    im = Image.fromarray(np.random.default_rng(6).integers(0, 256, (23, 37, 3), dtype=np.uint8), "RGB")
+    monkeypatch.setattr(PIL, "Image", Without())
+    for data, pixels in zip(cases, want, strict=True):
+        assert torch.equal(decode_rgb(data, probe(data)), pixels)
+    got = _rgb(im, torch)
+    assert np.array_equal(got.numpy(), np.asarray(im))
+    got[0, 0, 0] = 7  # writable: its own buffer
+
+
+def test_the_resize_is_torchvisions_call_for_call() -> None:
+    """`resize_bicubic`, on torch alone, equals torchvision's uint8 antialiased bicubic resize (the dev group keeps
+    torchvision for the reference tests): up and down, odd sizes, an unchanged size, on the decode's channels-last view
+    and on a contiguous image."""
+    import torchvision.transforms.v2.functional as tvF
+
+    from llm_mini_infer.vision.family import resize_bicubic
+
+    rng = random.Random(3)
+    gen = torch.Generator().manual_seed(3)
+    for k in range(200):
+        h, w = rng.randint(1, 160), rng.randint(1, 160)
+        img = torch.randint(0, 256, (h, w, 3), dtype=torch.uint8, generator=gen).permute(2, 0, 1)
+        if k % 2:
+            img = img.contiguous()
+        th, tw = (h, w) if k % 10 == 0 else (rng.randint(1, 200), rng.randint(1, 200))
+        want = tvF.resize(img.unsqueeze(0), [th, tw], interpolation=tvF.InterpolationMode.BICUBIC, antialias=True)
+        got = resize_bicubic(img, th, tw)
+        assert got.is_contiguous() and torch.equal(got, want[0]), (h, w, th, tw, k % 2)
+
+
+def test_the_serving_code_imports_no_torchvision() -> None:
+    """torchvision is a dev dependency only: in a child that refuses to import it, the vision package and the pool
+    worker's entry import, and both families decode and resize a JPEG, a PNG and a WebP, without asking for it."""
+    import subprocess
+    import sys
+
+    code = """
+import sys
+
+asked = []
+
+
+class Refuse:
+    def find_spec(self, name, path=None, target=None):
+        if name.split(".")[0] == "torchvision":
+            asked.append(name)
+            raise ImportError(f"{name} is refused")
+
+
+sys.meta_path.insert(0, Refuse())
+from llm_mini_infer.synthetic import pattern
+from llm_mini_infer.vision import family, gemma, pool, probe, qwen
+from tests.support.vision_pool import GEMMA70, encoded, exif
+
+fams = [GEMMA70, qwen.QwenVision(start_id=1, pad_id=2, end_id=3, patch=16, merge=2, temporal=2, min_pixels=65536,
+                                 max_pixels=327680, mean=(0.5,) * 3, std=(0.5,) * 3, rescale=1 / 255, mrope=True)]
+for fmt in ("JPEG", "PNG", "WEBP"):
+    data = encoded(pattern(400, 225), fmt, exif=exif(6) if fmt == "JPEG" else exif(6)[6:])
+    h = probe.probe(data)
+    for f in fams:
+        assert tuple(f.pixels(data, h, f.size(h)).shape)[0] == 3
+assert pool.worker_main and not asked and not any(m.split(".")[0] == "torchvision" for m in sys.modules), asked
+"""
+    root = Path(__file__).resolve().parents[2]
+    proc = subprocess.run([sys.executable, "-c", code], cwd=root, capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, proc.stderr[-3000:]
+
+
+def test_a_truncated_or_corrupt_jpeg_is_a_400_with_pillows_words(tmp_path) -> None:
+    """JPEG decodes through Pillow, as PNG and WebP do: a truncated file and one with a broken Huffman table fail
+    their request with a 400 that names Pillow's error; the worker stays up and decodes the next image."""
+    import base64
+    import shutil
+
+    from llm_mini_infer.api.images import ImageInputs
+    from llm_mini_infer.api.protocol import ApiError
+    from llm_mini_infer.engine import ipc as engine_ipc
+
+    gemma = tmp_path / "gemma"  # a Gemma 4 checkpoint's config.json alone
+    gemma.mkdir()
+    (gemma / "config.json").write_text(json.dumps({"model_type": "gemma4", "vision_config": {
+        "patch_size": 16, "pooling_kernel_size": 3, "default_output_length": 70}}))
+    jpg = encoded(pattern(400, 225), "JPEG", quality=90)
+    dht = jpg.index(b"\xff\xc4")
+    bad = {"truncated": jpg[:len(jpg) // 2], "a broken Huffman table": jpg[:dht + 5] + b"\xff" * 16 + jpg[dht + 21:]}
+    words = {"truncated": r"image: OSError: image file is truncated \(\d+ bytes not processed\)",
+             "a broken Huffman table": r"image: OSError: broken data stream when reading image file"}
+
+    def uri(data: bytes) -> str:
+        return "data:image/jpeg;base64," + base64.b64encode(data).decode()
+
+    ipc = engine_ipc.ipc_dir()
+    arena = str(tmp_path / "arena")
+    px_arena.create(arena, 1 << 22)
+    proc = None
+
+    async def main() -> None:
+        images = ImageInputs(GEMMA70, index=0, num_frontends=1, arena_bytes=1 << 22, pool_dir=ipc, workers=1,
+                             max_bytes=1 << 20, fetch_timeout_s=1.0, max_per_request=1)
+        images.start()
+        try:
+            for name, data in bad.items():
+                prep = await images.prepare([uri(data)])
+                with pytest.raises(ApiError) as err:
+                    await asyncio.wait_for(images.wait(prep), 60)
+                assert err.value.status == 400 and re.fullmatch(words[name], err.value.message), err.value.message
+                images.discard(prep)
+            prep = await images.prepare([uri(jpg)])
+            await asyncio.wait_for(images.wait(prep), 60)
+            images.discard(prep)
+        finally:
+            await images.close()
+
+    try:
+        proc, ready = spawn_pool_worker(gemma, None, None, ipc, arena)
+        assert ready, f"the worker exited before it was ready (exit code {proc.exitcode})"
+        asyncio.run(main())
+        assert proc.is_alive()
+    finally:
+        if proc is not None:
+            proc.kill()
+            proc.join(10)
+        px_arena.remove(arena)
+        shutil.rmtree(ipc, ignore_errors=True)
+
+
+def test_an_image_past_pillows_pixel_limit_warns_and_twice_it_fails(monkeypatch) -> None:
+    """Every format decodes through Pillow, JPEG too: a stored size above Image.MAX_IMAGE_PIXELS decodes with
+    Pillow's DecompressionBombWarning, and above twice it is Pillow's DecompressionBombError (a 400 from the pool).
+    images.max_source_pixels is at most twice Pillow's default, so the probe refuses such an image first."""
+    from llm_mini_infer.vision.family import decode_rgb
+    from llm_mini_infer.vision.probe import MAX_SOURCE_PIXELS
+
+    assert MAX_SOURCE_PIXELS == 2 * Image.MAX_IMAGE_PIXELS
+    img = pattern(40, 20)
+    for fmt in ("JPEG", "PNG", "WEBP"):
+        data = encoded(img, fmt)
+        monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 40 * 20 - 1)
+        with pytest.warns(Image.DecompressionBombWarning):
+            assert tuple(decode_rgb(data, probe(data)).shape) == (3, 20, 40)
+        monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 40 * 20 // 2 - 1)
+        with pytest.raises(Image.DecompressionBombError):
+            decode_rgb(data, probe(data))
 
 
 # -- transparency: vLLM's composite onto white ------------------------------------------------------------------------

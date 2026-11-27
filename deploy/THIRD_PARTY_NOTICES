@@ -33,14 +33,23 @@ keeps its own at site-packages/nvidia/cusparselt/LICENSE.txt). The wheels that c
 - tokenizers: Apache-2.0, as its metadata's classifier states (the text: llm-mini-infer's LICENSE); its SBOM,
   site-packages/tokenizers-*.dist-info/sboms/, lists the Rust crates compiled into it and their licences
 
-torchvision's wheel carries only torchvision's licence. The libraries it bundles (site-packages/torchvision.libs/) are
-under their projects' licences, which Pillow's licence file reproduces a section each
-(site-packages/pillow-*.dist-info/licenses/LICENSE), or NVIDIA's:
+Pillow's wheel bundles the libraries it reads and writes images with (site-packages/pillow.libs/), under their
+projects' licences, which Pillow's licence file reproduces a section each
+(site-packages/pillow-*.dist-info/licenses/LICENSE):
 - libjpeg: Pillow's LIBJPEG
 - libpng16: Pillow's LIBPNG
-- libwebp, libsharpyuv: Pillow's LIBWEBP
-- libz: Pillow's ZLIB
-- libnvjpeg, libcudart: the CUDA runtime wheel's, site-packages/nvidia_cuda_runtime-*.dist-info/licenses/License.txt
+- libwebp, libwebpdemux, libwebpmux, libsharpyuv: Pillow's LIBWEBP
+- libtiff: Pillow's LIBTIFF
+- libopenjp2: Pillow's OPENJPEG
+- libavif: Pillow's LIBAVIF
+- liblcms2: Pillow's LCMS2
+- libfreetype: Pillow's FREETYPE2
+- libharfbuzz: Pillow's HARFBUZZ
+- libbrotlicommon, libbrotlidec: Pillow's BROTLI
+- liblzma: Pillow's LIBLZMA
+- libzstd: Pillow's ZSTD
+- libxcb: Pillow's XCB
+- libXau: Pillow's XAU
 
 
 apt packages (Ubuntu 24.04, and the base image's CUDA packages)
