@@ -5,8 +5,9 @@ The size comes from each format's header; the orientation is read the way Pillow
 - **EXIF:** JPEG APP1 `Exif` segments (concatenated, as Pillow does), the PNG `eXIf` chunk or a "Raw profile type exif"
   text chunk, and the WebP `EXIF` chunk. The Orientation tag (0x0112) of IFD0 as Pillow loads it (`exif_orientation`):
   its first value, of any numeric type, is the orientation when it equals 2..8; anything else counts as 1.
-- **XMP**, when EXIF has no Orientation tag: `tiff:Orientation="N"` or `<tiff:Orientation>N</tiff:Orientation>` in
-  the JPEG APP1 XMP segment (the last one), the PNG iTXt `XML:com.adobe.xmp` chunk, or the WebP `XMP ` chunk.
+- **XMP**, when there is no EXIF, it is empty, or its IFD0 has no Orientation tag: `tiff:Orientation="N"` or
+  `<tiff:Orientation>N</tiff:Orientation>` in the JPEG APP1 XMP segment (the last one), the PNG iTXt
+  `XML:com.adobe.xmp` chunk, or the WebP `XMP ` chunk. EXIF that Pillow cannot parse counts as 1, without the XMP.
 - Orientations 5..8 swap width and height.
 
 Formats: JPEG, PNG, GIF, WebP and BMP (their first frame, as Pillow opens it). Anything else is a `ProbeError` (a
@@ -38,6 +39,9 @@ _XMP_ORIENTATION = re.compile(rb'tiff:Orientation(="|>)([0-9])')
 _TIFF_TYPES: dict[int, tuple[int, str | None]] = {
     1: (1, None), 2: (1, None), 3: (2, "H"), 4: (4, "I"), 5: (8, "R"), 6: (1, "b"), 7: (1, None), 8: (2, "h"),
     9: (4, "i"), 10: (8, "r"), 11: (4, "f"), 12: (8, "d"), 13: (4, "I"), 16: (8, "Q")}
+# The TIFF headers Pillow's EXIF loader reads (`TiffImagePlugin.PREFIXES`): 42 in either byte order, and a big-endian
+# 43, which it reads as classic TIFF; its other one, a little-endian BigTIFF, raises there (`Exif.load` reads 8 bytes)
+_TIFF_HEADS = (b"MM\x00\x2a", b"II\x2a\x00", b"MM\x2a\x00", b"II\x00\x2a", b"MM\x00\x2b")
 _SOF = frozenset({0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF})
 # The most pixels an image may store (images.max_source_pixels' default and bound): Pillow's decompression-bomb bound
 # (2 x Image.MAX_IMAGE_PIXELS)
@@ -99,24 +103,25 @@ def check_source_pixels(header: Header, limit: int = MAX_SOURCE_PIXELS) -> None:
 
 
 def exif_orientation(exif: bytes) -> int | None:
-    """The Orientation tag of IFD0 in a TIFF/EXIF block (with or without the `Exif\\0\\0` prefix), as Pillow 13 loads
-    it (`TiffImagePlugin.ImageFileDirectory_v2.load`) and `exif_transpose` applies it: the first entry of the tag with
-    data of a type Pillow reads (inline up to 4 bytes, else at its offset, within Pillow's running bound of the block's
-    length), and that data's first value, whatever the count. 2..8 when the value equals one (a SHORT or LONG, a signed
-    or IFD type, a float or a rational: Pillow's lookup compares numbers), else 1 (bytes and text never match). None
-    when the tag is absent, the block is broken, or the entry's data lies past the block's end (Pillow stops reading
-    IFD0 there). Pillow stops there for an earlier tag's data too; that is not followed (rare)."""
-    t = exif[6:] if exif[:6] == b"Exif\x00\x00" else exif
-    if len(t) < 8:
+    """The Orientation tag of IFD0 in a TIFF/EXIF block (behind up to two `Exif\\0\\0` prefixes, which Pillow strips),
+    as Pillow 13 loads it (`Image.Exif.load`, `TiffImagePlugin.ImageFileDirectory_v2.load`) and `exif_transpose`
+    applies it: the first entry of the tag with data of a type Pillow reads (inline up to 4 bytes, else at its offset,
+    within Pillow's running bound of the block's length), and that data's first value, whatever the count. 2..8 when
+    the value equals one (a SHORT or LONG, a signed or IFD type, a float or a rational: Pillow's lookup compares
+    numbers), else 1 (bytes and text never match). 1 too when Pillow cannot parse the block (shorter than a TIFF header,
+    or a header not in `_TIFF_HEADS`): `getexif` raises before it reads any XMP, and the image is served as stored.
+    None when Pillow finds no Orientation: the block empty once stripped, no such tag, IFD0 or the entry's data past the
+    block's end (Pillow warns and stops reading IFD0 there). Pillow stops there for an earlier tag's data too; that is
+    not followed (rare)."""
+    t = exif
+    for _ in range(2):
+        if t[:6] == b"Exif\x00\x00":
+            t = t[6:]
+    if not t:
         return None
-    if t[:2] == b"II":
-        e = "<"
-    elif t[:2] == b"MM":
-        e = ">"
-    else:
-        return None
-    if struct.unpack_from(e + "H", t, 2)[0] != 42:
-        return None
+    if len(t) < 8 or t[:4] not in _TIFF_HEADS:
+        return 1
+    e = "<" if t[:2] == b"II" else ">"
     ifd = struct.unpack_from(e + "I", t, 4)[0]
     if ifd + 2 > len(t):
         return None

@@ -7,6 +7,7 @@ format, colour mode and EXIF/XMP orientation the probe reads, and random pixels 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import io
 import json
 import multiprocessing as mp
@@ -1071,6 +1072,70 @@ def xmp_packet(o: int) -> bytes:
     return (f'<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF><rdf:Description tiff:Orientation="{o}"/>'
             f"</rdf:RDF></x:xmpmeta>").encode()
 
+
+
+def pillow_pixels(data: bytes) -> torch.Tensor:
+    """The image as vLLM decodes it (`normalize_image`: `exif_transpose`, the image as stored when it raises), RGB."""
+    im = Image.open(io.BytesIO(data))
+    with contextlib.suppress(Exception):
+        im = ImageOps.exif_transpose(im)
+    return torch.from_numpy(np.asarray(im.convert("RGB")).copy()).permute(2, 0, 1)
+
+
+def agrees_with_pillow(data: bytes) -> int:
+    """The probe's orientation, checked against Pillow's: the orientation it reads, the oriented size, the pixels."""
+    from llm_mini_infer.vision.family import decode_rgb
+
+    h = probe(data)
+    want = pillow_pixels(data)
+    assert h.orientation == pillow_orientation(data)[0]
+    assert h.oriented == (want.shape[2], want.shape[1])
+    assert torch.equal(decode_rgb(data, h), want)
+    return h.orientation
+
+
+def test_a_doubled_exif_prefix_and_junk_exif_beside_xmp_are_read_as_pillow_reads_them() -> None:
+    """#23's two cases, at orientations 2..8: an EXIF block behind two `Exif\\0\\0` prefixes, which Pillow strips
+    (JPEG APP1, PNG eXIf, WebP EXIF); and EXIF Pillow cannot parse beside an XMP orientation (JPEG and PNG), where
+    getexif raises before it reads the XMP and exif_transpose leaves the image as stored, as vLLM serves it."""
+    img = pattern(40, 20)
+    for o in range(2, 9):
+        tiff = exif(o)[6:]
+        doubled = [encoded(img, "JPEG", exif=b"Exif\x00\x00" * 2 + tiff),
+                   encoded(img, "PNG", exif=b"Exif\x00\x00" * 2 + tiff),  # Pillow writes the eXIf chunk one prefix off
+                   encoded(img, "WEBP", exif=b"Exif\x00\x00" * 3 + tiff, lossless=True)]  # and the WebP chunk
+        for data in doubled:
+            assert Image.open(io.BytesIO(data)).info["exif"] == b"Exif\x00\x00" * 2 + tiff
+            assert agrees_with_pillow(data) == o
+        info = PngImagePlugin.PngInfo()
+        info.add_itxt("XML:com.adobe.xmp", xmp_packet(o).decode())
+        junk = [encoded(img, "JPEG", exif=b"Exif\x00\x00not a tiff header", xmp=xmp_packet(o)),
+                encoded(img, "PNG", exif=b"not a tiff header", pnginfo=info)]
+        for data in junk:
+            assert agrees_with_pillow(data) == 1
+
+
+def test_exif_without_an_orientation_falls_back_to_xmp_and_exif_pillow_cannot_parse_is_1() -> None:
+    """An EXIF block beside an XMP orientation of 6, in JPEG, PNG and WebP, read as Pillow's getexif reads it: IFD0's
+    orientation when it has one (a TIFF header of either byte order of 42, or a big-endian 43, which Pillow reads as
+    classic TIFF); the XMP's when Pillow finds none (the block empty once its prefixes are stripped, no Orientation
+    tag, IFD0 or the Orientation's data past the block's end, an entry cut short); 1 when Pillow cannot parse it
+    (shorter than a TIFF header, another byte order, another magic number, a little-endian BigTIFF, a third prefix):
+    getexif raises before it reads the XMP, and the image is served as stored."""
+    p, o3, o3be = b"Exif\x00\x00", orientation_entry(3, [3]), orientation_entry(3, [3], big=True)
+    cases = [(p + o3, 3), (p + o3[:2] + b"\x00\x2a" + o3[4:], 3), (p + o3be[:2] + b"\x2a\x00" + o3be[4:], 3),
+             (p + o3be[:2] + b"\x00\x2b" + o3be[4:], 3),
+             (p, 6), (p * 2, 6), (p + ifd0([(0x010F, 2, 4, b"abc\0")]), 6), (p + b"II*\x00" + struct.pack("<I", 99), 6),
+             (p + orientation_entry(3, [3, 3, 3])[:26], 6), (p + ifd0([(0x010F, 2, 4, b"abc\0")] * 2)[:22], 6),
+             (p + b"M", 1), (p + o3[:6], 1), (p + o3[:7], 1), (p + b"XY" + o3[2:], 1),
+             (p + b"II\x2b\x00" + o3[4:], 1), (p + b"II\x2c\x00" + o3[4:], 1), (p * 3 + o3, 1)]
+    img = pattern(40, 20)
+    info = PngImagePlugin.PngInfo()
+    info.add_itxt("XML:com.adobe.xmp", xmp_packet(6).decode())
+    for block, want in cases:
+        for data in (encoded(img, "JPEG", exif=block, xmp=xmp_packet(6)), encoded(img, "PNG", exif=block, pnginfo=info),
+                     encoded(img, "WEBP", exif=p + block, xmp=xmp_packet(6), lossless=True)):
+            assert agrees_with_pillow(data) == want, (data[:4], block)
 
 # The JPEG cases' file digests (the first 16 hex digits) and the pixels the decoder before Pillow gave them
 # (torchvision's decode_jpeg, oriented by the probe), as sha256 of the HWC uint8 bytes, the same on the Mac and on linux
