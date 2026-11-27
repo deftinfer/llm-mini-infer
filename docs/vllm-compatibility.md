@@ -182,6 +182,7 @@ These rules follow the reference too.
 ### Images
 
 - **EXIF** that cannot be read leaves the image as stored.
+- **A JPEG with more than 4,096 markers and fill bytes before its frame header** gets a 400; vLLM decodes it. Real files hold a few hundred at most (an ICC profile takes up to 255 segments).
 - **Transparency** (RGBA, LA, PA, or a `transparency` entry) is composited onto white.
 
 ### Scheduling and start-up
