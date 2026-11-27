@@ -35,6 +35,10 @@ docker stop -t 60 llm-mini-infer                  # the default of 10 s cuts the
 ```
 
 A mounted checkpoint's served name is its path, unless `model.served_model_name` is set.
+Use a single name, a YAML list such as `served_model_name: [primary, alternate]`, or the CLI form
+`--served-model-name primary alternate`. Clients can send any listed name as `model`. The server
+lists each distinct alias in `/v1/models`, and uses the first name for the response's `model` field
+and metrics. The effective config in `/server_info` retains the configured string or list.
 
 ### docker compose
 
@@ -99,7 +103,7 @@ A deployment sets the rest with `--set`, the chart's `config`, or a file mounted
 | setting | default | what it does |
 |---|---|---|
 | `model.path` | (required) | a checkpoint directory, or a Hugging Face repo id |
-| `model.served_model_name` | the path as given | the name that clients send as `model` |
+| `model.served_model_name` | the path as given | one name or a list of accepted aliases; first is canonical |
 | `model.max_model_len` | `config.json`'s position limit (8,192 if none) | the context. A derived value is lowered, with a warning, to what the KV pool holds. A set value past the position limit, or that does not fit, stops the startup, naming what fits |
 | `model.chat_template_kwargs` | `{}` | defaults for the chat template's variables |
 | `sampling.temperature`, `top_p`, `top_k`, `min_p` | `generation_config.json`'s, else 1.0, 1.0, 0 (off), 0.0 | defaults for the fields that a request leaves out (the file's penalties too, with `server.penalties`) |

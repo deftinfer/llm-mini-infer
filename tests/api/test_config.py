@@ -1146,3 +1146,31 @@ def test_a_files_penalty_out_of_range_is_refused(tmp_path, key, value, match) ->
     with pytest.raises(ValueError, match=match):
         _penalties(model, True)
     assert _values(_penalties(model, False)) == (1.0, 0.0, 0.0)
+
+
+def test_served_model_name_accepts_yaml_lists_and_preserves_strings(tmp_path) -> None:
+    path = tmp_path / "aliases.yaml"
+    path.write_text("model:\n  served_model_name: [primary, alternate]\n")
+    assert config.load(str(path), {}).model.served_model_name == ["primary", "alternate"]
+    assert config.load(None, {"model.served_model_name": "only"}).model.served_model_name == "only"
+    assert config.load(None, {}).model.served_model_name is None
+
+
+@pytest.mark.parametrize("aliases", [[], [""], ["valid", "   "]])
+def test_served_model_name_rejects_empty_alias_lists(aliases) -> None:
+    with pytest.raises(ValueError, match="non-empty model names"):
+        config.load(None, {"model.served_model_name": aliases})
+
+
+def test_serve_model_name_accepts_one_or_more_cli_names() -> None:
+    from argparse import ArgumentParser
+
+    from llm_mini_infer import cli
+
+    parser = cli.serve_args(ArgumentParser())
+    key = "model.served_model_name"
+    one = cli.overrides(parser.parse_args(["--served-model-name", "primary"]))
+    two = cli.overrides(parser.parse_args(["--served-model-name", "primary", "alternate"]))
+    assert one[key] == "primary"
+    assert two[key] == ["primary", "alternate"]
+    assert key not in cli.overrides(parser.parse_args([]))

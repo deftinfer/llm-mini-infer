@@ -971,6 +971,20 @@ def test_an_unknown_model_is_a_404_that_names_the_served_one(server) -> None:
         "The model `x` does not exist. Valid aliases: google/gemma-4-31B-it."
 
 
+def test_configured_model_aliases_are_listed_and_canonicalized(tmp_path) -> None:
+    with Server(require_qwen(), tmp_path,
+                extra={"model": {"served_model_name": ["primary", "alternate", "primary"]}}).start() as srv:
+        code, data = srv.get("/v1/models")
+        assert code == 200
+        assert [row["id"] for row in json.loads(data)["data"]] == ["primary", "alternate"]
+        for name in ("primary", "alternate"):
+            code, data = srv.post(CHAT, chat(model=name, max_tokens=2, seed=SEED))
+            assert code == 200 and data["model"] == "primary", data
+        code, data = srv.post(CHAT, chat(model="unknown", max_tokens=2))
+        assert code == 404
+        assert data["error"]["message"] == "The model `unknown` does not exist. Valid aliases: primary, alternate."
+
+
 def test_a_default_chat_template_or_tokenize_is_dropped(tmp_path) -> None:
     """model.chat_template_kwargs holding `chat_template` and `tokenize`: only the request's own kwargs are checked, so
     the server starts and serves, and the renderer drops both."""

@@ -276,7 +276,9 @@ class App:
     def __init__(self, cfg: Config, index: int, ipc_path: str, pool_state: Any = None):
         self.cfg = cfg
         self.index = index
-        self.model_name = cfg.model.served_model_name or cfg.model.path
+        names = cfg.model.served_model_name
+        self.model_names = tuple(dict.fromkeys(names)) if isinstance(names, list) else (names or cfg.model.path,)
+        self.model_name = self.model_names[0]
         self.max_model_len = cfg.model.max_model_len
         self.renderer = Renderer(cfg.model.path, cfg.model.tokenizer)
         # the logits' width: a token id in a request must be below it (the tokenizer's size when config.json gives none)
@@ -596,9 +598,9 @@ class App:
 
     def models_body(self) -> bytes:
         return _enc.encode({"object": "list", "data": [{
-            "id": self.model_name, "object": "model", "created": self.created, "owned_by": "llm-mini-infer",
+            "id": name, "object": "model", "created": self.created, "owned_by": "llm-mini-infer",
             "root": self.cfg.model_source.split("@")[0] or self.cfg.model.path, "parent": None,
-            "max_model_len": self.max_model_len, "permission": []}]})
+            "max_model_len": self.max_model_len, "permission": []} for name in self.model_names]})
 
     def server_info_body(self) -> bytes:
         """The effective configuration, the reason for each derived value, and the runner's capabilities
@@ -614,8 +616,9 @@ class App:
         """None or "": the served model; any other name is a 404 that names the served ones, as vLLM's
         `_check_model` does, its message sanitized as vLLM sanitizes every error's (a path, the model's as given
         among them, becomes `<path>`)."""
-        if model and model != self.model_name:
-            raise ApiError(404, sanitize(f"The model `{model}` does not exist. Valid aliases: {self.model_name}."),
+        if model and model not in self.model_names:
+            aliases = ", ".join(self.model_names)
+            raise ApiError(404, sanitize(f"The model `{model}` does not exist. Valid aliases: {aliases}."),
                            "model", "NotFoundError")
 
     def admit(self) -> None:

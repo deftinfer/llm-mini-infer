@@ -120,7 +120,7 @@ Each row gives vLLM's setting (its default) and the server's (its default):
 
 | vLLM | llm-mini-infer |
 |---|---|
-| `--served-model-name` (the model as given) | `model.served_model_name` (the model as given) |
+| `--served-model-name NAME [NAME ...]` (the model as given) | Same flag or `model.served_model_name` as a string or list; the first name is reported |
 | `--seed` (0) | `scheduler.seed` (random; the image's file sets 0) |
 | `--structured-outputs-config` `backend`, `disable_any_whitespace` (`auto`, `false`) | `structured_output.backend`, `disable_any_whitespace` (`auto`, `false`; the image's file sets `guidance`, `true`) |
 | `--default-chat-template-kwargs` (none) | `model.chat_template_kwargs` (`{}`) |
