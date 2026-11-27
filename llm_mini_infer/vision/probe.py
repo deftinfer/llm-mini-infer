@@ -39,8 +39,9 @@ _XMP_ORIENTATION = re.compile(rb'tiff:Orientation(="|>)([0-9])')
 _TIFF_TYPES: dict[int, tuple[int, str | None]] = {
     1: (1, None), 2: (1, None), 3: (2, "H"), 4: (4, "I"), 5: (8, "R"), 6: (1, "b"), 7: (1, None), 8: (2, "h"),
     9: (4, "i"), 10: (8, "r"), 11: (4, "f"), 12: (8, "d"), 13: (4, "I"), 16: (8, "Q")}
-# The TIFF headers Pillow's EXIF loader reads (`TiffImagePlugin.PREFIXES`): 42 in either byte order, and a big-endian
-# 43, which it reads as classic TIFF; its other one, a little-endian BigTIFF, raises there (`Exif.load` reads 8 bytes)
+# The TIFF headers Pillow's EXIF loader reads (`TiffImagePlugin.PREFIXES`): II or MM, then 42 written in either byte
+# order (the byte order is the mark's), or MM then 43, which it reads as classic TIFF; its other one, a little-endian
+# BigTIFF, raises there (`Exif.load` reads 8 bytes)
 _TIFF_HEADS = (b"MM\x00\x2a", b"II\x2a\x00", b"MM\x2a\x00", b"II\x00\x2a", b"MM\x00\x2b")
 _SOF = frozenset({0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF})
 # The most pixels an image may store (images.max_source_pixels' default and bound): Pillow's decompression-bomb bound
@@ -109,7 +110,8 @@ def exif_orientation(exif: bytes) -> int | None:
     within Pillow's running bound of the block's length), and that data's first value, whatever the count. 2..8 when
     the value equals one (a SHORT or LONG, a signed or IFD type, a float or a rational: Pillow's lookup compares
     numbers), else 1 (bytes and text never match). 1 too when Pillow cannot parse the block (shorter than a TIFF header,
-    or a header not in `_TIFF_HEADS`): `getexif` raises before it reads any XMP, and the image is served as stored.
+    or a header not in `_TIFF_HEADS`): `getexif` raises before it reads any XMP (a JPEG's open, reading its DPI,
+    swallows the error, and its EXIF then holds nothing), and the image is served as stored.
     None when Pillow finds no Orientation: the block empty once stripped, no such tag, IFD0 or the entry's data past the
     block's end (Pillow warns and stops reading IFD0 there). Pillow stops there for an earlier tag's data too; that is
     not followed (rare)."""
