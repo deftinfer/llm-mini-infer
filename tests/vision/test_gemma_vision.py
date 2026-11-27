@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 import torch
 
+from llm_mini_infer.vision.family import transposed
 from llm_mini_infer.vision.gemma import SOFT_TOKENS, GemmaVision, aspect_ratio_size
 from llm_mini_infer.vision.probe import probe
 
@@ -153,6 +154,8 @@ def _ours(data: bytes, fam: GemmaVision = FAM) -> tuple[np.ndarray, np.ndarray]:
     header = probe(data)
     size = fam.size(header)
     px = fam.pixels(data, header, size)
+    if tuple(px.shape[1:]) != (size.height, size.width):  # Pillow turned a non-square image: the decode decides
+        size = transposed(size)
     assert px.dtype == torch.uint8 and tuple(px.shape) == (3, size.height, size.width)
     patches = GemmaVisionEncoder.patches(enc, px).numpy()
     xs, ys = pool_order(size.grid[1], size.grid[2], 3, torch.device("cpu"))

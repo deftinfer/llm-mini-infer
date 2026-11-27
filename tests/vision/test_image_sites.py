@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from ..support.paths import DATA, ROOT
+from ..support.paths import DATA, MODELS_DIR, ROOT
 
 PACKAGE = ROOT / "llm_mini_infer"
 FAMILY = "llm_mini_infer.vision.family"
@@ -178,3 +178,65 @@ def test_the_runner_builds_its_tower_buckets_at_the_setting(tiny_mm, caplog, inv
                          "eagerly"), line
     assert enc.describe(True).endswith(f"images of at most 280 soft tokens; tower graphs for {count} buckets of "
                                        f"261-{top} patches")
+
+
+def _symmetry_sizes() -> list[tuple[int, int]]:
+    """(height, width): every size 1..64 on each side, then seeded random sizes up to 65,535 per side (log-uniform, so
+    the extreme aspect ratios come up), with the extremes of the range and of the aspect limits."""
+    import random
+
+    sizes = [(h, w) for h in range(1, 65) for w in range(1, 65)]
+    rng = random.Random(20261127)
+    sizes += [(int(2 ** rng.uniform(0, 16)) or 1, int(2 ** rng.uniform(0, 16)) or 1) for _ in range(4000)]
+    sizes += [(65535, 65535), (1, 65535), (65535, 1), (200, 40000), (40000, 200), (201, 40000), (3, 600), (600, 3),
+              (2, 400), (400, 2), (1, 200), (1, 201), (4000, 20), (20, 4000)]
+    return sizes
+
+
+def _symmetric_families():
+    """(name, family) for every image family the engine loads on its fixtures: Gemma 4 at 70, 280 and 1120 soft
+    tokens, Qwen3.8 at the checkpoint's pixel bounds and at 65,536 / 327,680; the ones whose fixtures are absent are
+    left out."""
+    from llm_mini_infer.vision import family as vf
+
+    out = []
+    gemma = MODELS_DIR / "gemma-4-31b-it"
+    if (gemma / "config.json").exists():
+        out += [(f"gemma-{k}", vf.load(gemma, max_soft_tokens=k)) for k in (70, 280, 1120)]
+    qwen = MODELS_DIR / "qwen3.8-27b"
+    if (qwen / "config.json").exists():
+        out += [("qwen-checkpoint", vf.load(qwen)), ("qwen-65536-327680", vf.load(qwen, min_pixels=65536,
+                                                                                   max_pixels=327680))]
+    return out
+
+
+def test_every_image_family_sizes_an_image_the_same_turned() -> None:
+    """The decode decides the orientation and the frontend sizes the image as stored (`vision.family`): its span and
+    arena range hold either way only if every family is symmetric under a transpose, `size` of the image turned being
+    `transposed` of its `size`, and a ValueError in one orientation iff in the other, with the same text. Checked on
+    every size 1..64 by 1..64 and thousands of seeded random ones up to 65,535 per side, at both ends of the aspect
+    limits, for Gemma 4 (70, 280 and 1,120 soft tokens) and Qwen3.8 (the checkpoint's bounds, and 65,536 / 327,680)."""
+    from llm_mini_infer.vision.family import transposed
+    from llm_mini_infer.vision.probe import Header
+
+    families = _symmetric_families()
+    if not families:
+        pytest.skip("tests/.fixtures/models/gemma-4-31b-it and qwen3.8-27b are absent: "
+                    "uv run tests/scripts/fetch_fixtures.py")
+    sizes = _symmetry_sizes()
+    refused = 0
+    for name, fam in families:
+        for h, w in sizes:
+            try:
+                a = fam.size(Header("jpeg", w, h))
+            except ValueError as exc:
+                a, text = None, str(exc)
+            try:
+                b = fam.size(Header("jpeg", h, w))
+            except ValueError as exc:
+                assert a is None and str(exc) == text, (name, h, w, str(exc))
+                refused += 1
+                continue
+            assert a is not None, (name, h, w, "refused only as stored")
+            assert b == transposed(a), (name, h, w, a, b)
+    assert refused, "the sizes never reached a family's refusal (an aspect limit)"

@@ -4,9 +4,9 @@
 # (https://github.com/huggingface/transformers), and changed for llm-mini-infer.
 """Images for Qwen3.5 / Qwen3.8 (`Qwen3_5ForConditionalGeneration`): the Qwen2-VL image processor's rules.
 
-- **Sizing** (`size`): transformers' `smart_resize` with factor = patch × merge (32), operation for operation, taken
-  after the orientation. The grid is (1, h / 16, w / 16) patches and the image takes h × w / (16 × 16 × 4) tokens: 84
-  for a 400×225 photo (384 × 224).
+- **Sizing** (`size`): transformers' `smart_resize` with factor = patch × merge (32), operation for operation, on the
+  stored size (symmetric under a transpose: the pool turns the target with the image, `family`). The grid is
+  (1, h / 16, w / 16) patches and the image takes h × w / (16 × 16 × 4) tokens: 84 for a 400×225 photo (384 × 224).
 - **Pixels** (`pixels`, in the image pool): the shared exact uint8 path (`family.decode_rgb`), then the antialiased
   bicubic resize on uint8 the processor's torchvision backend runs (`family.resize_bicubic`). Normalisation and
   patchifying run on the GPU (`models.qwen3_5.vision`).
@@ -26,7 +26,7 @@ from typing import Any
 
 import numpy as np
 
-from .family import ImageFamily, ImageSize, Span, decode_rgb, resize_bicubic
+from .family import ImageFamily, ImageSize, Span, decode_rgb, resize_bicubic, target
 from .probe import Header
 
 MAX_ASPECT = 200  # transformers rejects images whose sides differ by more than this factor
@@ -88,8 +88,7 @@ class QwenVision(ImageFamily):
     # -- frontend --------------------------------------------------------------------------------------------------
 
     def size(self, header: Header) -> ImageSize:
-        width, height = header.oriented
-        h, w = smart_resize(height, width, self.factor, self.min_pixels, self.max_pixels)
+        h, w = smart_resize(header.height, header.width, self.factor, self.min_pixels, self.max_pixels)
         grid = (1, h // self.patch, w // self.patch)
         return ImageSize(height=h, width=w, grid=grid, tokens=grid[1] * grid[2] // (self.merge * self.merge))
 
@@ -99,7 +98,8 @@ class QwenVision(ImageFamily):
     # -- image pool ------------------------------------------------------------------------------------------------
 
     def pixels(self, data: bytes, header: Header, size: ImageSize) -> Any:
-        return resize_bicubic(decode_rgb(data, header), size.height, size.width)
+        img = decode_rgb(data, header)
+        return resize_bicubic(img, *target(img, header, size))
 
     # -- scheduler -------------------------------------------------------------------------------------------------
 

@@ -484,11 +484,23 @@ def packaged_references() -> tuple[dict[str, Any], list[dict[str, Any]]]:
     return host, parse_references(raw["loads"], REFERENCES.name)
 
 
+def oriented_size(path: Path | io.BytesIO) -> tuple[int, int]:
+    """A frame's (width, height) as the model sees it: Pillow's header and its EXIF orientation, as the image pool
+    applies it (`vision.family.decode_rgb`); nothing decodes but a PNG's pixels when Pillow looks for its EXIF."""
+    from PIL import Image
+
+    with Image.open(path) as im:
+        w, h = im.size
+        with contextlib.suppress(Exception):  # EXIF that Pillow cannot read: as stored
+            if im.getexif().get(0x0112, 1) in range(5, 9):
+                w, h = h, w
+    return w, h
+
+
 def mounted_inputs(folder: Path) -> Inputs:
     """`folder`'s images (`frames/*.jpg` and `*.jpeg`, sorted), prompt (`prompt.md` or `prompt.txt`), schema
     (`schema.json`), and optionally its user turn (`user.txt`) and references (`reference.json`). Image names are never
     logged; only counts and sizes are."""
-    from .vision.probe import probe
 
     frames_dir = folder / "frames"
     files = sorted(p for p in frames_dir.glob("*") if p.suffix.lower() in (".jpg", ".jpeg")) \
@@ -506,7 +518,7 @@ def mounted_inputs(folder: Path) -> Inputs:
     shapes: dict[str, int] = {}
     sizes: list[tuple[int, int]] = []
     for f in files:
-        w, h = probe(f.read_bytes()).oriented  # the header only: nothing decodes
+        w, h = oriented_size(f)
         sizes.append((w, h))
         shapes[f"{w}x{h}"] = shapes.get(f"{w}x{h}", 0) + 1
     top = dict(sorted(shapes.items(), key=lambda kv: -kv[1])[:4])

@@ -1,12 +1,14 @@
 """A frontend's image inputs (architecture.md, "Images"): fetch the bytes, probe the header, size the placeholders,
-hash, and have the image pool write the pixels into the arena.
+and have the image pool write the pixels into the arena and hash the image.
 
-Per request (`App.chat`): `prepare` fetches every image concurrently, probes and sizes each from its header, hashes
-its bytes (`vision.family.span_key`), allocates its pixels in this frontend's arena partition and submits the pool job;
-rendering and tokenizing run while the pool decodes. `expand` turns the one placeholder token per image of the
-tokenized prompt into the image's span, and `wait` collects the pool's results. From the moment the AddRequest is sent
-the engine owns the pixel ranges until it releases the request (`StepOutputs.released`); before that, `discard` frees
-them (after the job finished, if it is still running).
+Per request (`App.chat`): `prepare` fetches every image concurrently, probes and sizes each from its header (the
+stored size: the orientation is the pool's decode's, `vision.family`), allocates its pixels in this frontend's arena
+partition and submits the pool job; rendering and tokenizing run while the pool decodes. `expand` turns the one
+placeholder token per image of the tokenized prompt into the image's span (its token count does not depend on the
+orientation), and `wait` collects the pool's results: whether the pool turned the image (its size and grid then turn)
+and its digest (`vision.family.image_digest`, `span_key`), which the request's image references need. From the
+moment the AddRequest is sent the engine owns the pixel ranges until it releases the request (`StepOutputs.released`);
+before that, `discard` frees them (after the job finished, if it is still running).
 
 Errors are `ApiError` 400s (`prepare`, `wait`): among them a header that declares more pixels than
 `images.max_source_pixels`, refused right after the probe so nothing is allocated or decoded for it, a request whose
@@ -21,17 +23,15 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import struct
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
-import blake3
 import numpy as np
 
 from ..engine.messages import ImageRef
 from ..vision.arena import Allocator
-from ..vision.family import ImageFamily, ImageSize, span_key
+from ..vision.family import ImageFamily, ImageSize, image_digest, span_key, transposed
 from ..vision.fetch import DownloadBudget, DownloadBudgetError, Fetcher, FetchError, fetch_all, image_url
 from ..vision.pool import CLOSED, UNSERVED, Done, Job, PoolClient, PoolState
 from ..vision.probe import MAX_SOURCE_PIXELS, Header, ProbeError, check_source_pixels, probe
@@ -46,10 +46,10 @@ DOWNLOAD_MB = 256  # images.max_request_download_mb's default
 @dataclass
 class Image:
     header: Header
-    size: ImageSize
-    key: int
+    size: ImageSize  # as stored until the pool's answer (`ImageInputs.wait`), then as oriented
     nbytes: int  # the uint8 pixels in the arena
-    digest: bytes = b""  # the full content hash
+    key: int = 0  # the span key and the full content hash, from the pool's answer (`ImageInputs.wait`)
+    digest: bytes = b""
     offset: int = -1  # arena offset (-1: not allocated)
     job: asyncio.Future | None = None
     done: Done | None = None
@@ -128,7 +128,8 @@ class ImageInputs:
         return out
 
     async def prepare(self, urls: list[str], submit: bool = True) -> Prepared:
-        """Fetch, probe, size and hash every image; with `submit`, allocate their pixels and start the pool jobs."""
+        """Fetch, probe and size every image; with `submit`, allocate their pixels and start the pool jobs (without a
+        pool, as in tests, hash them here instead: as stored)."""
         if len(urls) > self.max_per_request:  # vLLM's `--limit-mm-per-prompt` message (Gemma 4's own limit: none)
             raise validation_error(f"At most {self.max_per_request} image(s) may be provided in one prompt.", "image")
         prep = Prepared(t_start=clock())
@@ -157,21 +158,20 @@ class ImageInputs:
                 size = fam.size(header)
             except (ProbeError, ValueError) as exc:
                 raise ApiError(400, f"image: {exc}", "messages") from exc
-            h = blake3.blake3(data)
-            h.update(struct.pack("<II", size.height, size.width))
-            digest = h.digest()
-            prep.images.append(Image(header, size, span_key(digest, self.span_key_bits), 3 * size.height * size.width,
-                                     digest=digest))
+            prep.images.append(Image(header, size, 3 * size.height * size.width))
         prep.t_sized = clock()
+        if submit and self.pool is None:
+            for im, data in zip(prep.images, blobs):
+                self._finish(im, image_digest(data, im.size))
         if submit and self.pool is not None:
             try:
                 for im, data in zip(prep.images, blobs):
                     im.offset = await self._alloc(im.nbytes)
                     hd, sz = im.header, im.size
                     im.job = self.pool.submit(Job(jid=0, fmt=hd.format, width=hd.width, height=hd.height,
-                                                  orientation=hd.orientation, out_h=sz.height,
-                                                  out_w=sz.width, grid_t=sz.grid[0], grid_h=sz.grid[1],
-                                                  grid_w=sz.grid[2], tokens=sz.tokens, offset=im.offset), data)
+                                                  out_h=sz.height, out_w=sz.width, grid_t=sz.grid[0],
+                                                  grid_h=sz.grid[1], grid_w=sz.grid[2], tokens=sz.tokens,
+                                                  offset=im.offset), data)
             except BaseException:
                 self.discard(prep)
                 raise
@@ -179,10 +179,10 @@ class ImageInputs:
         return prep
 
     async def wait(self, prep: Prepared) -> None:
-        """Until the pool wrote every image's pixels. A failed decode is a 400. An image that the pool could not serve
-        is a 503 (module docstring), unless another image of the request is a 400: an image that may have stopped a
-        worker is never retried. The jobs are shielded: a cancelled request frees its pixels only once their jobs
-        resolve (`discard`)."""
+        """Until the pool wrote every image's pixels, each image's size then as oriented and its digest as the pool
+        gave them. A failed decode is a 400. An image that the pool could not serve is a 503 (module docstring), unless
+        another image of the request is a 400: an image that may have stopped a worker is never retried. The jobs are
+        shielded: a cancelled request frees its pixels only once their jobs resolve (`discard`)."""
         t0 = clock()
         retry = ""
         for im in prep.images:
@@ -193,6 +193,10 @@ class ImageInputs:
                 retry = retry or im.done.error
             elif im.done.error:
                 raise ApiError(400, f"image: {im.done.error}", "messages")
+            else:
+                if im.done.transposed:
+                    im.size = transposed(im.size)
+                self._finish(im, im.done.digest)
         if retry:
             raise ApiError(503, f"image: {retry}", kind="ServiceUnavailableError")
         prep.t_pixels = clock()
@@ -223,6 +227,9 @@ class ImageInputs:
                 out[off + k:off + k + len(suf)] = suf
         ends = np.append(starts, len(out))
         return out, [int(o) for o in offsets], [int(ends[h]) for h in hints]
+
+    def _finish(self, im: Image, digest: bytes) -> None:
+        im.digest, im.key = digest, span_key(digest, self.span_key_bits)
 
     def discard(self, prep: Prepared) -> None:
         """Free the pixel ranges of a request that never reached the engine (once their jobs finished)."""

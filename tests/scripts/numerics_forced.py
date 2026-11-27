@@ -435,7 +435,7 @@ class Pixels:
 
         from llm_mini_infer.engine.messages import ImageRef
         from llm_mini_infer.vision.arena import ALIGN
-        from llm_mini_infer.vision.family import span_key
+        from llm_mini_infer.vision.family import span_key, transposed
         from llm_mini_infer.vision.probe import probe
 
         ids: list[int] = []
@@ -447,7 +447,10 @@ class Pixels:
             data = image(part["image"])
             header = probe(data)
             size = self.fam.size(header)
-            px = self.fam.pixels(data, header, size).numpy().reshape(-1)
+            px = self.fam.pixels(data, header, size)
+            if tuple(px.shape[1:]) != (size.height, size.width):  # Pillow turned the image: the decode decides
+                size = transposed(size)
+            px = px.numpy().reshape(-1)
             off = self.next
             self.arena.buf[off:off + len(px)] = px.tobytes()
             self.next += -(-len(px) // ALIGN) * ALIGN

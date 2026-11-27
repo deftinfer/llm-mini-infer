@@ -24,14 +24,14 @@ from PIL import Image, ImageOps, PngImagePlugin
 
 from llm_mini_infer.synthetic import pattern  # the host check's synthetic images too
 from llm_mini_infer.vision import arena as px_arena
-from llm_mini_infer.vision.family import ImageSize, Span, span_key
+from llm_mini_infer.vision.family import ImageSize, Span, image_digest, span_key, transposed
 from llm_mini_infer.vision.fetch import Fetcher, FetchError, from_data_uri, image_url
 from llm_mini_infer.vision.pool import Done
 from llm_mini_infer.vision.probe import Header, ProbeError, probe
 from llm_mini_infer.vision.qwen import QwenVision, smart_resize
 
 from ..support.fixtures import QWEN, require_qwen
-from ..support.vision_pool import GEMMA70, POISON, encoded, exif, run_jobs, spawn_pool_worker
+from ..support.vision_pool import GEMMA70, POISON, encoded, exif, lopsided, run_jobs, spawn_pool_worker
 
 FAMILY = QwenVision(start_id=248053, pad_id=248056, end_id=248054, patch=16, merge=2, temporal=2, min_pixels=65536,
                     max_pixels=327680, mean=(0.5,) * 3, std=(0.5,) * 3, rescale=1 / 255, mrope=True)
@@ -184,6 +184,8 @@ def test_pool_pixels_are_hfs_pixel_values(name, data) -> None:
     header = probe(data)
     size = FAMILY.size(header)
     px = FAMILY.pixels(data, header, size)
+    if tuple(px.shape[1:]) != (size.height, size.width):  # Pillow turned the image: the decode decides
+        size = transposed(size)
     assert px.dtype == torch.uint8 and tuple(px.shape) == (3, size.height, size.width)
     assert np.array_equal(patches(px), hf_pixel_values(data, FAMILY, model_dir))
 
@@ -531,9 +533,8 @@ def test_pool_worker_round_trip(tmp_path) -> None:
             client.start()
             try:
                 job = Job(jid=0, fmt=header.format, width=header.width, height=header.height,
-                          orientation=header.orientation, out_h=size.height,
-                          out_w=size.width, grid_t=1, grid_h=size.grid[1], grid_w=size.grid[2], tokens=size.tokens,
-                          offset=8192)
+                          out_h=size.height, out_w=size.width, grid_t=1, grid_h=size.grid[1], grid_w=size.grid[2],
+                          tokens=size.tokens, offset=8192)
                 ok = await asyncio.wait_for(client.submit(job, data), 60)
                 bad = await asyncio.wait_for(client.submit(Job(**{**{f: getattr(job, f) for f in job.__struct_fields__},
                                                                   "fmt": "png"}), b"garbage"), 60)
@@ -544,8 +545,10 @@ def test_pool_worker_round_trip(tmp_path) -> None:
         ok, bad = asyncio.run(main())
         assert not ok.error and ok.decode_ns > 0 and bad.error
         view = px_arena.map_readonly(path)
-        got = np.frombuffer(view.buf, np.uint8, 3 * size.height * size.width, 8192).reshape(3, size.height,
-                                                                                           size.width).copy()
+        turned = transposed(size)  # EXIF 6 on a non-square image: the pool's pixels are the target turned
+        assert ok.transposed and ok.digest == image_digest(data, turned)
+        got = np.frombuffer(view.buf, np.uint8, 3 * turned.height * turned.width, 8192).reshape(
+            3, turned.height, turned.width).copy()
         assert np.array_equal(got, FAMILY.pixels(data, header, size).numpy())
         view.close()
     finally:
@@ -588,7 +591,7 @@ def test_pool_client_never_loses_a_reply() -> None:
     workers = [threading.Thread(target=echo, args=(i,), daemon=True) for i in range(2)]
     for t in workers:
         t.start()
-    job = Job(jid=0, fmt="jpeg", width=1, height=1, orientation=1, out_h=1, out_w=1, grid_t=1, grid_h=1,
+    job = Job(jid=0, fmt="jpeg", width=1, height=1, out_h=1, out_w=1, grid_t=1, grid_h=1,
               grid_w=1, tokens=1, offset=0)
 
     async def main() -> int:
@@ -1037,10 +1040,18 @@ def test_the_probe_agrees_with_pillow_on_random_ifd0s() -> None:
     assert seen["agree"] > 1000 and seen["count"] > 30 and seen["type"] > 30 and seen["stops early"] > 50, seen
 
 
+def vllm_pixels(data: bytes) -> np.ndarray:
+    """The image as vLLM reads it: Pillow open, `exif_transpose` with errors suppressed, RGB; uint8 [3, H, W]."""
+    im = Image.open(io.BytesIO(data))
+    with contextlib.suppress(Exception):
+        im = ImageOps.exif_transpose(im)
+    return np.asarray(im.convert("RGB")).transpose(2, 0, 1)
+
+
 def test_the_pool_serves_malformed_exif_as_stored_and_decodes_the_probed_format_only() -> None:
     """EXIF that `exif_transpose` cannot read (not TIFF, a broken header): the image as stored, not a failed
-    request. A disagreement with the probe still fails it: `exif_transpose` raising after it read orientation 6, which
-    the probe applies. Pillow opens the probed format only."""
+    request. `exif_transpose` raising after it read orientation 6 serves the image as stored too (the decode decides,
+    not the probe's reading), as vLLM's reading does. Pillow opens the probed format only."""
     from PIL import UnidentifiedImageError
 
     from llm_mini_infer.vision.family import decode_rgb
@@ -1061,8 +1072,9 @@ def test_the_pool_serves_malformed_exif_as_stored_and_decodes_the_probed_format_
         raises = bytes.fromhex("4d4d002a000000080002010f000a00000004000000080112000300000001000600060000000000")
         data = encoded(img, fmt, exif=prefix + raises + bytes(48))
         assert pillow_orientation(data) == (6, True) and probe(data).orientation == 6
-        with pytest.raises(ProbeError, match="is 40x20, but its header says 20x40"):
-            decode_rgb(data, probe(data))
+        # the decode decides: served as Pillow orients it, which is as stored (vLLM's reading), not a 400
+        assert tuple(decode_rgb(data, probe(data)).shape) == (3, 20, 40)
+        assert np.array_equal(decode_rgb(data, probe(data)).numpy(), vllm_pixels(data))
     gif = encoded(img, "GIF")
     with pytest.raises(UnidentifiedImageError):  # a GIF under a PNG header is not decoded as a GIF
         decode_rgb(gif, Header("png", 40, 20))
@@ -1591,3 +1603,192 @@ def test_a_transparent_png_reaches_the_pool_composited(tmp_path) -> None:
             proc.join(10)
         px_arena.remove(arena)
         shutil.rmtree(ipc, ignore_errors=True)
+
+
+# -- the decode decides the orientation: the worker's check, the digests, the sizing-only path -------------------------
+
+
+def gemma_config_dir(tmp_path: Path) -> Path:
+    """A Gemma 4 checkpoint's config.json alone (images of at most 70 soft tokens)."""
+    gemma = tmp_path / "gemma"
+    gemma.mkdir()
+    (gemma / "config.json").write_text(json.dumps({"model_type": "gemma4", "vision_config": {
+        "patch_size": 16, "pooling_kernel_size": 3, "default_output_length": 70}}))
+    return gemma
+
+
+def data_uri(data: bytes) -> str:
+    import base64
+
+    return "data:image/jpeg;base64," + base64.b64encode(data).decode()
+
+
+def image_inputs(family, pool_dir: str, **kw):
+    from llm_mini_infer.api.images import ImageInputs
+
+    return ImageInputs(family, index=0, num_frontends=1, arena_bytes=1 << 22, pool_dir=pool_dir, workers=1,
+                       max_bytes=1 << 20, fetch_timeout_s=1.0, max_per_request=2, **kw)
+
+
+def test_oriented_is_the_target_or_its_transpose_and_refuses_an_asymmetric_family() -> None:
+    """`pool.oriented` gives the job's target for pixels of that shape, its transpose for pixels turned by a quarter,
+    and raises `Asymmetric` (a ValueError, so a 400) when the family sizes the turned image otherwise than the turned
+    target: the frontend sized the span and the arena range from the target as stored, which holds only then. A shape
+    that is neither is a ValueError too."""
+    from llm_mini_infer.vision.pool import Asymmetric, oriented
+
+    header = Header("jpeg", 400, 225)
+    size = GEMMA70.size(header)
+    assert oriented(GEMMA70, header, size, (size.height, size.width)) is size
+    assert oriented(GEMMA70, header, size, (size.width, size.height)) == transposed(size)
+    bad = lopsided(GEMMA70)  # the portrait image has a token fewer than the transpose of its landscape one
+    assert bad.size(Header("jpeg", 225, 400)) != transposed(bad.size(header))
+    assert oriented(bad, header, bad.size(header), (size.height, size.width)) == bad.size(header)  # unturned: no check
+    with pytest.raises(Asymmetric, match=r"^the image family sizes the turned image"):
+        oriented(bad, header, bad.size(header), (size.width, size.height))
+    assert issubclass(Asymmetric, ValueError)
+    with pytest.raises(ValueError, match="the target is"):
+        oriented(GEMMA70, header, size, (size.height + 1, size.width))
+
+
+def test_an_asymmetric_family_fails_the_turned_image_before_anything_is_written(tmp_path) -> None:
+    """A worker whose family is not symmetric under a transpose answers an EXIF-turned image with an error starting
+    "Asymmetric:" and leaves its arena range untouched (a sentinel stays); through `ImageInputs.wait` that is an
+    ApiError 400 "image: Asymmetric: ...", never another exception type; an unturned image of the same worker is served
+    and the worker stays up."""
+    import shutil
+
+    from llm_mini_infer.api.protocol import ApiError
+    from llm_mini_infer.engine import ipc as engine_ipc
+
+    ipc = engine_ipc.ipc_dir()
+    arena = str(tmp_path / "arena")
+    px_arena.create(arena, 1 << 22)
+    bad = lopsided(GEMMA70)
+    turned = encoded(pattern(400, 225, 3), "JPEG", exif=exif(6))
+    plain = encoded(pattern(400, 225, 4), "JPEG")
+    mem = px_arena.map_writable(arena)
+    np.frombuffer(mem.buf, np.uint8)[:] = 0xAB  # the sentinel: nothing of the failed image may be written over it
+    proc = view = None
+    try:
+        proc, ready = spawn_pool_worker(gemma_config_dir(tmp_path), None, None, ipc, arena, lopsided=True)
+        assert ready, f"the worker exited before it was ready (exit code {proc.exitcode})"
+        h = probe(turned)
+        size = bad.size(h)
+        n = 3 * size.height * size.width
+        failed, ok = run_jobs(ipc, [(turned, h, size, 8192), (plain, probe(plain), bad.size(probe(plain)), 1 << 20)])
+        assert failed.error.startswith("Asymmetric:") and not failed.transposed and failed.digest == b"", failed
+        assert not ok.error and ok.digest
+        view = np.frombuffer(mem.buf, np.uint8)
+        assert (view[8192:8192 + 2 * n] == 0xAB).all()  # the range, and room for the turned pixels, untouched
+        assert not (view[1 << 20:(1 << 20) + n] == 0xAB).all()  # the control image was written
+
+        async def main() -> None:
+            images = image_inputs(bad, ipc)
+            images.start()
+            try:
+                prep = await images.prepare([data_uri(turned)])
+                with pytest.raises(ApiError) as err:
+                    await asyncio.wait_for(images.wait(prep), 60)
+                assert err.value.status == 400 and err.value.message.startswith("image: Asymmetric:"), err.value
+                images.discard(prep)
+                prep = await images.prepare([data_uri(plain)])
+                await asyncio.wait_for(images.wait(prep), 60)
+                images.discard(prep)
+            finally:
+                await images.close()
+
+        asyncio.run(main())
+        assert proc.is_alive()
+    finally:
+        del view
+        mem.close()
+        if proc is not None:
+            proc.kill()
+            proc.join(10)
+        px_arena.remove(arena)
+        shutil.rmtree(ipc, ignore_errors=True)
+
+
+def test_the_pool_hashes_the_image_as_oriented_and_the_frontend_takes_it_from_the_pool(tmp_path) -> None:
+    """The worker's digest is `image_digest(bytes, the oriented size)`: for an unrotated image the frontend's old
+    formula (BLAKE3 of the bytes and the packed height and width), so span keys are unchanged; `Done.transposed` says
+    whether Pillow turned the image (EXIF 6 on a non-square one). Through `ImageInputs.prepare` and `wait` the turned
+    image's size, grid, digest and span key are the turned ones (before the wait: as stored, no digest)."""
+    import shutil
+
+    import blake3
+
+    from llm_mini_infer.engine import ipc as engine_ipc
+
+    ipc = engine_ipc.ipc_dir()
+    arena = str(tmp_path / "arena")
+    px_arena.create(arena, 1 << 22)
+    plain = encoded(pattern(400, 225, 5), "JPEG")
+    turned = encoded(pattern(400, 225, 6), "JPEG", exif=exif(6))
+    proc = None
+    try:
+        proc, ready = spawn_pool_worker(gemma_config_dir(tmp_path), None, None, ipc, arena)
+        assert ready, f"the worker exited before it was ready (exit code {proc.exitcode})"
+        jobs = [(d, probe(d), GEMMA70.size(probe(d)), off) for d, off in ((plain, 8192), (turned, 1 << 20))]
+        a, b = run_jobs(ipc, jobs)
+        size = jobs[0][2]
+        h = blake3.blake3(plain)
+        h.update(struct.pack("<II", size.height, size.width))  # the frontend's old formula
+        assert not a.transposed and a.digest == h.digest() == image_digest(plain, size)
+        stored = jobs[1][2]
+        assert (stored.height, stored.width) == (size.height, size.width) and stored.width > stored.height
+        assert b.transposed and b.digest == image_digest(turned, transposed(stored))
+        assert b.digest != image_digest(turned, stored)
+
+        async def main():
+            images = image_inputs(GEMMA70, ipc)
+            images.start()
+            try:
+                prep = await images.prepare([data_uri(turned), data_uri(plain)])
+                im, flat = prep.images
+                assert im.size == stored and im.digest == b"" and im.key == 0  # as stored until the pool answers
+                await asyncio.wait_for(images.wait(prep), 60)
+                images.discard(prep)
+                return im, flat
+            finally:
+                await images.close()
+
+        im, flat = asyncio.run(main())
+        want = transposed(stored)
+        assert im.size == want and im.size.grid == (1, stored.grid[2], stored.grid[1])
+        assert im.size.tokens == stored.tokens
+        assert im.digest == image_digest(turned, want) and im.key == span_key(im.digest)
+        assert flat.size == stored and flat.digest == image_digest(plain, stored) and flat.key == span_key(flat.digest)
+    finally:
+        if proc is not None:
+            proc.kill()
+            proc.join(10)
+        px_arena.remove(arena)
+        shutil.rmtree(ipc, ignore_errors=True)
+
+
+def test_tokenize_sizes_a_turned_image_by_symmetry_with_no_pool_and_no_digest() -> None:
+    """`/tokenize`'s path, `prepare(urls, submit=False)`: an EXIF-6 non-square image has the token count of the same
+    image upright (the frontend sizes it as stored; the family is symmetric under a transpose); no pool is asked
+    (`pool_dir=""`: none exists, no job is set, no pixels allocated) and nothing is hashed."""
+    img = pattern(400, 225, 7)
+    turned = encoded(img, "JPEG", exif=exif(6))
+    upright = encoded(img.transpose(Image.Transpose.ROTATE_270), "JPEG")  # EXIF 6: turned 90 degrees clockwise
+    assert tuple(vllm_pixels(turned).shape) == (3, 400, 225) and tuple(vllm_pixels(upright).shape) == (3, 400, 225)
+
+    async def main():
+        images = image_inputs(GEMMA70, "")
+        images.start()
+        try:
+            assert images.pool is None
+            return await images.prepare([data_uri(turned), data_uri(upright)], submit=False)
+        finally:
+            await images.close()
+
+    prep = asyncio.run(main())
+    a, b = prep.images
+    assert a.size.tokens == b.size.tokens == GEMMA70.size(probe(upright)).tokens
+    assert transposed(a.size) == b.size  # the stored sizes are each other's transpose
+    for im in prep.images:
+        assert im.job is None and im.offset == -1 and im.digest == b"" and im.key == 0

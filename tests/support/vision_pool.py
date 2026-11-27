@@ -38,15 +38,16 @@ def encoded(img: Image.Image, fmt: str, **kw) -> bytes:
 
 
 def spawn_pool_worker(model_dir: Path, min_pixels: int | None, max_pixels: int | None, ipc: str, arena: str,
-                      **kw) -> tuple[mp.Process, bool]:
+                      lopsided: bool = False, **kw) -> tuple[mp.Process, bool]:
     """A real pool worker 0, spawned as the launcher spawns it (`kw`: worker_main's parameters after `log_level`, by
-    keyword): (the process, whether it reported ready; one that did not has exited, its exit code set)."""
+    keyword): (the process, whether it reported ready; one that did not has exited, its exit code set). `lopsided`: its
+    family is `lopsided`'s, a defective one whose sizing is not symmetric under a transpose."""
     from llm_mini_infer.vision.pool import worker_main
 
     ctx = mp.get_context("spawn")
     r, s = ctx.Pipe(duplex=False)
-    proc = ctx.Process(target=worker_main, args=(str(model_dir), min_pixels, max_pixels, 0, ipc, arena, s, "warning"),
-                       kwargs=kw)
+    proc = ctx.Process(target=lopsided_worker_main if lopsided else worker_main,
+                       args=(str(model_dir), min_pixels, max_pixels, 0, ipc, arena, s, "warning"), kwargs=kw)
     proc.start()
     s.close()
     try:
@@ -70,7 +71,7 @@ def run_jobs(ipc: str, jobs: list[tuple[bytes, Header, ImageSize, int]]) -> list
         try:
             out = []
             for data, h, size, offset in jobs:
-                job = Job(jid=0, fmt=h.format, width=h.width, height=h.height, orientation=h.orientation,
+                job = Job(jid=0, fmt=h.format, width=h.width, height=h.height,
                           out_h=size.height, out_w=size.width, grid_t=size.grid[0],
                           grid_h=size.grid[1], grid_w=size.grid[2], tokens=size.tokens, offset=offset)
                 out.append(await asyncio.wait_for(client.submit(job, data), 60))
@@ -79,3 +80,29 @@ def run_jobs(ipc: str, jobs: list[tuple[bytes, Header, ImageSize, int]]) -> list
             client.close()
 
     return asyncio.run(main())
+
+
+def lopsided(family: GemmaVision) -> GemmaVision:
+    """A copy of `family` that is deliberately not symmetric under a transpose: a portrait image takes one token fewer
+    than the landscape one it is turned from."""
+    import copy
+    import dataclasses
+
+    class Lopsided(type(family)):
+        def size(self, header: Header) -> ImageSize:
+            size = super().size(header)
+            return dataclasses.replace(size, tokens=size.tokens - 1) if header.height > header.width else size
+
+    out = copy.copy(family)
+    out.__class__ = Lopsided
+    return out
+
+
+def lopsided_worker_main(*args, **kw) -> None:
+    """`worker_main` with the family it loads made `lopsided` (a spawned worker's entry)."""
+    from llm_mini_infer.vision import family as fam
+    from llm_mini_infer.vision.pool import worker_main
+
+    load = fam.load
+    fam.load = lambda *a, **k: lopsided(load(*a, **k))
+    worker_main(*args, **kw)

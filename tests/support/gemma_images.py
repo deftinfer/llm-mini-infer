@@ -17,7 +17,7 @@ from llm_mini_infer.engine.messages import AddRequest, ImageRef
 from llm_mini_infer.runner.base import PoolConfig
 from llm_mini_infer.sched.scheduler import Scheduler
 from llm_mini_infer.vision import arena as px_arena
-from llm_mini_infer.vision.family import span_key
+from llm_mini_infer.vision.family import span_key, transposed
 from llm_mini_infer.vision.probe import probe
 
 from .tiny_gemma import MM_IMAGE, hf_mm_model
@@ -66,7 +66,10 @@ class Pixels:
             if isinstance(part, bytes):
                 header = probe(part)
                 size = self.fam.size(header)
-                px = self.fam.pixels(part, header, size).numpy().reshape(-1)
+                px = self.fam.pixels(part, header, size)
+                if tuple(px.shape[1:]) != (size.height, size.width):  # Pillow turned the image: the decode decides
+                    size = transposed(size)
+                px = px.numpy().reshape(-1)
                 off = self.next_px
                 self.arena.buf[off:off + len(px)] = px.tobytes()
                 self.next_px += -(-len(px) // 4096) * 4096

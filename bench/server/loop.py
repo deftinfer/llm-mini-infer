@@ -392,9 +392,9 @@ def gap_stats(per_request: list[list[int]], t0: int, t1: int, slow_ms: float) ->
 
 def stage_stats(recs: list[dict]) -> dict:
     """Per image request, the frontend's steps from its body to its tokens (`/debug/stages`), ms: they run on the
-    loop with no await between them on these requests."""
+    loop with no await between them on these requests (`probe+size` holds the hash too where the frontend hashes)."""
     recs = [r for r in recs if r.get("images")]
-    steps = {"parse": ("body", "arrival"), "base64": ("arrival", "fetched"), "probe+size+hash": ("fetched", "sized"),
+    steps = {"parse": ("body", "arrival"), "base64": ("arrival", "fetched"), "probe+size": ("fetched", "sized"),
              "submit+render": ("sized", "rendered"), "tokenize": ("rendered", "tokenized"),
              "on_loop": ("body", "tokenized")}
     return {k: pcts([(r[b] - r[a]) / MS for r in recs if a in r and b in r]) for k, (a, b) in steps.items()}
@@ -563,7 +563,7 @@ def steps_of(data: bytes, mime: str, fam: Any) -> tuple[dict[str, Any], str]:
 
     steps["size"] = lambda: fam.size(header)
     steps["hash"] = hash_once
-    return steps, f"{header.format} {header.width}x{header.height} o{header.orientation}"
+    return steps, f"{header.format} {header.width}x{header.height}"
 
 
 def bench_stages(args: argparse.Namespace) -> dict:

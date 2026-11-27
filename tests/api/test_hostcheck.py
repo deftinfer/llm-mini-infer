@@ -111,7 +111,7 @@ def test_the_synthetic_images_have_two_sizes_and_never_repeat() -> None:
     family = GemmaVision(boi_id=255999, image_id=258880, eoi_id=258882, max_soft_tokens=280)
     images = [synthetic.image_jpeg(i) for i in range(40)]
     assert len(set(images)) == 40
-    sizes = [probe(f).oriented for f in images]
+    sizes = [(probe(f).width, probe(f).height) for f in images]  # the frames carry no EXIF
     assert sizes.count((720, 1280)) == 10 and sizes.count((1280, 720)) == 30  # TALL_SHARE: a quarter portrait
     grids = {}
     for f, wh in zip(images, sizes, strict=True):

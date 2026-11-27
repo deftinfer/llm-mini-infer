@@ -4,8 +4,9 @@ event loops.
 **Workers** (`worker_main`), spawned by the launcher before the engine, so they import torch while it loads the model.
 Each runs one torch thread (`OMP_NUM_THREADS=1` and friends are set before torch is imported), so the pool never
 oversubscribes the cores with default-sized thread pools. A worker binds a ROUTER socket (`ipc://<dir>/pool-<i>.sock`)
-and serves jobs in arrival order: decode, orient and resize the image (the family's `pixels`), write the pixels into
-the arena at the job's offset, and answer with the time it took, or with the error.
+and serves jobs in arrival order: decode, orient and resize the image (the family's `pixels`: Pillow orients it, and
+the target turns with it), write the pixels into the arena at the job's offset, hash the image (`family.image_digest`),
+and answer with whether it turned the image, the digest and the time it took, or with the error.
 
 **Clients** (`PoolClient`, one per frontend process) connect a DEALER socket to every worker and send each job to the
 ready worker with the fewest of this frontend's jobs outstanding (several frontends may queue on one worker; jobs take
@@ -75,10 +76,9 @@ def job_deadline_s(max_source_pixels: int) -> float:
 class Job(msgspec.Struct, array_like=True, gc=False):
     jid: int
     fmt: str
-    width: int  # stored size and orientation (vision.probe.Header)
+    width: int  # the stored size (vision.probe.Header)
     height: int
-    orientation: int
-    out_h: int  # the resize target (vision.family.ImageSize)
+    out_h: int  # the resize target of the image as stored (vision.family.ImageSize)
     out_w: int
     grid_t: int
     grid_h: int
@@ -92,7 +92,9 @@ class Done(msgspec.Struct, array_like=True, gc=False):
     jid: int
     error: str = ""
     decode_ns: int = 0  # decode, orientation and resize
-    write_ns: int = 0  # the copy into the arena
+    write_ns: int = 0  # the copy into the arena and the hash
+    transposed: bool = False  # Pillow turned the image by a quarter: the pixels are the job's target turned
+    digest: bytes = b""  # `family.image_digest` of the bytes and the oriented target
 
 
 class PoolState:
@@ -207,7 +209,7 @@ def worker_main(model_dir: str, min_pixels: int | None, max_pixels: int | None, 
         torch.set_num_interop_threads(1)
     from . import family as fam
     from .arena import map_writable
-    from .family import ImageSize
+    from .family import ImageSize, image_digest
     from .probe import Header, check_source_pixels
 
     family = fam.load(model_dir, min_pixels=min_pixels, max_pixels=max_pixels, max_soft_tokens=max_soft_tokens)
@@ -254,15 +256,17 @@ def worker_main(model_dir: str, min_pixels: int | None, max_pixels: int | None, 
             state.start(index, job.jid)
         t0 = time.perf_counter_ns()
         try:
-            header = Header(job.fmt, job.width, job.height, job.orientation)
+            header = Header(job.fmt, job.width, job.height)
             check_source_pixels(header, max_source_pixels)  # the frontend refused it already: never let a decoder try
             size = ImageSize(job.out_h, job.out_w, (job.grid_t, job.grid_h, job.grid_w), job.tokens)
             px = family.pixels(data.bytes, header, size)
             t1 = time.perf_counter_ns()
-            n = 3 * size.height * size.width
+            out = oriented(family, header, size, tuple(px.shape[1:]))
+            n = 3 * out.height * out.width
             if job.offset < 0 or job.offset + n > arena.size:
                 raise ValueError(f"arena range [{job.offset}, {job.offset + n}) out of bounds")
             out_view[job.offset:job.offset + n] = px.numpy().reshape(-1)
+            reply.transposed, reply.digest = out is not size, image_digest(data.buffer, out)
             reply.decode_ns, reply.write_ns = t1 - t0, time.perf_counter_ns() - t1
         except Exception as exc:  # a corrupt image: the client answers 400
             reply.error = f"{type(exc).__name__}: {exc}"[:500]
@@ -275,11 +279,37 @@ def worker_main(model_dir: str, min_pixels: int | None, max_pixels: int | None, 
     arena.close()
 
 
+class Asymmetric(ValueError):
+    """The family sized the image turned otherwise than its target turned (`oriented`): a defect of the family, which
+    fails this image (a 400 with this text) before its pixels are written."""
+
+
+def oriented(family: Any, header: Any, size: Any, shape: tuple[int, ...]) -> Any:
+    """The size of a job's pixels: its target (the image as stored), or that target turned when Pillow turned the image
+    (`family`'s module docstring). The frontend sized the span and the arena range from the target, which holds only if
+    the family sizes the turned image as the turned target: checked here, so a family that does not fails the image
+    (`Asymmetric`) instead of writing pixels HF's processors would size otherwise."""
+    from .family import transposed
+    from .probe import Header
+
+    if shape == (size.height, size.width):
+        return size
+    turned = transposed(size)
+    if shape != (turned.height, turned.width):
+        raise ValueError(f"the pixels are {shape[1]}x{shape[0]}, but the target is {size.width}x{size.height}")
+    want = family.size(Header(header.format, header.height, header.width))
+    if want != turned:
+        raise Asymmetric(f"the image family sizes the turned image {want.width}x{want.height} ({want.tokens} tokens), "
+                         f"not {turned.width}x{turned.height} ({turned.tokens}): the frontend sized it as stored")
+    return turned
+
+
 def _warm(family: Any, np: Any) -> None:
     import io
 
     from PIL import Image
 
+    from .family import image_digest
     from .probe import probe
 
     for fmt in ("JPEG", "PNG"):
@@ -287,7 +317,9 @@ def _warm(family: Any, np: Any) -> None:
         Image.new("RGB", (64, 48), (10, 20, 30)).save(buf, format=fmt)
         data = buf.getvalue()
         header = probe(data)
-        family.pixels(data, header, family.size(header))
+        size = family.size(header)
+        family.pixels(data, header, size)
+        image_digest(data, size)
 
 
 class PoolClient:

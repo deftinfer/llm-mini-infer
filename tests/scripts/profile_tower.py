@@ -90,16 +90,21 @@ def image_shape(fam: Any, data: bytes, budget: int) -> dict[str, Any]:
     """The image as the family sizes it (its header only), the encoder budget the config derives for a step budget
     (`max(max_num_batched_tokens, the largest image)`), the tower's buckets for it (`family_buckets`, as the runner's
     `ImageEncoder`) and the bucket that holds the image's patches."""
+    from llm_mini_infer import hostcheck
     from llm_mini_infer.runner.cuda.images import family_buckets
+    from llm_mini_infer.vision.family import transposed
     from llm_mini_infer.vision.probe import probe
 
     h = probe(data)
     size = fam.size(h)
+    image_wh = hostcheck.oriented_size(io.BytesIO(data))  # Pillow's reading, as the pool's decode orients it
+    if image_wh != (h.width, h.height):
+        size = transposed(size)
     enc_budget = max(budget, fam.max_tokens())
     buckets = family_buckets(fam, fam.pooling, enc_budget)
     patches = size.grid[1] * size.grid[2]
     bucket = next((b for b in buckets if b >= patches), None)
-    return {"image": list(h.oriented), "max_soft_tokens": fam.max_soft_tokens, "patch": fam.patch,
+    return {"image": list(image_wh), "max_soft_tokens": fam.max_soft_tokens, "patch": fam.patch,
             "size": [size.height, size.width], "grid": list(size.grid), "tokens": size.tokens, "patches": patches,
             "encoder_budget": enc_budget, "buckets": buckets, "bucket": bucket,
             "padding": None if bucket is None else bucket - patches}
@@ -126,11 +131,15 @@ class TowerCall:
     def __init__(self, enc: Any, fam: Any, data: bytes):
         import torch
 
+        from llm_mini_infer.vision.family import transposed
         from llm_mini_infer.vision.probe import probe
 
         h = probe(data)
         size = fam.size(h)
-        px = fam.pixels(data, h, size).reshape(-1).contiguous()  # uint8 [3 * H * W]
+        px = fam.pixels(data, h, size)
+        if tuple(px.shape[1:]) != (size.height, size.width):  # Pillow turned the image: the decode decides
+            size = transposed(size)
+        px = px.reshape(-1).contiguous()  # uint8 [3 * H * W]
         self.enc, self.tokens, self.grid = enc, size.tokens, tuple(size.grid)
         self.patches = size.grid[1] * size.grid[2]
         self.nbytes = px.numel()
