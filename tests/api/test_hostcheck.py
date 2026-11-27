@@ -11,14 +11,19 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import io
 import itertools
 import json
+import os
 import re
+import signal
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
+import psutil
 import pytest
 
 from llm_mini_infer import hostcheck, synthetic
@@ -586,40 +591,58 @@ def test_the_gemma_load_end_to_end_on_the_fake_runner(tmp_path, monkeypatch, cap
 
 # -- the server's stop and a check that raises -------------------------------------------------------------------------
 
-class StubbornChild:
-    """A child that ignores SIGINT: the first wait times out, the kill ends it, the wait after it reaps it."""
-
-    def __init__(self) -> None:
-        self.returncode = None
-        self.calls: list[str] = []
-
-    def poll(self):
-        return self.returncode
-
-    def send_signal(self, sig) -> None:
-        self.calls.append(f"signal {sig}")
-
-    def kill(self) -> None:
-        self.calls.append("kill")
-        self.returncode = -9
-
-    def wait(self, timeout):
-        self.calls.append(f"wait {timeout}")
-        if self.returncode is None:
-            import subprocess
-
-            raise subprocess.TimeoutExpired("server", timeout)
-        return self.returncode
-
-
-def test_stop_kills_a_child_that_ignores_sigint_waits_for_it_and_closes_the_log(tmp_path) -> None:
+def test_stop_uses_the_shared_helper_and_closes_the_log(tmp_path, monkeypatch) -> None:
     srv = object.__new__(hostcheck.Server)
-    srv.proc, srv.log = StubbornChild(), (tmp_path / "server.log").open("w")
-    srv.stop()
-    assert srv.proc.calls == ["signal 2", "wait 120", "kill", "wait 10"] and srv.proc.returncode == -9
+    srv.proc, srv.log, srv._stopped = object(), (tmp_path / "server.log").open("w"), False
+    calls = []
+
+    def stop(proc, *, first_signal, waits):
+        calls.append((proc, first_signal, waits))
+
+    monkeypatch.setattr(hostcheck.server_process, "stop", stop)
+    srv.stop(wait=120, kill_wait=10)
+    assert calls == [(srv.proc, signal.SIGINT, (120, 10))]
     assert srv.log.closed
     srv.stop()  # a second stop signals nothing more
-    assert srv.proc.calls == ["signal 2", "wait 120", "kill", "wait 10"]
+    assert calls == [(srv.proc, signal.SIGINT, (120, 10))]
+
+
+def _running_group(pgid: int) -> list[int]:
+    pids = []
+    for proc in psutil.process_iter():
+        try:
+            if os.getpgid(proc.pid) == pgid:
+                pids.append(proc.pid)
+        except (OSError, psutil.Error):
+            pass
+    return pids
+
+
+@needs_gemma
+@pytest.mark.skipif(not hasattr(os, "killpg"), reason="no process groups on this platform")
+def test_stop_kills_the_hostcheck_group_after_the_launcher_is_stopped(tmp_path) -> None:
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(f"model:\n  path: {GEMMA}\nrunner:\n  kind: fake\n")
+    srv = hostcheck.Server(str(cfg), free_port(), tmp_path / "server.log", [])
+    pgid = srv.proc.pid
+    try:
+        srv.wait_ready(60)
+        assert os.getpgid(srv.proc.pid) == pgid
+        os.kill(srv.proc.pid, signal.SIGSTOP)
+        srv.stop(wait=0.1)
+        assert srv.proc.returncode == -signal.SIGKILL
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and _running_group(pgid):
+            time.sleep(0.05)
+        assert _running_group(pgid) == []
+        assert srv.log.closed
+    finally:
+        with contextlib.suppress(OSError):
+            os.killpg(pgid, signal.SIGKILL)
+        if srv.proc.poll() is None:
+            srv.proc.wait(timeout=10)
+        if not srv.log.closed:
+            srv.stop(wait=0.1)
 
 
 def test_a_server_that_exited_during_startup_is_reaped_and_its_log_closed_by_stop(tmp_path) -> None:

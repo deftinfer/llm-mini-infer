@@ -9,12 +9,15 @@ import asyncio
 import hashlib
 import importlib.util
 import json
+import os
 import random
 import re
+import signal
 import sys
 import time
 
 import jsonschema
+import psutil
 import pytest
 
 from llm_mini_infer.hostcheck import GENERATION_SERIES, VERIFY_SERIES, counter, engine_delta, prometheus
@@ -375,42 +378,64 @@ def test_the_bench_server_starts_on_the_fake_runner_and_stops_idempotently() -> 
     srv.stop()  # a second stop does nothing
 
 
-def test_the_bench_servers_stop_kills_a_child_that_outlives_sigterm_and_reaps_it(tmp_path) -> None:
-    """stop: SIGTERM, then after its wait a kill and a wait for the child (reaped), and the config removed; a second
-    stop sends nothing; with no child yet (a start that failed before it) only the config goes."""
-    calls: list[tuple] = []
+def test_the_bench_server_passes_its_shutdown_policy_to_the_shared_helper(tmp_path, monkeypatch) -> None:
+    calls = []
 
-    class Child:
-        returncode = None
+    def stop(proc, *, first_signal, waits):
+        calls.append((proc, first_signal, waits))
 
-        def poll(self):
-            return self.returncode
-
-        def send_signal(self, sig) -> None:
-            calls.append(("signal", sig))
-
-        def kill(self) -> None:
-            calls.append(("kill",))
-
-        def wait(self, timeout=None) -> int:
-            calls.append(("wait", timeout))
-            if ("kill",) not in calls:
-                raise server_run.subprocess.TimeoutExpired("server", timeout)
-            self.returncode = -9
-            return -9
-
+    monkeypatch.setattr(server_run.server_process, "stop", stop)
     srv = object.__new__(server_run.Server)
-    srv.proc, srv.cfg_path = Child(), tmp_path / ".server-1.yaml"
+    srv.proc, srv.cfg_path, srv._stopped = object(), tmp_path / ".server-1.yaml", False
     srv.cfg_path.write_text("server: {}")
+    srv.stop(wait=60, kill_wait=10)
+    assert calls == [(srv.proc, signal.SIGTERM, (60, 10))]
+    assert not srv.cfg_path.exists()
     srv.stop()
-    assert calls == [("signal", server_run.signal.SIGTERM), ("wait", 60), ("kill",), ("wait", 10)]
-    assert srv.proc.returncode == -9 and not srv.cfg_path.exists()
-    srv.stop()
-    assert len(calls) == 4
+    assert calls == [(srv.proc, signal.SIGTERM, (60, 10))]
     srv.proc = None
+    srv._stopped = False
     srv.cfg_path.write_text("server: {}")
     srv.stop()
     assert not srv.cfg_path.exists()
+
+
+def _running_group(pgid: int) -> list[int]:
+    pids = []
+    for proc in psutil.process_iter():
+        try:
+            if os.getpgid(proc.pid) == pgid:
+                pids.append(proc.pid)
+        except (OSError, psutil.Error):
+            pass
+    return pids
+
+
+@needs_gemma
+@pytest.mark.skipif(not hasattr(os, "killpg"), reason="no process groups on this platform")
+def test_the_bench_server_kills_its_group_after_the_launcher_is_stopped(monkeypatch) -> None:
+    monkeypatch.setattr(server_run, "MODEL", GEMMA)
+    monkeypatch.setattr(server_run, "RUNNER", "fake")
+    srv = server_run.Server(1.0)
+    pgid = srv.proc.pid
+    try:
+        assert os.getpgid(srv.proc.pid) == pgid
+        os.kill(srv.proc.pid, signal.SIGSTOP)
+        srv.stop(wait=0.1)
+        assert srv.proc.returncode == -signal.SIGKILL
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and _running_group(pgid):
+            time.sleep(0.05)
+        assert _running_group(pgid) == []
+        assert not srv.cfg_path.exists()
+    finally:
+        if srv.proc.poll() is None:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except OSError:
+                pass
+            srv.proc.wait(timeout=10)
+        srv.stop()
 
 
 def test_a_failed_start_stops_the_bench_server_and_removes_its_config(monkeypatch) -> None:
@@ -439,6 +464,9 @@ def test_the_bench_server_notices_a_child_that_exited_and_waits_through_non_200s
         returncode = 3
 
         def poll(self):
+            return 3
+
+        def wait(self, timeout=None):
             return 3
 
     monkeypatch.setattr(server_run.subprocess, "Popen", lambda *a, **kw: Dead())

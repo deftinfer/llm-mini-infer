@@ -12,7 +12,6 @@ what their readiness path means), and stops the server. Standard library only.
 from __future__ import annotations
 
 import argparse
-import contextlib
 import json
 import os
 import shutil
@@ -26,6 +25,8 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
+
+from llm_mini_infer import server_process
 
 POLL_S = 0.25
 # Seconds to wait after SIGINT, SIGTERM and SIGKILL, and for the port to come free.
@@ -54,14 +55,6 @@ class Handle:
     base_url: str
 
 
-def log_tail(path: Path, lines: int = 60) -> str:
-    """The last `lines` lines of a log file, or an empty string if it cannot be read."""
-    try:
-        return "\n".join(Path(path).read_text(errors="replace").splitlines()[-lines:])
-    except OSError:
-        return ""
-
-
 def redact(argv: list[str]) -> list[str]:
     """Copy argv with secret values replaced and the executable cut to its basename."""
     out: list[str] = []
@@ -88,10 +81,8 @@ def launch(argv: list[str], *, env: dict[str, str] | None, cwd: str, log_path: P
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with open(log_path, "ab") as log:
         t0 = time.monotonic()
-        proc = subprocess.Popen(
-            argv, cwd=cwd, env=env if env is not None else os.environ.copy(), start_new_session=True,
-            stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-        )
+        proc = server_process.launch(argv, cwd=cwd, env=env if env is not None else os.environ.copy(), stdout=log,
+                                     stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
     return Handle(proc, t0, log_path, base_url.rstrip("/"))
 
 
@@ -99,12 +90,12 @@ def _exited(h: Handle, what: str) -> StartError | None:
     code = h.proc.poll()
     if code is None:
         return None
-    return StartError(f"server exited with code {code} before {what}", log_tail(h.log_path), code)
+    return StartError(f"server exited with code {code} before {what}", server_process.log_tail(h.log_path) or "", code)
 
 
 def _timed_out(h: Handle, what: str, timeout: float) -> StartError:
     stop(h)
-    return StartError(f"no {what} within {timeout:g} s", log_tail(h.log_path), None)
+    return StartError(f"no {what} within {timeout:g} s", server_process.log_tail(h.log_path) or "", None)
 
 
 def wait_ready(h: Handle, ready_path: str = "/health", timeout: float = 1800) -> float:
@@ -161,32 +152,12 @@ def first_answer(h: Handle, model: str, timeout: float = 1800) -> float:
                 body = e.read()
                 stop(h)
                 msg = f"first request refused: HTTP {e.code} ({_error_type(body)})"
-                raise StartError(msg, log_tail(h.log_path)) from None
+                raise StartError(msg, server_process.log_tail(h.log_path) or "") from None
         except (OSError, urllib.error.URLError, ValueError):
             pass
         if time.monotonic() - h.t0 > timeout:
             raise _timed_out(h, "first answer", timeout)
         time.sleep(POLL_S)
-
-
-def _signal_group(proc: subprocess.Popen, sig: int) -> None:
-    """Signal the server's process group by id: launch() makes the child a session leader, so the group id is its pid
-    and the group lives as long as any member does, even after the leader is reaped. An empty group is a no-op."""
-    try:
-        os.killpg(proc.pid, sig)
-    except ProcessLookupError:
-        pass  # no member left
-    except PermissionError:
-        with contextlib.suppress(OSError):
-            proc.send_signal(sig)
-
-
-def _wait(proc: subprocess.Popen, seconds: float) -> bool:
-    try:
-        proc.wait(timeout=seconds)
-        return True
-    except subprocess.TimeoutExpired:
-        return False
 
 
 def _port_open(host: str, port: int) -> bool:
@@ -201,16 +172,8 @@ def stop(h: Handle) -> dict:
     """Stop the server's process group (SIGINT, then SIGTERM, then SIGKILL), reap it, and wait for its port to come
     free. Returns {"signal", "seconds", "port_free"}; "signal" is the one that ended it, or null if it had exited."""
     t = time.monotonic()
-    used: str | None = None
-    if h.proc.poll() is None:
-        for sig, wait_s in zip((signal.SIGINT, signal.SIGTERM, signal.SIGKILL), STOP_WAITS):
-            used = sig.name
-            _signal_group(h.proc, sig)
-            if _wait(h.proc, wait_s):
-                break
-    h.proc.wait()
-    # A child that exited may leave group members behind; make sure none survive.
-    _signal_group(h.proc, signal.SIGKILL)
+    used = server_process.stop(h.proc, first_signal=signal.SIGINT, escalation_signals=(signal.SIGTERM,),
+                               waits=STOP_WAITS, signal_group_signals=True)
     parsed = urllib.parse.urlparse(h.base_url)
     host, port = parsed.hostname or "127.0.0.1", parsed.port or (443 if parsed.scheme == "https" else 80)
     deadline = time.monotonic() + PORT_WAIT_S
