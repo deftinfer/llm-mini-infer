@@ -99,7 +99,8 @@ def frontend_main(cfg: Config, index: int, ipc_path: str, ready: Connection | No
     signal.signal(signal.SIGINT, signal.SIG_IGN)  # until `_main` sets its handler: the launcher handles a Ctrl-C
     faulthandler.enable()  # a native crash prints every thread's stack
     faulthandler.register(signal.SIGUSR2, all_threads=True)  # and so does the launcher, for a start that hangs
-    setup_logging(cfg.observability.log_level, f"frontend-{index}", without_messages=True)
+    # queued: a stderr that stops reading blocks the log's writer thread, not the event loop every stream waits on
+    setup_logging(cfg.observability.log_level, f"frontend-{index}", without_messages=True, queued=True)
     cpus = cfg.dev.server.cpus
     if cpus and index < len(cpus):
         try:
