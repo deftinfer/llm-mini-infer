@@ -106,8 +106,8 @@ LAG_SAMPLES = 120_000
 class LoopLag:
     """The event loop's lag, with `observability.debug_endpoints` (`/debug/loop`): a timer due every `LAG_INTERVAL_NS`
     records how late it ran, so work that holds the loop shows as the lag every stream of the frontend sees. uvloop's
-    timers have a resolution of a millisecond, so a sample is within about a millisecond of the true lag (an idle loop's
-    lie between -1 and +1.3 ms), and a stall shows in full. A ring keeps the last `LAG_SAMPLES` (two minutes or more),
+    timers have a resolution of a millisecond, so a sample is within about a millisecond of the true lag either way, and
+    a stall shows in full. A ring keeps the last `LAG_SAMPLES` (two minutes or more),
     each the monotonic time it ran (`time.monotonic_ns`, one clock for every process of the host) and its lag, in ns."""
 
     def __init__(self, size: int = LAG_SAMPLES):

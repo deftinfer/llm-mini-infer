@@ -489,11 +489,17 @@ def oriented_size(path: Path | io.BytesIO) -> tuple[int, int]:
     applies it (`vision.family.decode_rgb`); nothing decodes but a PNG's pixels when Pillow looks for its EXIF."""
     from PIL import Image
 
-    with Image.open(path) as im:
-        w, h = im.size
-        with contextlib.suppress(Exception):  # EXIF that Pillow cannot read: as stored
-            if im.getexif().get(0x0112, 1) in range(5, 9):
-                w, h = h, w
+    try:
+        with Image.open(path) as im:
+            w, h = im.size
+            with contextlib.suppress(Exception):  # EXIF that Pillow cannot read: as stored
+                if im.getexif().get(0x0112, 1) in range(5, 9):
+                    w, h = h, w
+    except Image.DecompressionBombError:  # past twice Pillow's bound: the server refuses it; its stored size
+        from .vision.probe import probe
+
+        head = probe(path.read_bytes() if isinstance(path, Path) else path.getvalue())
+        w, h = head.width, head.height
     return w, h
 
 

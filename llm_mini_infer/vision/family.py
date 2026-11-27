@@ -10,7 +10,8 @@ vision encoder and its cache").
 does: it sizes the image as stored. A family's `size` is symmetric under a transpose (`size` of the image turned is
 `transposed` of its `size`: the same tokens and pixel bytes, the height and width and the grid's swapped), so the
 frontend's token count and arena range hold either way, and the pool turns the target when Pillow turned the image
-(`tests/vision/test_image_sites.py` checks every family; the pool checks each image it turns).
+(`tests/vision/test_image_sites.py` checks both families on their fixtures; the pool checks each image it may have
+turned).
 - **Scheduler:** the positions the model's RoPE takes over a prompt with images (`positions`): None when the family
   uses 1-D positions, else [3, n] and the offset that later tokens add to their sequence index.
 - **Runner:** the vision encoder with the checkpoint's weights (`load_encoder`), which rescales or normalises and

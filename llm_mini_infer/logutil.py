@@ -74,7 +74,7 @@ class _Writer(logging.handlers.QueueListener):
         front.acquire()
         try:
             if front.dropped:
-                self.queue.put(front.note(), timeout=LOG_STOP_S)
+                self.queue.put(front.note(), timeout=max(0.0, deadline - time.monotonic()))
                 front.dropped = 0
             self.queue.put(self._sentinel, timeout=max(0.0, deadline - time.monotonic()))
         except queue.Full:

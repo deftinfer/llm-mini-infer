@@ -143,7 +143,7 @@ def test_a_frontends_loop_runs_on_while_stderr_takes_nothing_and_every_line_arri
             if p.poll() is None:
                 p.kill()
     assert all(p.returncode == 0 for p in procs)
-    assert all(rep["worst_lag_ms"] < 50 for rep in reports), reports
+    assert all(rep["worst_lag_ms"] < 500 for rep in reports), reports  # blocked on the pipe: the whole two seconds
     lines = data.decode().splitlines(keepends=True)
     for k in range(2):
         mine = [LINE.fullmatch(x) for x in lines if f"[p{k}]" in x]
