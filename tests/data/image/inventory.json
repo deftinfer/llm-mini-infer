@@ -3,8 +3,8 @@
  "runs": {
   "gemma": {
    "ready_s": [
-    318.1,
-    22.0
+    62.0,
+    30.0
    ],
    "caches": {
     "start0": {
@@ -184,7 +184,7 @@
     },
     "llm-mini-infer-frontend-0": {
      "processes": 2,
-     "modules": 607,
+     "modules": 589,
      "dists": [
       "Jinja2",
       "MarkupSafe",
@@ -198,7 +198,6 @@
       "msgspec",
       "numpy",
       "nvidia-cutlass-dsl-libs-base",
-      "pillow",
       "pybase64",
       "pyzmq",
       "setuptools",
@@ -228,7 +227,6 @@
       "llguidance": 1,
       "msgspec": 1,
       "numpy": 5,
-      "pillow": 8,
       "pybase64": 1,
       "pyzmq": 3,
       "tokenizers": 1,
@@ -936,7 +934,7 @@
     },
     "llm-mini-infer-frontend-0": {
      "processes": 2,
-     "modules": 608,
+     "modules": 590,
      "dists": [
       "Jinja2",
       "MarkupSafe",
@@ -950,7 +948,6 @@
       "msgspec",
       "numpy",
       "nvidia-cutlass-dsl-libs-base",
-      "pillow",
       "pybase64",
       "pyzmq",
       "setuptools",
@@ -1201,7 +1198,7 @@
   },
   "qwen": {
    "ready_s": [
-    302.1
+    76.0
    ],
    "caches": {
     "start0": {
@@ -1373,7 +1370,7 @@
     },
     "llm-mini-infer-frontend-0": {
      "processes": 1,
-     "modules": 607,
+     "modules": 589,
      "dists": [
       "Jinja2",
       "MarkupSafe",
@@ -1387,7 +1384,6 @@
       "msgspec",
       "numpy",
       "nvidia-cutlass-dsl-libs-base",
-      "pillow",
       "pybase64",
       "pyzmq",
       "setuptools",
@@ -1417,7 +1413,6 @@
       "llguidance": 1,
       "msgspec": 1,
       "numpy": 5,
-      "pillow": 8,
       "pybase64": 1,
       "pyzmq": 3,
       "tokenizers": 1,
