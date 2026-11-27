@@ -12,12 +12,6 @@ Changed:
 - A JPEG above Pillow's `MAX_IMAGE_PIXELS` (89,478,485 pixels) decodes with Pillow's `DecompressionBombWarning` in the log, as PNG and WebP do. `images.max_source_pixels` still refuses an image above twice that.
 - A JPEG whose EXIF Pillow reads but then fails to rewrite after turning the image (crafted values) is served as stored, as PNG and WebP are, so at orientations 5 to 8 it gets a 400; vLLM serves it as stored.
 
-Fixed:
-- An image's orientation is the one Pillow's `ImageOps.exif_transpose` applies, read by Pillow's own EXIF loader. An EXIF block behind two `Exif\0\0` prefixes is read: a JPEG was served as stored, and a PNG or WebP at orientations 5 to 8 got a 400. EXIF that Pillow cannot load leaves the image as stored even beside an XMP orientation: a JPEG was turned by the XMP's value, and a PNG at orientations 5 to 8 got a 400.
-- A WebP's EXIF and XMP count only where Pillow reads them, in a VP8X file whose flags declare them, the first chunk of each. A PNG's text chunks count by Pillow's rules for each key, up to where Pillow stops reading.
-- An image whose EXIF holds more than 256 IFD0 entries is sized as stored, without reading them on the event loop; its decode still applies Pillow's orientation, so at 5 to 8 the request gets a 400.
-- The header probe bounds its work on crafted images, where Pillow reads on. A JPEG with more than 2,048 markers before its scan (a run of stray bytes counts as one, a run of fill one a KiB) gets a 400, and so does a PNG whose metadata text takes more than the probe's bound to read (bytes inflated or decoded, compressed bytes counted more). A "Raw profile type exif" text longer than 1 MiB is sized as stored, and an XMP packet's orientation is read in its first MiB, past at most 64 `tiff:Orientation` that do not match; at 5 to 8 those get a 400.
-
 ## 0.8.0
 
 This is the first public release of llm-mini-infer. It is an LLM inference server for Gemma 4 31B and Qwen3.8 27B. It runs on one NVIDIA SM120 GPU, such as the RTX PRO 6000 Blackwell. It ships as a container image with prebuilt kernels and as a Helm chart. The [README](README.md#quickstart) has the quickstart.

@@ -302,10 +302,6 @@ class App:
         self.images: ImageInputs | None = None
         im = cfg.images
         if im.enabled:
-            # the probe reads EXIF with Pillow's loader, which imports TiffImagePlugin on its first call: both at start,
-            # not on a request
-            from PIL import Image, TiffImagePlugin  # noqa: F401
-
             from ..vision import family as vf
 
             fam = vf.load(cfg.model.path, min_pixels=im.min_pixels, max_pixels=im.max_pixels,

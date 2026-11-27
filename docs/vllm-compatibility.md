@@ -106,7 +106,6 @@ A `response_format` nested past 64 JSON levels gets the reference's 400, with it
 - a model's image placeholder (Gemma 4's `<|image|>`) in a message's text is a 400 unless it matches an image; the reference accepts it;
 - the content format (a string or parts) is detected from the template's source as the reference detected it before it tracked `namespace(...)` aliases of `messages`;
 - an image whose header declares more than 178,956,970 pixels is a 400 before any decode; the reference answers 500;
-- a crafted image header the probe bounds on the event loop, where the reference's Pillow reads on: a JPEG with more than 2,048 markers before its scan, or a PNG whose metadata text takes more than the probe's bound to read, is a 400; EXIF with more than 256 IFD0 entries, a "Raw profile type exif" text longer than 1 MiB, and an XMP orientation past the packet's first MiB or after 64 `tiff:Orientation` that do not match, are not read, so such an image at orientations 5 to 8 is a 400;
 - a schema, the tools' included, of more than `structured_output.max_schema_bytes` (1 MiB) is a 400; the reference has no cap;
 - `logit_bias` is accepted under speculative decoding (the bias applies at every verify position); the reference refuses it there;
 - more than 1,024 `logit_bias` entries is a 400 "Too many logit bias tokens: N. The max size is 1024."; the reference's v2 runner raises that text as an engine error;

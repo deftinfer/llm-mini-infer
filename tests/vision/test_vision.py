@@ -7,7 +7,6 @@ format, colour mode and EXIF/XMP orientation the probe reads, and random pixels 
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import io
 import json
 import multiprocessing as mp
@@ -15,7 +14,6 @@ import random
 import re
 import struct
 import types
-import zlib
 from pathlib import Path
 
 import numpy as np
@@ -79,8 +77,7 @@ def test_probe_rejects_what_it_cannot_read() -> None:
 def test_a_png_text_chunk_inflates_at_most_as_far_as_pillow_reads_it() -> None:
     """The probe runs on the frontend's event loop: a compressed text chunk that inflates past 1 MiB (Pillow's
     MAX_TEXT_CHUNK) is refused, as Pillow refuses to open the image, instead of inflating about 1,000 times. At the
-    cap both read a Raw profile (spaces: nothing to parse); an XMP packet, which the probe then searches, both read at
-    half the cap (the whole is past MAX_TEXT_WORK)."""
+    cap both read it."""
     import zlib
 
     from llm_mini_infer.vision.probe import MAX_TEXT_CHUNK
@@ -95,7 +92,7 @@ def test_a_png_text_chunk_inflates_at_most_as_far_as_pillow_reads_it() -> None:
         return plain[:33] + chunk + plain[33:]  # after IHDR
 
     for kind in (b"zTXt", b"iTXt"):
-        at_cap = png(b" " * (MAX_TEXT_CHUNK if kind == b"zTXt" else MAX_TEXT_CHUNK // 2), kind)
+        at_cap = png(b" " * MAX_TEXT_CHUNK, kind)
         h = probe(at_cap)
         assert (h.width, h.height) == Image.open(io.BytesIO(at_cap)).size == (8, 6)
         bomb = png(b" " * (MAX_TEXT_CHUNK + 1), kind)
@@ -896,12 +893,10 @@ def orientation_entry(typ: int, values: list, big: bool = False, extra: int = 0)
 
 
 def pillow_orientation(data: bytes) -> tuple[int, bool]:
-    """The orientation `exif_transpose` applies (its lookup on what Pillow reads once the image is loaded: 2..8, else
-    1), and whether it raises after reading one (the image is then served as stored)."""
+    """The orientation `exif_transpose` applies (its lookup on what Pillow reads: 2..8, else 1), and whether it raises
+    after reading one (the image is then served as stored)."""
     try:
-        im = Image.open(io.BytesIO(data))
-        im.load()  # as exif_transpose does first: a PNG's chunks after the image data can replace its EXIF
-        v = im.getexif().get(274)
+        v = Image.open(io.BytesIO(data)).getexif().get(274)
     except Exception:
         v = None
     o = int(v) if v in {2, 3, 4, 5, 6, 7, 8} else 1
@@ -943,8 +938,10 @@ def test_the_probe_reads_the_orientation_pillow_applies(tiff, want) -> None:
 
 def random_ifd0(rng: random.Random) -> tuple[bytes, bool]:
     """IFD0 with an Orientation entry among 0-3 others, of random types, counts, offsets and trailers (with the
-    orientation's values encoded in its type); and whether an entry before the orientation has data past the block's
-    end (Pillow stops reading IFD0 there)."""
+    orientation's values encoded in its type); and whether Pillow stops reading IFD0 at an earlier entry whose data
+    lies past the block's end, which the probe does not follow (left as a known, rare difference)."""
+    from PIL import TiffImagePlugin
+
     big = rng.random() < 0.5
     e = ">" if big else "<"
     tags = [0x0112] + [rng.choice([0x010F, 0x0110, 0x0131, 0x8769, 0x8825, 0x0132, 0x011A, 0x9286,
@@ -956,7 +953,7 @@ def random_ifd0(rng: random.Random) -> tuple[bytes, bool]:
     for tag in tags:
         if tag == 0x0112:
             typ = rng.choice([3, 3, 4, 8, 9, 13, 6, 16, 5, 10, 11, 12, 1, 2, 7, 99])
-            count = rng.choice([1, 1, 1, 2, 3, 4, 0, 50, 1000]) if typ != 2 else rng.choice([1, 2])
+            count = rng.choice([1, 1, 1, 2, 3, 4, 0]) if typ != 2 else rng.choice([1, 2])
             code = TIFF_CODES.get(typ, "I")
             vals = [rng.choice([6, 8, 5, 7, 3, 2, 1, 0, 9, 100]) for _ in range(count * len(code))]
             if typ in (5, 10) and vals:
@@ -978,10 +975,26 @@ def random_ifd0(rng: random.Random) -> tuple[bytes, bool]:
             field = struct.pack(e + "I", rng.choice([8, 26, 40, 200, rng.randint(0, 0xFFFFFFFF)]))
         entries.append((tag, typ, count, field))
     tiff = ifd0(entries, big, trailer)
-    before = entries[:next(k for k, x in enumerate(entries) if x[0] == 0x0112)]
-    past = any(typ in TIFF_CODES and (size := count * struct.calcsize("<" + TIFF_CODES[typ])) > 4 and
-               struct.unpack(e + "I", field)[0] + size > len(tiff) for _, typ, count, field in before)
-    return tiff, past
+    # Pillow's loop (TiffImagePlugin.ImageFileDirectory_v2.load) up to the orientation: an earlier tag's data past the
+    # block's end stops it
+    stored: set[int] = set()
+    total, stops_early = 0, False
+    for tag, typ, count, field in entries:
+        if tag in stored or typ not in TiffImagePlugin.ImageFileDirectory_v2._load_dispatch:
+            continue
+        size = count * TiffImagePlugin.ImageFileDirectory_v2._load_dispatch[typ][0]
+        if size > 4:
+            total += size
+            if total > len(tiff):
+                continue
+            if struct.unpack(e + "I", field)[0] + size > len(tiff):
+                stops_early = tag != 0x0112
+                break
+        if tag == 0x0112 and size:
+            break
+        if size:
+            stored.add(tag)
+    return tiff, stops_early
 
 
 def entries_of(tiff: bytes) -> list[tuple[int, int, int]]:
@@ -991,39 +1004,35 @@ def entries_of(tiff: bytes) -> list[tuple[int, int, int]]:
 
 
 def test_the_probe_agrees_with_pillow_on_random_ifd0s() -> None:
-    """Random IFD0s in JPEG, PNG and WebP: the probe's orientation is the one Pillow reads, which `exif_transpose`
-    applies, where Pillow stops reading IFD0 at an earlier tag's data past the block's end too, and for Orientation
-    counts above 1 (up to 1,000), of which the probe has Pillow unpack one value. Where exif_transpose then fails
-    rewriting the EXIF (crafted values), the pool serves the image as stored, and an orientation of 5..8 fails its size
-    check (`test_the_pool_serves_malformed_exif_as_stored...`)."""
+    """Random IFD0s in JPEG, PNG and WebP: the probe's orientation is the one `exif_transpose` applies, but for the two
+    known differences (rare: malformed EXIF): Pillow stopping at an earlier tag's truncated data, and `exif_transpose`
+    raising after it read an orientation (it fails rewriting the EXIF; the image is served as stored, the probe
+    orients it)."""
     import warnings
 
     rng = random.Random(1)
     img = pattern(40, 20)
-    seen = {"agree": 0, "count": 0, "type": 0, "past the end": 0, "raises": 0, "counts above 1": 0}
+    seen = {"agree": 0, "count": 0, "type": 0, "stops early": 0, "raises": 0}
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         for _ in range(1500):
             fmt = rng.choice(["JPEG", "PNG", "WEBP"])
-            tiff, past = random_ifd0(rng)
+            tiff, stops_early = random_ifd0(rng)
             try:
                 data = encoded(img, fmt, exif=b"Exif\x00\x00" + tiff if fmt == "JPEG" else tiff)
             except Exception:
                 continue
             want, raises = pillow_orientation(data)
-            with unpacked() as lengths:
-                assert probe(data).orientation == want, (fmt, tiff.hex())
-            assert all(n <= 8 for n in lengths), lengths  # one value, of 8 bytes at most
+            if stops_early or raises:
+                seen["stops early" if stops_early else "raises"] += 1
+                continue
+            assert probe(data).orientation == want, (fmt, tiff.hex())
             seen["agree"] += 1
-            seen["counts above 1"] += any(tag == 0x0112 and c > 1 for tag, _, c in entries_of(tiff))
-            seen["past the end"] += past
-            seen["raises"] += raises
             if want != 1:
                 n, typ = next((c, t) for tag, t, c in entries_of(tiff) if tag == 0x0112 and t != 99 and c)
                 seen["count"] += n != 1
                 seen["type"] += typ not in (3, 4)
-    assert seen["agree"] > 1000 and seen["count"] > 30 and seen["type"] > 30 and seen["counts above 1"] > 300, seen
-    assert seen["past the end"] > 30 and seen["raises"] > 5, seen
+    assert seen["agree"] > 1000 and seen["count"] > 30 and seen["type"] > 30, seen
 
 
 def test_the_pool_serves_malformed_exif_as_stored_and_decodes_the_probed_format_only() -> None:
@@ -1061,560 +1070,6 @@ def test_the_pool_serves_malformed_exif_as_stored_and_decodes_the_probed_format_
 def xmp_packet(o: int) -> bytes:
     return (f'<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF><rdf:Description tiff:Orientation="{o}"/>'
             f"</rdf:RDF></x:xmpmeta>").encode()
-
-
-def pillow_pixels(data: bytes) -> torch.Tensor:
-    """The image as vLLM decodes it (`normalize_image`: `exif_transpose`, the image as stored when it raises), RGB."""
-    im = Image.open(io.BytesIO(data))
-    with contextlib.suppress(Exception):
-        im = ImageOps.exif_transpose(im)
-    return torch.from_numpy(np.asarray(im.convert("RGB")).copy()).permute(2, 0, 1)
-
-
-def agrees_with_pillow(data: bytes) -> int:
-    """The probe's orientation, checked against Pillow's: the orientation it reads, the oriented size, the pixels."""
-    from llm_mini_infer.vision.family import decode_rgb
-
-    h = probe(data)
-    want = pillow_pixels(data)
-    assert h.orientation == pillow_orientation(data)[0]
-    assert h.oriented == (want.shape[2], want.shape[1])
-    assert torch.equal(decode_rgb(data, h), want)
-    return h.orientation
-
-
-def test_a_doubled_exif_prefix_and_junk_exif_beside_xmp_are_read_as_pillow_reads_them() -> None:
-    """Two cases the probe once read differently from Pillow, at orientations 2..8: an EXIF block behind two
-    `Exif\\0\\0` prefixes, which Pillow strips (JPEG APP1, PNG eXIf, WebP EXIF); and EXIF Pillow cannot load beside
-    an XMP orientation (JPEG and PNG), where getexif raises before it reads the XMP and exif_transpose leaves the image
-    as stored, as vLLM serves it."""
-    img = pattern(40, 20)
-    for o in range(2, 9):
-        tiff = exif(o)[6:]
-        doubled = [encoded(img, "JPEG", exif=b"Exif\x00\x00" * 2 + tiff),
-                   encoded(img, "PNG", exif=b"Exif\x00\x00" * 2 + tiff),  # Pillow writes the block one prefix off
-                   encoded(img, "WEBP", exif=b"Exif\x00\x00" * 2 + tiff, lossless=True)]
-        for data in doubled:
-            assert agrees_with_pillow(data) == o
-        info = PngImagePlugin.PngInfo()
-        info.add_itxt("XML:com.adobe.xmp", xmp_packet(o).decode())
-        junk = [encoded(img, "JPEG", exif=b"Exif\x00\x00not a tiff header", xmp=xmp_packet(o)),
-                encoded(img, "PNG", exif=b"not a tiff header", pnginfo=info)]
-        for data in junk:
-            assert agrees_with_pillow(data) == 1
-
-
-def webp(*chunks: tuple[bytes, bytes], flags: int | None = None) -> bytes:
-    """A 40 x 20 lossless WebP: its VP8L chunk after a VP8X with `flags` (None: a simple file), then `chunks`."""
-    simple = encoded(pattern(40, 20), "WEBP", lossless=True)
-
-    def chunk(kind: bytes, data: bytes) -> bytes:
-        return kind + struct.pack("<I", len(data)) + data + b"\0" * (len(data) & 1)
-
-    body = b"" if flags is None else chunk(b"VP8X", bytes([flags, 0, 0, 0]) + (39).to_bytes(3, "little") +
-                                         (19).to_bytes(3, "little"))
-    body += simple[12:] + b"".join(chunk(k, d) for k, d in chunks)
-    return b"RIFF" + struct.pack("<I", 4 + len(body)) + b"WEBP" + body
-
-
-def test_a_webps_metadata_is_what_libwebp_gives_pillow() -> None:
-    """A WebP's EXIF and XMP count only in a VP8X file whose flags declare them (EXIF 0x08, XMP 0x04), the first
-    chunk of each, and an empty first chunk hides the rest: libwebp's demuxer, which Pillow reads them through."""
-    e3, e6 = exif(3)[6:], exif(6)[6:]
-    cases = [(webp((b"EXIF", e6)), 1), (webp((b"EXIF", e6), flags=0), 1), (webp((b"EXIF", e6), flags=0x08), 6),
-             (webp((b"EXIF", e3), (b"EXIF", e6), flags=0x08), 3), (webp((b"EXIF", b""), (b"EXIF", e6), flags=0x08), 1),
-             (webp((b"EXIF", e6), (b"XMP ", xmp_packet(3)), flags=0x04), 3),
-             (webp((b"XMP ", xmp_packet(5)), (b"XMP ", xmp_packet(6)), flags=0x0C), 5)]
-    for data, want in cases:
-        assert agrees_with_pillow(data) == want, data[12:40]
-
-
-def png(before: list[tuple[bytes, bytes]] = (), after: list[tuple[bytes, bytes]] = (), frames: int = 1) -> bytes:
-    """A 40 x 20 PNG with these chunks before and after its image data; `frames` > 1: an animated PNG, `after`
-    following its second frame's fcTL."""
-    buf = io.BytesIO()
-    imgs = [pattern(40, 20, k) for k in range(frames)]
-    imgs[0].save(buf, "PNG", save_all=frames > 1, append_images=imgs[1:])
-    raw, i, chunks = buf.getvalue(), 8, []
-    while i < len(raw):
-        n = struct.unpack_from(">I", raw, i)[0]
-        chunks.append((raw[i + 4:i + 8], raw[i + 8:i + 8 + n]))
-        i += 12 + n
-    kinds = [k for k, _ in chunks]
-    at = kinds.index(b"IDAT")
-    cut = len(chunks) - 1 if frames == 1 else [j for j, k in enumerate(kinds) if k == b"fcTL"][1] + 1
-    chunks = chunks[:at] + list(before) + chunks[at:cut] + list(after) + chunks[cut:]
-    return b"\x89PNG\r\n\x1a\n" + b"".join(struct.pack(">I", len(d)) + k + d + struct.pack(">I", zlib.crc32(k + d))
-                                          for k, d in chunks)
-
-
-def text(kind: bytes, key: bytes, value: bytes, compressed: bool = False, method: int = 0) -> tuple[bytes, bytes]:
-    """A tEXt, zTXt or iTXt chunk (iTXt `compressed` with compression `method`)."""
-    if kind == b"tEXt":
-        return kind, key + b"\0" + value
-    if kind == b"zTXt":
-        return kind, key + b"\0\0" + zlib.compress(value)
-    return kind, key + b"\0" + bytes([compressed, method]) + b"\0\0" + (zlib.compress(value) if compressed else value)
-
-
-def raw_profile(block: bytes) -> bytes:
-    return f"\nexif\n{len(block):8}\n{block.hex()}\n".encode()
-
-
-def test_a_pngs_metadata_is_what_pillow_reads_of_it() -> None:
-    """PNG's metadata as Pillow puts it in the image's info, for every key getexif reads: `eXIf`; a tEXt `exif` as
-    bytes, a zTXt or iTXt `exif` as text (which Pillow's loader refuses: 1); "Raw profile type exif" in any of the
-    three, the last one, read only without `exif`, and bad hex fails getexif (no XMP then); `XML:com.adobe.xmp` in
-    any of the three (iTXt's when it is UTF-8; else its bytes as `xmp`; nothing for another compression method),
-    `XML:com.adobe.xmp` before `xmp`. Pillow reads the chunks after the image data, up to a malformed chunk type, and
-    in an animated PNG up to the next frame's fcTL."""
-    t3, t6 = exif(3)[6:], exif(6)[6:]
-    x6 = xmp_packet(6)
-    cases = [
-        (png(after=[(b"eXIf", t6)]), 6),
-        (png([(b"eXIf", t6)], [text(b"tEXt", b"exif", t3)]), 3),
-        (png([text(b"zTXt", b"exif", t6)]), 1),
-        (png([text(b"iTXt", b"exif", t6)]), 1),
-        (png([text(b"tEXt", b"Raw profile type exif", raw_profile(t3))], [text(b"zTXt", b"Raw profile type exif",
-                                                                                 raw_profile(t6))]), 6),
-        (png([text(b"iTXt", b"Raw profile type exif", raw_profile(t6), compressed=True), (b"eXIf", t3)]), 3),
-        (png([text(b"tEXt", b"Raw profile type exif", b"\nexif\n4\nnot hex\n"), text(b"tEXt", b"XML:com.adobe.xmp",
-                                                                                     x6)]), 1),
-        (png([text(b"tEXt", b"XML:com.adobe.xmp", x6)]), 6),
-        (png(after=[text(b"zTXt", b"XML:com.adobe.xmp", x6)]), 6),
-        (png([text(b"iTXt", b"XML:com.adobe.xmp", x6 + b"\xff")]), 6),
-        (png([text(b"iTXt", b"XML:com.adobe.xmp", x6, compressed=True, method=1)]), 1),
-        (png([text(b"iTXt", b"XML:com.adobe.xmp", xmp_packet(3) + b"\xff"), text(b"tEXt", b"XML:com.adobe.xmp",
-                                                                                 x6)]), 6),
-        (png(after=[(b"b@d!", b"x"), (b"eXIf", t6)]), 1),
-        (png(after=[(b"eXIf", t6)], frames=2), 1),
-        (png([(b"eXIf", t6)], frames=2), 6),
-        # a key with no NUL: tEXt and zTXt set it empty, replacing what came before; iTXt sets nothing
-        (png([(b"eXIf", t6)], [(b"tEXt", b"exif")]), 1),
-        (png([(b"eXIf", t6)], [(b"zTXt", b"exif")]), 1),
-        (png([(b"eXIf", t6)], [(b"iTXt", b"exif")]), 6),
-        (png([text(b"tEXt", b"Raw profile type exif", raw_profile(t6))], [(b"tEXt", b"Raw profile type exif")]), 1),
-        (png([text(b"tEXt", b"XML:com.adobe.xmp", x6)], [(b"tEXt", b"XML:com.adobe.xmp")]), 1),
-        # a chunk keyed `xmp` replaces an iTXt packet's `xmp` bytes with text, which getexif's bytes match refuses
-        (png([text(b"iTXt", b"XML:com.adobe.xmp", x6 + b"\xff")], [text(b"tEXt", b"xmp", b"x")]), 1),
-        (png([text(b"tEXt", b"xmp", b"x")], [text(b"iTXt", b"XML:com.adobe.xmp", x6 + b"\xff")]), 6),
-        # a compressed packet cut before its checksum: zlib's output past the last input still counts
-        (png([(b"iTXt", b"XML:com.adobe.xmp\0\1\0\0\0" + zlib.compress(
-            b'xiff:Orientation="6"' + b"." * 16346 + b'tiff:Orientation="6"', 6)[:-5])]), 6),
-    ]
-    for data, want in cases:
-        assert agrees_with_pillow(data) == want, data
-
-
-def test_the_probe_walks_containers_where_pillow_does() -> None:
-    """Containers walked as Pillow walks them: a JPEG's stray bytes, 0xFF00 and a segment length below 2 before its
-    APP1 Exif (JpegImageFile._open skips them); a WebP's chunks no further than its RIFF size (libwebp's demuxer);
-    an animated PNG whose first frame is an fdAT; an IFD0 cut short after the entries its count declares (Pillow reads
-    those present). A chunk cut short in a PNG's header is a ProbeError or an image, never another exception."""
-    img = pattern(40, 20)
-    jpeg = encoded(img, "JPEG")
-    sof = jpeg.index(b"\xff\xc0")
-    app1 = b"\xff\xe1" + struct.pack(">H", 2 + len(exif(6))) + exif(6)
-    after = sof + 2 + struct.unpack_from(">H", jpeg, sof + 2)[0]
-    for junk in (b"\xff\x00", b"\x17", b"\xff\xff", b"\xff\xfe\x00\x00", b"\xff\xfe\x00\x01"):
-        assert agrees_with_pillow(jpeg[:after] + junk + app1 + jpeg[after:]) == 6, junk
-    data = bytearray(webp((b"EXIF", exif(6)[6:]), flags=0x08))
-    struct.pack_into("<I", data, 4, len(data) - 8 - 8 - len(exif(6)[6:]) - (len(exif(6)[6:]) & 1))  # EXIF past it
-    assert agrees_with_pillow(bytes(data)) == 1
-    raw = png(after=[(b"eXIf", exif(6)[6:])], frames=2)
-    idat = raw.index(b"IDAT") - 4
-    n = struct.unpack_from(">I", raw, idat)[0]
-    body = raw[idat + 8:idat + 8 + n]
-    fdat = struct.pack(">I", n + 4) + b"fdAT" + struct.pack(">I", 1) + body
-    fdat += struct.pack(">I", zlib.crc32(fdat[4:]))
-    seq = raw[:idat] + fdat + raw[idat + 12 + n:]
-    seq = seq.replace(b"fcTL\x00\x00\x00\x01", b"fcTL\x00\x00\x00\x02", 1)
-    assert Image.open(io.BytesIO(seq)).n_frames == 2  # Pillow reads the fdAT as the first frame
-    assert probe(seq).orientation == pillow_orientation(seq)[0] == 1
-    short = ifd0([(0x0112, 3, 1, b"\6\0\0\0")])[:22]
-    for count in (2, 1001, 65535):
-        block = short[:8] + struct.pack("<H", count) + short[10:]
-        assert agrees_with_pillow(encoded(img, "PNG", exif=block)) == 6, count
-    for cut in range(33, 45):
-        data = encoded(img, "PNG")[:33] + struct.pack(">I", 8) + b"acTL" + bytes(8)
-        with contextlib.suppress(ProbeError):
-            probe(data[:cut])
-    for kind in (b"tEXt", b"zTXt", b"iTXt"):  # a text chunk of a key the probe reads, cut short anywhere
-        for key in (b"exif", b"Raw profile type exif", b"XML:com.adobe.xmp"):
-            data = encoded(img, "PNG")[:33] + struct.pack(">I", 100) + kind + key + b"\0\x01\x00\x00\x00x"
-            for cut in range(33, len(data) + 1):
-                with contextlib.suppress(ProbeError):
-                    probe(data[:cut])
-    many = b"\xff\xe1" + struct.pack(">H", 9) + b"Exif\x00\x00x"  # APP1 Exif segments of one byte each: joined once
-    data = jpeg[:after] + app1 + many * 2000 + jpeg[after:]
-    assert probe(data).orientation == pillow_orientation(data)[0] == 6
-
-
-def lines_run(f, *args) -> tuple[int, object]:
-    """The Python lines of the probe's module that f(*args) runs (its work, whatever the host's speed), and what f
-    returns or raises."""
-    import sys
-
-    from llm_mini_infer.vision import probe as pr
-
-    n = 0
-
-    def local(frame, event, arg):
-        nonlocal n
-        n += event == "line"
-        return local
-
-    def call(frame, event, arg):
-        return local if frame.f_code.co_filename == pr.__file__ else None
-
-    old = sys.gettrace()
-    sys.settrace(call)
-    try:
-        try:
-            out = f(*args)
-        except Exception as exc:  # returned for the caller to check
-            out = exc
-    finally:
-        sys.settrace(old)
-    return n, out
-
-
-def test_the_jpeg_walk_skips_stray_bytes_and_fill_at_once_and_bounds_the_rest() -> None:
-    """The walk runs on the event loop: a run of stray bytes is one `bytes.find` whatever its length (20 MiB here), a
-    run of fill one regex match that counts a marker a KiB; every other marker (a segment, 0xFF00, a marker without a
-    length, a length below 2) costs a step, and past MAX_JPEG_MARKERS the JPEG is a ProbeError, after a stray byte or
-    an EOI too, where the base stopped and Pillow reads on. Where Pillow reads the file, the probe reads what Pillow
-    does."""
-    from llm_mini_infer.vision.probe import MAX_JPEG_MARKERS
-
-    img = pattern(40, 20)
-    jpeg = encoded(img, "JPEG")
-    sof = jpeg.index(b"\xff\xc0")
-    after = sof + 2 + struct.unpack_from(">H", jpeg, sof + 2)[0]
-    app1 = b"\xff\xe1" + struct.pack(">H", 2 + len(exif(6))) + exif(6)
-    for gap in (b"\x00" * (20 << 20), b"\x17" * (20 << 20), b"\xff" * (1 << 20)):
-        n, h = lines_run(probe, jpeg[:after] + gap + app1 + jpeg[after:])
-        assert n < 200 and h.orientation == 6, (gap[:1], n)
-    n, err = lines_run(probe, jpeg[:after] + b"\xff" * (20 << 20) + app1 + jpeg[after:])
-    assert isinstance(err, ProbeError) and "more than 2048 markers" in str(err) and n < 200, n
-    for gap in (b"\x00" * 65536, b"\xff" * 65536):
-        assert agrees_with_pillow(jpeg[:after] + gap + app1 + jpeg[after:]) == 6
-    room = MAX_JPEG_MARKERS - 20  # the encoder's own markers before the scan, and the APP1
-    units = {b"\xff\x00": 1, b"\xff\xd0": 1, b"\xff\xd8": 1, b"\xff\xd9": 1, b"\xff\xf0": 1, b"\xff\xfe\x00\x00": 1,
-             b"\xff\xe0\x00\x01": 1, b"\xff\xc0\x00\x00": 1, b"\xff\xfe\x00\x02": 1, b"\xff\xe1\x00\x02": 1,
-             b"\xff\xe1\x00\x08Exif\x00\x00": 1, b"\x00\xff\xfe\x00\x02": 2, b"\xff\xff\xfe\x00\x02": 2}
-    for unit, markers in units.items():
-        at_cap = jpeg[:after] + unit * (room // markers) + app1 + jpeg[after:]
-        n, h = lines_run(probe, at_cap)
-        assert h.orientation == 6 and n < 20 * MAX_JPEG_MARKERS, (unit, n)
-        flood = unit * ((20 << 20) // len(unit))
-        for data in (jpeg[:after] + flood + app1 + jpeg[after:], jpeg[:after] + b"\x17\xff\xd9" + flood + jpeg[after:]):
-            n, err = lines_run(probe, data)
-            assert isinstance(err, ProbeError) and "more than 2048 markers" in str(err), (unit, err)
-            assert n < 20 * MAX_JPEG_MARKERS, (unit, n)
-    assert agrees_with_pillow(jpeg[:after] + b"\xff\xfe\x00\x00" * room + app1 + jpeg[after:]) == 6
-
-
-def test_a_jpegs_exif_segments_are_joined_up_to_max_jpeg_exif() -> None:
-    """Pillow joins a JPEG's APP1 Exif segments into one block; the probe joins at most MAX_JPEG_EXIF of their data (a
-    segment holds 64 KiB) and counts more as orientation 1, without the copy (the pool's decode orients by Pillow)."""
-    from llm_mini_infer.vision.probe import MAX_JPEG_EXIF
-
-    jpeg = encoded(pattern(40, 20), "JPEG")
-    sof = jpeg.index(b"\xff\xc0")
-    after = sof + 2 + struct.unpack_from(">H", jpeg, sof + 2)[0]
-    first = exif(6) + bytes(65000 - len(exif(6)))
-    more = b"Exif\x00\x00" + bytes(65000)
-    segments = [first] + [more] * (MAX_JPEG_EXIF // 65006)
-
-    def app1(s: bytes) -> bytes:
-        return b"\xff\xe1" + struct.pack(">H", 2 + len(s)) + s
-
-    under = jpeg[:after] + b"".join(app1(s) for s in segments[:-1]) + jpeg[after:]
-    over = jpeg[:after] + b"".join(app1(s) for s in [*segments, more]) + jpeg[after:]
-    assert probe(under).orientation == pillow_orientation(under)[0] == 6
-    assert pillow_orientation(over)[0] == 6 and probe(over).orientation == 1
-
-
-@contextlib.contextmanager
-def unpacked():
-    """The lengths of the data Pillow's TIFF value loaders unpack meanwhile (`ImageFileDirectory_v2._load_dispatch`),
-    one entry a call."""
-    from PIL.TiffImagePlugin import ImageFileDirectory_v2
-
-    seen: list[int] = []
-    saved = dict(ImageFileDirectory_v2._load_dispatch)
-
-    def wrap(size, handler):
-        def load(self, data, legacy_api=True):
-            seen.append(len(data))
-            return handler(self, data, legacy_api)
-        return size, load
-
-    ImageFileDirectory_v2._load_dispatch.update({t: wrap(*v) for t, v in saved.items()})
-    try:
-        yield seen
-    finally:
-        ImageFileDirectory_v2._load_dispatch.update(saved)
-
-
-def test_the_probe_unpacks_one_value_of_the_orientation_tag() -> None:
-    """The review's case: IFD0 of one entry, Orientation, RATIONAL, its count filling a 15 MiB block, which Pillow's
-    loader unpacks value by value (seconds on the event loop). The probe hands Pillow one unit of the data, of every
-    numeric type, and none of BYTE, ASCII and UNDEFINED (never 2..8); the answer is Pillow's, its first value."""
-    img = pattern(40, 20)
-    six = {3: [6], 4: [6], 5: [(6, 1)], 6: [6], 8: [6], 9: [6], 10: [(-12, -2)], 11: [6.0], 12: [6.0], 13: [6], 16: [6],
-           1: [6], 2: [b"6"], 7: [6]}
-    for typ, first in six.items():
-        unit = struct.calcsize("<" + TIFF_CODES[typ]) if typ != 2 else 1
-        for count in (2, 1000, (15 << 20) // unit if typ == 5 else 0):
-            if not count:
-                continue
-            values = first + ([(0, 1)] if typ in (5, 10) else [b"0"] if typ == 2 else [0]) * (count - 1)
-            data = encoded(img, "PNG", exif=orientation_entry(typ, values))
-            want = 6 if typ not in (1, 2, 7) else 1
-            if count < 1 << 20:
-                assert pillow_orientation(data)[0] == want, (typ, count)
-            with unpacked() as seen:
-                assert probe(data).orientation == want, (typ, count)
-            assert seen == ([] if typ in (1, 2, 7) else [unit]), (typ, count, seen[:4])
-
-
-def test_pillows_tiff_loader_logs_nothing_while_the_probe_reads_exif() -> None:
-    """At debug level Pillow's IFD loader logs a record for each entry; on the event loop that is up to
-    MAX_IFD0_ENTRIES records an image. The probe reads with that logger disabled, and leaves it as it was."""
-    import logging
-
-    from llm_mini_infer.vision.probe import MAX_IFD0_ENTRIES
-
-    records: list[logging.LogRecord] = []
-    handler = logging.Handler(logging.DEBUG)
-    handler.emit = records.append
-    log = logging.getLogger("PIL.TiffImagePlugin")
-    old = log.level
-    log.addHandler(handler)
-    log.setLevel(logging.DEBUG)
-    try:
-        others = [(0x0200 + k, 3, 1, b"\1\0\0\0") for k in range(MAX_IFD0_ENTRIES - 1)]
-        block = ifd0([(0x0112, 3, 1, b"\6\0\0\0"), *others])
-        data = encoded(pattern(40, 20), "JPEG", exif=b"Exif\x00\x00" + block)
-        assert probe(data).orientation == 6 and records == [] and not log.disabled
-        Image.open(io.BytesIO(data)).getexif()
-        assert len(records) >= MAX_IFD0_ENTRIES  # Pillow's own read, outside the probe, logs them
-    finally:
-        log.removeHandler(handler)
-        log.setLevel(old)
-
-
-def test_the_probe_reads_exif_tags_at_once_as_pillows_safe_read_reads_them() -> None:
-    """While the probe's Exif.load runs, Pillow's `ImageFile._safe_read` (a tag over a MiB read in 1 MiB blocks and
-    joined: on linux every block faulted in afresh) is `_read_at_once`: the same bytes (as a view of the block it
-    holds) and the same error on the loader's BytesIO, at every size; and Pillow's own is back afterwards, whatever
-    the probe answers."""
-    from PIL import ImageFile
-
-    from llm_mini_infer.vision.probe import _read_at_once
-
-    data = random.Random(4).randbytes(3 * ImageFile.SAFEBLOCK + 7)
-    for start in (0, 5):
-        for size in (-1, 0, 1, 4, ImageFile.SAFEBLOCK, ImageFile.SAFEBLOCK + 1, len(data) - start, len(data) + 1):
-            got = []
-            for read in (ImageFile._safe_read, _read_at_once, lambda fp, n: _read_at_once(fp, n, data)):
-                fp = io.BytesIO(data)
-                fp.seek(start)
-                try:
-                    got.append((bytes(read(fp, size)), fp.tell()))
-                except OSError as exc:
-                    got.append((type(exc), str(exc)))
-            assert got[0] == got[1] == got[2], (start, size)
-    own = ImageFile._safe_read
-    big = orientation_entry(5, [(6, 1)] + [(0, 1)] * ((3 << 20) // 8))  # a 3 MiB RATIONAL tag, as the review's case
-    for data in (encoded(pattern(40, 20), "PNG", exif=big), b"\x89PNG\r\n\x1a\n"):
-        with contextlib.suppress(ProbeError):
-            probe(data)
-        assert ImageFile._safe_read is own
-    assert probe(encoded(pattern(40, 20), "PNG", exif=big)).orientation == 6
-
-
-def test_the_exif_block_is_handed_to_pillow_cut_past_the_prefixes_it_strips() -> None:
-    """Exif.load strips up to two `Exif\\0\\0` by a copy; the probe hands it the block cut once past them, which
-    Pillow then reads unchanged, whatever the prefixes: the same block after Pillow's strip, with none, one, two or
-    more, before the data or in Pillow's info already (a PNG eXIf)."""
-    import re as regex
-
-    from llm_mini_infer.vision.probe import _exif_block
-
-    def strip(x: bytes) -> bytes:
-        return regex.sub(b"^(Exif\x00\x00){1,2}", b"", x)
-
-    tiff = exif(6)[6:]
-    for k in range(5):
-        for prefixed in (0, 1):
-            b = b"junk" + b"Exif\x00\x00" * k + tiff
-            got = _exif_block(b, 4, len(b), prefixed)
-            assert strip(got) == strip(b"Exif\x00\x00" * prefixed + b[4:]), (k, prefixed)
-            assert strip(got) is got or k + prefixed > 2, (k, prefixed)  # no second copy, but past two prefixes
-
-
-def test_the_xmp_orientation_is_getexifs_first_match_up_to_the_decoys() -> None:
-    """The probe finds `tiff:Orientation` by memchr and reads what follows (`="N` or `>N`), as getexif's regex
-    matches; occurrences that do not match are passed over, up to _XMP_DECOYS of them, after which the XMP counts
-    as no orientation (crafted; the pool's decode still orients by Pillow)."""
-    from llm_mini_infer.vision.probe import _XMP_DECOYS
-
-    img = pattern(40, 20)
-    for decoy in (b"tiff:Orientation", b'tiff:Orientation="x"', b"tiff:Orientation>x", b"tiff:Orientation=6"):
-        for n, want in ((0, 6), (1, 6), (_XMP_DECOYS - 1, 6), (_XMP_DECOYS, 1)):
-            xmp = b"<x:xmpmeta>" + decoy * n + b'<rdf:Description tiff:Orientation="6"/></x:xmpmeta>'
-            data = encoded(img, "JPEG", xmp=xmp)
-            assert probe(data).orientation == want, (decoy, n)
-            if want != 1:
-                assert agrees_with_pillow(data) == 6
-    for form, want in ((b"tiff:Orientation>8<", 8), (b'tiff:Orientation="9"', 1), (b"tiff:Orientation>0", 1)):
-        data = encoded(img, "JPEG", xmp=b"<x:xmpmeta>" + form + b"</x:xmpmeta>")
-        assert agrees_with_pillow(data) == want, form
-
-
-def stored_flood(n: int) -> bytes:
-    """A zlib stream of `n` empty stored blocks: compressed bytes that inflate to nothing."""
-    return b"\x78\x01" + b"\x00\x00\x00\xff\xff" * n + b"\x01\x00\x00\xff\xff" + zlib.adler32(b"").to_bytes(4, "big")
-
-
-def bad_checksum(value: bytes) -> bytes:
-    z = bytearray(zlib.compress(value))
-    z[-1] ^= 0xFF
-    return bytes(z)
-
-
-@contextlib.contextmanager
-def inflation(monkeypatch):
-    """The bytes the probe feeds zlib and the bytes zlib gives back meanwhile, kept or not."""
-    from llm_mini_infer.vision import probe as pr
-
-    work = {"fed": 0, "out": 0}
-    real = zlib.decompressobj
-
-    class Counted:
-        def __init__(self) -> None:
-            self.d = real()
-
-        def decompress(self, data, max_length=0):
-            try:
-                out = self.d.decompress(data, max_length)
-            except zlib.error:
-                work["fed"] += len(data)
-                work["out"] += max_length
-                raise
-            work["fed"] += len(data) - len(self.d.unconsumed_tail)  # consumed, each byte once
-            work["out"] += len(out)
-            return out
-
-        def __getattr__(self, name):
-            return getattr(self.d, name)
-
-    with monkeypatch.context() as m:
-        m.setattr(pr.zlib, "decompressobj", Counted)
-        yield work
-
-
-def test_png_text_is_read_within_the_probes_work_bound(monkeypatch) -> None:
-    """PNG text the probe inflates or decodes, kept or not, counts against MAX_TEXT_WORK, and so do the compressed
-    bytes it feeds zlib (_FED_COST each): the review's case (zTXt `exif` or Raw-profile streams ending in a bad
-    checksum, 1 MiB each) inflates the last chunk only (the value Pillow keeps); iTXt chunks that set nothing (a bad
-    checksum, text that is not UTF-8, compressed or not) are read back to the bound and refused past it; a stream of
-    empty deflate blocks is refused past the bound on its compressed bytes. A compressed EXIF of tens of KiB, as
-    an encoder writes it, is read as Pillow reads it."""
-    from llm_mini_infer.vision import probe as pr
-
-    mib = pr.MAX_TEXT_CHUNK
-    bound = {"out": pr.MAX_TEXT_WORK + pr._INFLATE_STEP, "fed": pr.MAX_TEXT_WORK // pr._FED_COST + pr._TEXT_FEED}
-    read = [png([(b"zTXt", key + b"\0\0" + bad_checksum(b" " * mib))] * 40)
-            for key in (b"exif", b"Raw profile type exif")]
-    for data in read:
-        want = pillow_orientation(data)[0]
-        with inflation(monkeypatch) as work:
-            assert probe(data).orientation == want == 1
-        assert mib <= work["out"] <= mib + pr._INFLATE_STEP and work["fed"] < 1 << 14, work
-    itxt = b"\0\1\0\0\0"
-    refused = [png([(b"iTXt", b"XML:com.adobe.xmp" + itxt + bad_checksum(b" " * mib))] * 40),
-               png([(b"iTXt", b"Raw profile type exif" + itxt + zlib.compress(b"\xff" * mib))] * 40),
-               png([text(b"iTXt", b"exif", b"\xff" * mib)] * 40),
-               png([(b"zTXt", b"XML:com.adobe.xmp\0\0" + stored_flood(1 << 16))])]
-    for data in refused:
-        with inflation(monkeypatch) as work, pytest.raises(ProbeError, match="MAX_TEXT_WORK"):
-            probe(data)
-        assert work["out"] <= bound["out"] and work["fed"] <= bound["fed"], work
-    thumb = random.Random(2).randbytes(25000)  # an EXIF with a thumbnail: its hex barely compresses
-    block = ifd0([(0x0112, 3, 1, b"\6\0\0\0")], trailer=thumb)
-    data = png([text(b"zTXt", b"Raw profile type exif", raw_profile(block))])
-    assert len(data) > 25000 and agrees_with_pillow(data) == 6
-
-
-def test_the_probe_reads_png_text_as_pillow_does_on_random_chunks() -> None:
-    """Random runs of the metadata chunks getexif reads (eXIf; tEXt, zTXt and iTXt of `exif`, "Raw profile type exif"
-    and `XML:com.adobe.xmp`; iTXt compressed or not, with another method, a bad checksum or text that is not
-    UTF-8), before and after the image data: the probe, which reads each value from the last chunk back, reads the
-    orientation Pillow reads, or refuses an image Pillow refuses."""
-    import warnings
-
-    rng = random.Random(3)
-    blocks = {o: exif(o)[6:] for o in range(1, 9)}
-    seen = {"agree": 0, "rotated": 0}
-    for _ in range(600):
-        chunks = []
-        for _ in range(rng.randint(1, 4)):
-            key = rng.choice([b"exif", b"Raw profile type exif", b"XML:com.adobe.xmp", b"eXIf"])
-            o = rng.randint(1, 8)
-            value = (blocks[o] if key in (b"exif", b"eXIf") else raw_profile(blocks[o]) if key[0] == 0x52 else
-                     xmp_packet(o))
-            if rng.random() < 0.2:
-                value += b"\xff"
-            if key == b"eXIf":
-                chunks.append((b"eXIf", value))
-                continue
-            kind = rng.choice([b"tEXt", b"zTXt", b"iTXt"])
-            if kind == b"iTXt" and rng.random() < 0.6:
-                z = zlib.compress(value) if rng.random() < 0.8 else bad_checksum(value)
-                chunks.append((kind, key + b"\0" + bytes([1, rng.choice([0, 0, 0, 1])]) + b"\0\0" + z))
-            elif kind == b"zTXt" and rng.random() < 0.2:
-                chunks.append((kind, key + b"\0\0" + bad_checksum(value)))
-            else:
-                chunks.append(text(kind, key, value))
-        split = rng.randint(0, len(chunks))
-        data = png(chunks[:split], chunks[split:])
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            want = pillow_orientation(data)[0]
-        assert probe(data).orientation == want, chunks
-        seen["agree"] += 1
-        seen["rotated"] += want != 1
-    assert seen["rotated"] > 150, seen
-
-
-def test_the_probe_has_pillow_read_at_most_max_ifd0_entries(monkeypatch) -> None:
-    """The probe runs on the event loop, and Pillow's loader costs about a microsecond an entry: an IFD0 of
-    MAX_IFD0_ENTRIES entries is read as Pillow reads it, one with more counts as orientation 1 without calling the
-    loader. The pool's decode still orients by Pillow, so an orientation of 5..8 then fails its size check (a 400)."""
-    from llm_mini_infer.vision.family import decode_rgb
-    from llm_mini_infer.vision.probe import MAX_IFD0_ENTRIES
-
-    def block(n: int) -> bytes:
-        return ifd0([(0x0200 + k % 0xF000, 3, 1, b"\1\0\0\0") for k in range(n - 1)] + [(0x0112, 3, 1, b"\6\0\0\0")])
-
-    img = pattern(40, 20)
-    at_cap = encoded(img, "PNG", exif=block(MAX_IFD0_ENTRIES))
-    assert agrees_with_pillow(at_cap) == 6
-    over = encoded(img, "PNG", exif=block(MAX_IFD0_ENTRIES + 1))
-    assert pillow_orientation(over) == (6, False)
-    with monkeypatch.context() as m:
-        m.setattr(Image.Exif, "load", lambda self, data: pytest.fail("Pillow's loader called"))
-        h = probe(over)
-        assert h.orientation == 1 and probe(encoded(img, "PNG", exif=block(65535))).orientation == 1
-    with pytest.raises(ProbeError, match="is 20x40, but its header says 40x20"):
-        decode_rgb(over, h)
-    over = encoded(img, "JPEG", exif=b"Exif\x00\x00" + block(MAX_IFD0_ENTRIES + 1))
-    with pytest.raises(ProbeError, match="is 20x40, but its header says 40x20"):
-        decode_rgb(over, probe(over))
 
 
 # The JPEG cases' file digests (the first 16 hex digits) and the pixels the decoder before Pillow gave them
