@@ -500,7 +500,7 @@ def _shards(cfg: Qwen35Config) -> dict[str, tuple[str, int]]:
 
 def map_weight_name(cfg: Qwen35Config, name: str, mtp: bool = False) -> tuple[str, int] | None:
     """HF checkpoint name → (parameter name, first row), or None for weights we do not load. A block-FP8 weight's
-    `weight_scale_inv` maps to the projection's `weight_scale`, at the shard's first row / 128 (block rows). `mtp`:
+    `weight_scale_inv` (HF `fp8`) or `weight_scale` (`compressed-tensors`, selected via `cfg.quant.scale_suffix`) maps to the projection's `weight_scale`, at the shard's first row / 128 (block rows). `mtp`:
     load the MTP layer (`mtp.*`; the first one when the checkpoint has several)."""
     if name.startswith(_SKIP_PREFIXES):
         return None
