@@ -66,6 +66,7 @@ import platform
 import random
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -75,6 +76,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from . import server_process
 from .api.auth import client_headers
 
 # The packaged references: the host measures' values (`host`) and labelled loads (`loads`, `load_reference`'s format)
@@ -212,8 +214,9 @@ class Server:
         self.log_path = out
         self.log = out.open("w")
         self.t0 = time.perf_counter()
+        self._stopped = False
         try:
-            self.proc = subprocess.Popen(args, stdout=self.log, stderr=subprocess.STDOUT)
+            self.proc = server_process.launch(args, stdout=self.log, stderr=subprocess.STDOUT)
         except BaseException:
             self.log.close()
             raise
@@ -237,11 +240,10 @@ class Server:
     def tail(self, lines: int = 60) -> str:
         """The end of the server's log, for an error: in a container its log may be on a volume nobody reads once the
         container has ended (startup lines only: no request has run, and nothing logs a secret)."""
-        try:
-            last = self.log_path.read_text(errors="replace").splitlines()[-lines:]
-        except OSError:
+        last = server_process.log_tail(self.log_path, lines)
+        if last is None:
             return f"; its log: {self.log_path}"
-        return f"; the last {len(last)} lines of its log ({self.log_path}):\n" + "\n".join(last)
+        return f"; the last {len(last.splitlines()) if last else 0} lines of its log ({self.log_path}):\n" + last
 
     def get(self, path: str) -> tuple[int, Any]:
         """GET `path` with the API key the server holds, if any (`client_headers`): every path but the probes needs
@@ -255,21 +257,15 @@ class Server:
         finally:
             c.close()
 
-    def stop(self) -> None:
-        """SIGINT (drain without a grace), then SIGKILL after 120 s; the child is reaped and the log closed (a second
-        call does nothing more). The launcher's children are not in a new session: a launcher that had to be killed
-        may leave its engine or frontends running, so after a kill the port is not known to be free."""
+    def stop(self, wait: float = 120, kill_wait: float = 10) -> None:
+        """Send SIGINT to drain, then kill and reap the whole process group if it does not exit in time."""
+        if self._stopped:
+            return
         try:
-            if self.proc.poll() is None:
-                self.proc.send_signal(2)
-                try:
-                    self.proc.wait(120)
-                except subprocess.TimeoutExpired:
-                    self.proc.kill()
-                    with contextlib.suppress(subprocess.TimeoutExpired):
-                        self.proc.wait(10)
+            server_process.stop(self.proc, first_signal=signal.SIGINT, waits=(wait, kill_wait))
         finally:
             self.log.close()
+        self._stopped = True
 
 
 # -- 4a. Qwen3.8: closed loops -----------------------------------------------------------------------------------------

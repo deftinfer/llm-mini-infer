@@ -37,6 +37,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
+from llm_mini_infer import server_process  # noqa: E402
 from tests.support import paths  # noqa: E402
 
 # --model overrides: any model directory with its tokenizer and configuration (the fake runner reads no weights)
@@ -81,14 +82,14 @@ class Server:
         RESULTS.mkdir(parents=True, exist_ok=True)
         self.cfg_path = RESULTS / f".server-{self.port}.yaml"
         self.proc: subprocess.Popen | None = None
+        self._stopped = False
         try:
             self.cfg_path.write_text(yaml.safe_dump(cfg))
             # the bench's own server: no API key (an exported one would guard every path but the probes from the
             # bench's clients, which send none)
             env = {k: v for k, v in os.environ.items() if k not in ("LLM_MINI_INFER_API_KEY", "VLLM_API_KEY")}
-            self.proc = subprocess.Popen([sys.executable, "-m", "llm_mini_infer.cli", "serve", "--config",
-                                          str(self.cfg_path)],
-                                         cwd=ROOT, env=env)
+            self.proc = server_process.launch([sys.executable, "-m", "llm_mini_infer.cli", "serve", "--config",
+                                               str(self.cfg_path)], cwd=ROOT, env=env, stderr=None)
             deadline = time.monotonic() + (60 if RUNNER == "fake" else 1200)  # the GPU loads weights, profiles, JITs
             while time.monotonic() < deadline:
                 if self.proc.poll() is not None:
@@ -142,21 +143,16 @@ class Server:
             out[name] = t
         return out
 
-    def stop(self) -> None:
-        """SIGTERM, then SIGKILL after 60 s; the child is reaped and the config file removed. Safe to call twice, and
-        before the child exists (a failed start). The launcher's children are not in a new session: a killed launcher
-        may leave its engine or frontends running."""
+    def stop(self, wait: float = 60, kill_wait: float = 10) -> None:
+        """Send SIGTERM to drain, then kill and reap the whole process group if it does not exit in time."""
+        if self._stopped:
+            return
         try:
-            if self.proc is not None and self.proc.poll() is None:
-                self.proc.send_signal(signal.SIGTERM)
-                try:
-                    self.proc.wait(60)
-                except subprocess.TimeoutExpired:
-                    self.proc.kill()
-                    with contextlib.suppress(subprocess.TimeoutExpired):  # it raised already: keep that
-                        self.proc.wait(10)
+            if self.proc is not None:
+                server_process.stop(self.proc, first_signal=signal.SIGTERM, waits=(wait, kill_wait))
         finally:
             self.cfg_path.unlink(missing_ok=True)
+        self._stopped = True
 
 
 # -- load ---------------------------------------------------------------------------------------------------------
