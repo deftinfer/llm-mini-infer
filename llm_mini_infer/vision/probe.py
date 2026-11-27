@@ -112,9 +112,9 @@ def exif_orientation(exif: bytes) -> int | None:
     numbers), else 1 (bytes and text never match). 1 too when Pillow cannot parse the block (shorter than a TIFF header,
     or a header not in `_TIFF_HEADS`): `getexif` raises before it reads any XMP (a JPEG's open, reading its DPI,
     swallows the error, and its EXIF then holds nothing), and the image is served as stored.
-    None when Pillow finds no Orientation: the block empty once stripped, no such tag, IFD0 or the entry's data past the
-    block's end (Pillow warns and stops reading IFD0 there). Pillow stops there for an earlier tag's data too; that is
-    not followed (rare)."""
+    None when Pillow finds no Orientation: the block empty once stripped, no such tag, IFD0 or an entry past the block's
+    end, or the data of the Orientation entry or of any entry before it past the block's end (Pillow warns and stops
+    reading IFD0 at the first such entry)."""
     t = exif
     for _ in range(2):
         if t[:6] == b"Exif\x00\x00":
@@ -144,10 +144,8 @@ def exif_orientation(exif: bytes) -> int | None:
             off = struct.unpack_from(e + "I", t, p + 8)[0]
             if total > len(t):
                 continue
-            if off + size > len(t):
-                if tag == 0x0112:
-                    return None
-                continue
+            if off + size > len(t):  # Pillow's read of the data fails, and it stops reading IFD0
+                return None
             data = t[off:off + size]
         else:
             data = t[p + 8:p + 8 + size]

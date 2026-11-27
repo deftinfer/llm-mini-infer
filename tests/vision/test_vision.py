@@ -921,7 +921,7 @@ ORIENTATIONS = [  # (Orientation entry, the orientation Pillow applies)
     (ifd0([(0x0112, 3, 0, b"\6\0\0\0"), (0x0112, 3, 1, b"\5\0\0\0")]), 5),
     (ifd0([(0x0112, 1, 1, b"\6\0\0\0"), (0x0112, 3, 1, b"\6\0\0\0")]), 1),
     # data past the block's end: Pillow stops reading IFD0; past its running bound of the block's length: skipped
-    (ifd0([(0x0112, 3, 4, b"\xf0\0\0\0")]), 1),
+    (ifd0([(0x0112, 3, 4, b"\xf0\0\0\0")]), 1), (ifd0([(0x010F, 2, 6, b"\x40\0\0\0"), (0x0112, 3, 1, b"\6\0\0\0")]), 1),
     (ifd0([(0x010F, 2, 60, b"\x08\0\0\0"), (0x0112, 3, 4, b"\x08\0\0\0"), (0x0112, 3, 1, b"\6\0\0\0")]), 6),
 ]
 
@@ -940,7 +940,7 @@ def test_the_probe_reads_the_orientation_pillow_applies(tiff, want) -> None:
 def random_ifd0(rng: random.Random) -> tuple[bytes, bool]:
     """IFD0 with an Orientation entry among 0-3 others, of random types, counts, offsets and trailers (with the
     orientation's values encoded in its type); and whether Pillow stops reading IFD0 at an earlier entry whose data
-    lies past the block's end, which the probe does not follow (left as a known, rare difference)."""
+    lies past the block's end (the probe stops there too)."""
     from PIL import TiffImagePlugin
 
     big = rng.random() < 0.5
@@ -1005,10 +1005,10 @@ def entries_of(tiff: bytes) -> list[tuple[int, int, int]]:
 
 
 def test_the_probe_agrees_with_pillow_on_random_ifd0s() -> None:
-    """Random IFD0s in JPEG, PNG and WebP: the probe's orientation is the one `exif_transpose` applies, but for the two
-    known differences (rare: malformed EXIF): Pillow stopping at an earlier tag's truncated data, and `exif_transpose`
-    raising after it read an orientation (it fails rewriting the EXIF; the image is served as stored, the probe
-    orients it)."""
+    """Random IFD0s in JPEG, PNG and WebP: the probe's orientation is the one `exif_transpose` applies, Pillow stopping
+    at an earlier tag's data past the block's end included, but for one known difference (rare: malformed EXIF):
+    `exif_transpose` raising after it read an orientation (it fails rewriting the EXIF; the image is served as stored,
+    the probe orients it)."""
     import warnings
 
     rng = random.Random(1)
@@ -1024,16 +1024,17 @@ def test_the_probe_agrees_with_pillow_on_random_ifd0s() -> None:
             except Exception:
                 continue
             want, raises = pillow_orientation(data)
-            if stops_early or raises:
-                seen["stops early" if stops_early else "raises"] += 1
+            if raises:
+                seen["raises"] += 1
                 continue
             assert probe(data).orientation == want, (fmt, tiff.hex())
             seen["agree"] += 1
+            seen["stops early"] += stops_early
             if want != 1:
                 n, typ = next((c, t) for tag, t, c in entries_of(tiff) if tag == 0x0112 and t != 99 and c)
                 seen["count"] += n != 1
                 seen["type"] += typ not in (3, 4)
-    assert seen["agree"] > 1000 and seen["count"] > 30 and seen["type"] > 30, seen
+    assert seen["agree"] > 1000 and seen["count"] > 30 and seen["type"] > 30 and seen["stops early"] > 50, seen
 
 
 def test_the_pool_serves_malformed_exif_as_stored_and_decodes_the_probed_format_only() -> None:
@@ -1135,6 +1136,27 @@ def test_exif_without_an_orientation_falls_back_to_xmp_and_exif_pillow_cannot_pa
         for data in (encoded(img, "JPEG", exif=block, xmp=xmp_packet(6)), encoded(img, "PNG", exif=block, pnginfo=info),
                      encoded(img, "WEBP", exif=p + block, xmp=xmp_packet(6), lossless=True)):
             assert agrees_with_pillow(data) == want, (data[:4], block)
+
+
+def test_ifd0_ends_at_the_first_entry_whose_data_lies_past_the_block_as_in_pillow() -> None:
+    """Pillow stops reading IFD0 at the first entry whose data lies past the block's end, whatever its tag: an
+    Orientation after it is not read, so an XMP orientation counts, else 1. Data past Pillow's running bound of the
+    block's length is skipped instead, and the Orientation after it is read. JPEG, PNG and WebP at orientations 2 to 8,
+    against Pillow's orientation, size and pixels."""
+    img = pattern(40, 20)
+    p = b"Exif\x00\x00"
+    for o in range(2, 9):
+        x = 2 if o != 2 else 3
+        past = ifd0([(0x010F, 2, 6, b"\x40\0\0\0"), (0x0112, 3, 1, bytes([o, 0, 0, 0]))])  # 6 bytes at 64 of 38
+        skipped = ifd0([(0x010F, 2, 60, b"\x08\0\0\0"), (0x0112, 3, 1, bytes([o, 0, 0, 0]))])  # 60 > 38 in all
+        info = PngImagePlugin.PngInfo()
+        info.add_itxt("XML:com.adobe.xmp", xmp_packet(x).decode())
+        for block, xmp, want in ((past, None, 1), (past, x, x), (skipped, x, o)):
+            extra = {} if xmp is None else {"xmp": xmp_packet(xmp)}
+            for data in (encoded(img, "JPEG", exif=p + block, **extra),
+                         encoded(img, "PNG", exif=block, **({} if xmp is None else {"pnginfo": info})),
+                         encoded(img, "WEBP", exif=p + block, lossless=True, **extra)):
+                assert agrees_with_pillow(data) == want, (o, xmp, data[:4])
 
 
 # The JPEG cases' file digests (the first 16 hex digits) and the pixels the decoder before Pillow gave them
