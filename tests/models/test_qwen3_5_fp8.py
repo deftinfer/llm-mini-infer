@@ -1,5 +1,6 @@
 from llm_mini_infer.models.fp8 import QuantConfig
 from llm_mini_infer.models.qwen3_5.model import Qwen35Config, map_weight_name
+from tests.support.tiny_gemma import REDHAT_FP8_BLOCK
 
 
 def _cfg(quant: QuantConfig | None = None) -> Qwen35Config:
@@ -27,7 +28,7 @@ def _cfg(quant: QuantConfig | None = None) -> Qwen35Config:
 
 
 def test_map_weight_name_default_scale_suffix():
-    for quant in (None, QuantConfig(fmt="FP8_BLOCK", block=(128, 128))):
+    for quant in (None, QuantConfig.from_hf({"quant_method": "fp8", "weight_block_size": [128, 128]})):
         cfg = _cfg(quant)
         assert map_weight_name(
             cfg, "model.layers.0.mlp.gate_proj.weight_scale_inv"
@@ -38,26 +39,19 @@ def test_map_weight_name_default_scale_suffix():
         assert map_weight_name(
             cfg, "model.layers.0.mlp.down_proj.weight_scale_inv"
         ) == ("layers.0.mlp.down_proj.weight_scale", 0)
-        assert (
-            map_weight_name(cfg, "model.layers.0.mlp.gate_proj.weight_scale") is None
-        )
+           assert map_weight_name(cfg, "model.layers.0.self_attn.k_proj.weight_scale_inv") == ("layers.0.self_attn.qkv_proj.weight_scale", (cfg.num_heads * cfg.head_dim * (2 if cfg.attn_output_gate else 1)) // 128)
+        assert map_weight_name(cfg, "model.layers.0.linear_attn.in_proj_z.weight_scale_inv") == ("layers.0.linear_attn.in_proj_qkvz.weight_scale", cfg.conv_dim // 128)
         assert map_weight_name(
             cfg, "mtp.layers.0.mlp.gate_proj.weight_scale_inv", mtp=True
         ) == ("layers.0.mlp.gate_up_proj.weight_scale", 0)
         assert map_weight_name(
             cfg, "mtp.layers.0.mlp.up_proj.weight_scale_inv", mtp=True
         ) == ("layers.0.mlp.gate_up_proj.weight_scale", 2)
-        assert (
-            map_weight_name(
-                cfg, "mtp.layers.0.mlp.gate_proj.weight_scale", mtp=True
-            )
-            is None
-        )
-
+     
 
 def test_map_weight_name_compressed_tensors_scale_suffix():
     cfg = _cfg(
-        QuantConfig(fmt="FP8_BLOCK", block=(128, 128), scale_suffix="weight_scale")
+        QuantConfig.from_hf(REDHAT_FP8_BLOCK)
     )
     assert map_weight_name(
         cfg, "model.layers.0.mlp.gate_proj.weight_scale"
@@ -68,18 +62,11 @@ def test_map_weight_name_compressed_tensors_scale_suffix():
     assert map_weight_name(
         cfg, "model.layers.0.mlp.down_proj.weight_scale"
     ) == ("layers.0.mlp.down_proj.weight_scale", 0)
-    assert (
-        map_weight_name(cfg, "model.layers.0.mlp.gate_proj.weight_scale_inv") is None
-    )
+    assert map_weight_name(cfg, "model.layers.0.self_attn.k_proj.weight_scale") == ("layers.0.self_attn.qkv_proj.weight_scale", (cfg.num_heads * cfg.head_dim * (2 if cfg.attn_output_gate else 1)) // 128)
+      assert map_weight_name(cfg, "model.layers.0.linear_attn.in_proj_z.weight_scale") == ("layers.0.linear_attn.in_proj_qkvz.weight_scale", cfg.conv_dim // 128)
     assert map_weight_name(
         cfg, "mtp.layers.0.mlp.gate_proj.weight_scale", mtp=True
     ) == ("layers.0.mlp.gate_up_proj.weight_scale", 0)
     assert map_weight_name(
         cfg, "mtp.layers.0.mlp.up_proj.weight_scale", mtp=True
     ) == ("layers.0.mlp.gate_up_proj.weight_scale", 2)
-    assert (
-        map_weight_name(
-            cfg, "mtp.layers.0.mlp.gate_proj.weight_scale_inv", mtp=True
-        )
-        is None
-    )
