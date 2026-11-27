@@ -1073,7 +1073,6 @@ def xmp_packet(o: int) -> bytes:
             f"</rdf:RDF></x:xmpmeta>").encode()
 
 
-
 def pillow_pixels(data: bytes) -> torch.Tensor:
     """The image as vLLM decodes it (`normalize_image`: `exif_transpose`, the image as stored when it raises), RGB."""
     im = Image.open(io.BytesIO(data))
@@ -1136,6 +1135,7 @@ def test_exif_without_an_orientation_falls_back_to_xmp_and_exif_pillow_cannot_pa
         for data in (encoded(img, "JPEG", exif=block, xmp=xmp_packet(6)), encoded(img, "PNG", exif=block, pnginfo=info),
                      encoded(img, "WEBP", exif=p + block, xmp=xmp_packet(6), lossless=True)):
             assert agrees_with_pillow(data) == want, (data[:4], block)
+
 
 # The JPEG cases' file digests (the first 16 hex digits) and the pixels the decoder before Pillow gave them
 # (torchvision's decode_jpeg, oriented by the probe), as sha256 of the HWC uint8 bytes, the same on the Mac and on linux
