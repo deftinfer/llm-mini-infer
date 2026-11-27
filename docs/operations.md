@@ -146,7 +146,7 @@ A deployment sets the rest with `--set`, the chart's `config`, or a file mounted
 | `engine.watchdog_s` | 60 | stop an engine whose step loop is stuck this long; 0 disables it |
 | `engine.plan_at_boundary` | `false` | [plan at the forward/sampling boundary](architecture.md#planning-at-the-forwardsampling-boundary): Gemma 4 with structured output only |
 | `observability.log_level`, `log_requests` | `info`, `true` | the log, and a line per chat request |
-| `observability.debug_endpoints` | `false` | `/debug/*` timings |
+| `observability.debug_endpoints` | `false` | `/debug/*`: timings, and the event loop's lag (`/debug/loop`) |
 
 ### The dev settings
 
