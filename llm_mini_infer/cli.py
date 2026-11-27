@@ -20,7 +20,8 @@ def serve_args(s: argparse.ArgumentParser) -> argparse.ArgumentParser:
     s.add_argument("--host")
     s.add_argument("--port", type=int)
     s.add_argument("--frontends", type=int, help="frontend processes (default 1)")
-    s.add_argument("--served-model-name")
+    s.add_argument("--served-model-name", nargs="+", metavar="NAME",
+                   help="one or more aliases; completions and metrics use the first")
     s.add_argument("--max-model-len", type=int)
     s.add_argument("--max-num-seqs", type=int)
     s.add_argument("--max-num-batched-tokens", type=int)
@@ -38,9 +39,11 @@ def serve_args(s: argparse.ArgumentParser) -> argparse.ArgumentParser:
 def overrides(args: argparse.Namespace) -> dict[str, Any]:
     """The settings that `serve`'s flags give, as `config.load` takes them: the named flags, then every `--set`, which
     wins. Raises ValueError for a malformed `--set`."""
+    names = args.served_model_name
+    served_name = names[0] if names and len(names) == 1 else names
     flags = {"model.path": args.model, "runner.kind": args.runner, "server.host": args.host,
              "server.port": args.port, "server.num_frontends": args.frontends,
-             "model.served_model_name": args.served_model_name, "model.max_model_len": args.max_model_len,
+             "model.served_model_name": served_name, "model.max_model_len": args.max_model_len,
              "scheduler.max_num_seqs": args.max_num_seqs, "scheduler.max_num_batched_tokens":
              args.max_num_batched_tokens, "scheduler.max_num_queued_reqs": args.max_num_queued_reqs,
              "scheduler.max_num_queued_tokens": args.max_num_queued_tokens, "dev.cache.page_size": args.page_size,

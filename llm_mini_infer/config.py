@@ -42,7 +42,7 @@ class ModelConfig(_Group):
     # Face cache first (llm_mini_infer.hub; the token from HF_TOKEN)
     path: str = ""
     revision: str | None = None  # a repo id's branch, tag or commit; default: main
-    served_model_name: str | None = None  # default: the path as given, a repo id included (vLLM's rule)
+    served_model_name: str | list[str] | None = None  # default: the path or repo ID as given
     tokenizer: str | None = None  # directory with tokenizer.json; default: the model directory
     # Default: config.json's smallest position limit (8192 if none); a derived one is lowered to what the KV pool holds.
     # A set one past that limit is refused
@@ -50,6 +50,11 @@ class ModelConfig(_Group):
     # Defaults for the chat template's variables, under each request's chat_template_kwargs (the request wins): vLLM's
     # --default-chat-template-kwargs, e.g. {enable_thinking: false} for Qwen3.5/3.8, whose template thinks by default
     chat_template_kwargs: dict[str, Any] = {}
+
+    def __post_init__(self) -> None:
+        names = self.served_model_name
+        if isinstance(names, list) and (not names or any(not name.strip() for name in names)):
+            raise ValueError("model.served_model_name must contain one or more non-empty model names")
 
 
 class SamplingDefaults(_Group):
