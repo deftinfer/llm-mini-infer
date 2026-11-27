@@ -23,6 +23,16 @@ python3 bench/server/run.py ttft+idle --runner cuda --model <model dir>   # in t
 | GPU idle time caused by the CPU | 5 ms steps, closed-loop clients at concurrency 1, 8 and 32, the 1,024-token chat with 64 tokens out, 15 s each. The device's gaps while a step waited, over busy time plus gaps | < 3% |
 | SSE throughput, one frontend | 128 streams of 256 tokens, 0 ms steps, the events of the streams that completed in 10 s | reported |
 
+## The event loop beside image requests
+
+`bench/server/loop.py` measures what an image request costs the other streams of its frontend: one event loop serves them all, and an image request's parse, base64 decode, header probe and hash run on it. `arms` runs a server with images on and, beside steady streams, image requests of three kinds (a phone-sized JPEG, a 12-megapixel JPEG, a PNG) at a few a second and at as many as the server takes, the images of a folder (`--files`), and request logging into a stderr that stops reading for a while. Per arm it reports the lag of the frontend's timer (`/debug/loop`, which `observability.debug_endpoints` turns on), the gaps between the streams' chunks, and the image requests' TTFT and on-loop stages; the arms run interleaved, several times. `stages` times each step of an image request's path in one process, and whether it lets other threads run. `--help` lists the options.
+
+```bash
+uv run python bench/server/loop.py arms --repeats 5
+uv run python bench/server/loop.py stages
+uv run python bench/server/loop.py table results/server/<time>-loop-arms.json
+```
+
 ## Caveats
 
 - On macOS the engine's thread is not pinned, the cores differ and the clients share the machine. On Linux the engine pins its thread (`engine_affinity`), and `cgroup_throttled_ms` shows a CPU quota's throttling. Run the benchmarks on the serving host to judge it.
