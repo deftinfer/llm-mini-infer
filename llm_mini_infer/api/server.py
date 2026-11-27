@@ -100,12 +100,18 @@ def frontend_main(cfg: Config, index: int, ipc_path: str, ready: Connection | No
     faulthandler.enable()  # a native crash prints every thread's stack
     faulthandler.register(signal.SIGUSR2, all_threads=True)  # and so does the launcher, for a start that hangs
     # queued: a stderr that stops reading blocks the log's writer thread, not the event loop every stream waits on
-    setup_logging(cfg.observability.log_level, f"frontend-{index}", without_messages=True, queued=True)
+    writer = setup_logging(cfg.observability.log_level, f"frontend-{index}", without_messages=True, queued=True)
     cpus = cfg.dev.server.cpus
     if cpus and index < len(cpus):
         try:
-            os.sched_setaffinity(0, {cpus[index]})
+            allowed = os.sched_getaffinity(0)
+            os.sched_setaffinity(0, {cpus[index]})  # this thread (Linux): the event loop's
             log.info("frontend %d pinned to CPU %d", index, cpus[index])
+            # the log's writer thread, started before, on the cores the engine and the frontends leave (the pool's):
+            # on the frontend's own core it would take turns with the loop and its ZMQ threads on every request
+            rest = allowed - set(cpus) - {cfg.dev.engine.cpu}
+            if writer is not None and rest:
+                writer.place(rest)
         except (AttributeError, OSError) as exc:
             log.warning("could not pin frontend %d to CPU %d: %s", index, cpus[index], exc)
     import gc

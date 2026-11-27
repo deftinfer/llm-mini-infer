@@ -8,11 +8,14 @@ from __future__ import annotations
 import io
 import json
 import logging
+import os
 import re
 import subprocess
 import sys
 import threading
 import time
+
+import pytest
 
 from llm_mini_infer import logutil
 from llm_mini_infer.logutil import LOG_QUEUE_LINES, Queued, setup_logging
@@ -228,4 +231,24 @@ def test_a_stderr_that_takes_nothing_does_not_hold_the_writers_stop_for_good(mon
         gate.opened.set()
         if writer is not None and writer._thread is not None:
             writer._thread.join(5)
+        root.handlers[:], root.level = saved
+
+
+@pytest.mark.skipif(not hasattr(os, "sched_setaffinity"), reason="no thread affinity on this platform")
+def test_the_writer_thread_runs_on_the_cores_it_is_placed_on(monkeypatch) -> None:
+    """A frontend places its log's writer on the cores the engine and the frontends leave (`api.server`): the writer
+    thread's own affinity, not the process's."""
+    root = logging.getLogger()
+    saved = root.handlers[:], root.level
+    monkeypatch.setattr(sys, "stderr", io.StringIO())
+    writer = None
+    try:
+        writer = setup_logging("info", "frontend-0", queued=True)
+        mine = os.sched_getaffinity(0)
+        one = {min(mine)}
+        writer.place(one)
+        assert os.sched_getaffinity(writer._thread.native_id) == one and os.sched_getaffinity(0) == mine
+    finally:
+        if writer is not None:
+            writer.stop()
         root.handlers[:], root.level = saved

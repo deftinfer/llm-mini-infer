@@ -3,6 +3,7 @@ from __future__ import annotations
 import atexit
 import logging
 import logging.handlers
+import os
 import queue
 import sys
 import textwrap
@@ -66,6 +67,10 @@ class _Writer(logging.handlers.QueueListener):
         super().__init__(q, handler)
         self.front = front
 
+    def place(self, cpus: set[int]) -> None:
+        """Run the writer thread on `cpus` (Linux: a thread's own affinity)."""
+        os.sched_setaffinity(self._thread.native_id, cpus)
+
     def stop(self) -> None:
         if self._thread is None:  # once: the process's exit stops it again
             return
@@ -85,8 +90,7 @@ class _Writer(logging.handlers.QueueListener):
         self._thread = None
 
 
-def setup_logging(level: str, process: str, without_messages: bool = False,
-                  queued: bool = False) -> logging.handlers.QueueListener | None:
+def setup_logging(level: str, process: str, without_messages: bool = False, queued: bool = False) -> _Writer | None:
     """One format for every process: `INFO 10-03 14:00:00.123 [engine] message`. `without_messages`: logged
     exceptions without their messages (`WithoutMessages`), for the processes that handle requests' contents. `queued`
     (the frontends): the lines go through `Queued` to a writer thread, stopped at the process's exit once it has written

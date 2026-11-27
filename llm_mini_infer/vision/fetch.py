@@ -23,14 +23,20 @@ import asyncio
 import binascii
 import logging
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from .urlguard import REFUSED, Blocked, BlockedAddress, Policy, check_url, safe_resolver
 
-try:  # pybase64 (the images extra) decodes faster; the standard library is the fallback
+try:  # pybase64 (the images extra) decodes faster, and lets other threads run meanwhile; the standard library is the
+    # fallback, which holds the GIL throughout
     import pybase64 as _b64
 except ImportError:  # pragma: no cover - depends on the environment
     import base64 as _b64
+# A data URI of at least this many characters (256 KiB decoded) is decoded on the fetcher's thread, off the event loop
+# (`Fetcher.fetch`): with pybase64 only, the standard library's decode holding the GIL, which would hold the loop as
+# long; below it the thread's hop (tens of microseconds) costs about what the decode does
+OFF_LOOP_CHARS = (256 << 10) * 4 // 3
 
 
 def _b64decode(s: str) -> bytes:
@@ -124,11 +130,17 @@ class Fetcher:
         self.policy = Policy(allowed_networks, allowed_domains)
         self._resolver = resolver
         self._session: Any = None
+        self._decoder: ThreadPoolExecutor | None = None  # a large data URI's base64 decode (`fetch`)
 
     async def fetch(self, url: str, budget: DownloadBudget | None = None) -> bytes:
         """The image's bytes. `budget`: the request's, charged by an http(s) download (a data URI is not counted)."""
         if url.startswith("data:"):
-            return from_data_uri(url, self.max_bytes)
+            if len(url) < OFF_LOOP_CHARS or _b64.__name__ != "pybase64":
+                return from_data_uri(url, self.max_bytes)
+            if self._decoder is None:
+                self._decoder = ThreadPoolExecutor(1, thread_name_prefix="image-base64")
+            # off the loop: the decode lets the loop run (a request cancelled meanwhile drops the result)
+            return await asyncio.get_running_loop().run_in_executor(self._decoder, from_data_uri, url, self.max_bytes)
         low = url[:8].lower()
         if low.startswith("http://") or low.startswith("https://"):
             if not self.allow_urls:
@@ -215,6 +227,9 @@ class Fetcher:
         return b"".join(chunks)
 
     async def close(self) -> None:
+        if self._decoder is not None:  # a decode still running ends on its own (milliseconds); a queued one never runs
+            self._decoder.shutdown(wait=False, cancel_futures=True)
+            self._decoder = None
         if self._session is not None:
             await self._session.close()
             self._session = None

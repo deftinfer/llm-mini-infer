@@ -396,7 +396,8 @@ def stage_stats(recs: list[dict]) -> dict:
     recs = [r for r in recs if r.get("images")]
     steps = {"parse": ("body", "arrival"), "base64": ("arrival", "fetched"), "probe+size": ("fetched", "sized"),
              "submit+render": ("sized", "rendered"), "tokenize": ("rendered", "tokenized"),
-             "on_loop": ("body", "tokenized")}
+             "on_loop": ("body", "tokenized"), "to_pixels": ("sized", "pixels"),
+             "pixels_to_first_byte": ("pixels", "first_byte")}
     return {k: pcts([(r[b] - r[a]) / MS for r in recs if a in r and b in r]) for k, (a, b) in steps.items()}
 
 
@@ -651,12 +652,23 @@ def main() -> None:
     ap.add_argument("--stall-s", type=float, default=5.0, help="log-stalled: seconds the stderr reader stops")
     ap.add_argument("--drain-bps", type=float, default=8192.0, help="log-stalled: its reads afterwards, bytes/s")
     ap.add_argument("--reps", type=int, default=20, help="stages: timed runs of each step")
+    ap.add_argument("--set", action="append", default=[], metavar="GROUP.KEY=VALUE",
+                    help="arms: a server config override, e.g. --set observability.log_requests=false (repeatable)")
     ap.add_argument("--out", type=Path, help="write the JSON here instead of results/server/")
     args = ap.parse_args()
     if args.what == "table":
         print(table(json.loads(args.report.read_text())))
         return
     base.MODEL = args.model
+    import yaml
+
+    for item in args.set:  # as bench/server/run.py takes them: over the arms' own settings
+        key, _, value = item.partition("=")
+        node = base.EXTRA
+        *parents, leaf = key.split(".")
+        for part in parents:
+            node = node.setdefault(part, {})
+        node[leaf] = yaml.safe_load(value)
     report = bench_arms(args) if args.what == "arms" else bench_stages(args)
     out = args.out or base.RESULTS / f"{time.strftime('%Y%m%d-%H%M%S')}-loop-{args.what}.json"
     out.parent.mkdir(parents=True, exist_ok=True)
