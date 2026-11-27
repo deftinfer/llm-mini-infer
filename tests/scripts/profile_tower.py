@@ -87,9 +87,9 @@ def image_jpeg(width: int, height: int, seed: int = 0) -> bytes:
 
 
 def image_shape(fam: Any, data: bytes, budget: int) -> dict[str, Any]:
-    """The image as the family sizes it (its header only), the encoder budget the config derives for a step budget
-    (`max(max_num_batched_tokens, the largest image)`), the tower's buckets for it (`family_buckets`, as the runner's
-    `ImageEncoder`) and the bucket that holds the image's patches."""
+    """The image as the family sizes it (its stored size; Pillow opens it to read the EXIF orientation), the encoder
+    budget the config derives for a step budget (`max(max_num_batched_tokens, the largest image)`), the tower's buckets
+    for it (`family_buckets`, as the runner's `ImageEncoder`) and the bucket that holds the image's patches."""
     from llm_mini_infer import hostcheck
     from llm_mini_infer.runner.cuda.images import family_buckets
     from llm_mini_infer.vision.family import transposed

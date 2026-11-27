@@ -162,7 +162,7 @@ def decode_rgb(data: bytes, header: Header) -> Any:
     its alpha instead, as vLLM's `convert_image_mode` does.
     Raises ProbeError when the decoded size disagrees with the header's stored size (a GIF's first frame may extend past
     the logical screen the probe reads, and Pillow sizes the image by it; a JPEG's later frame header declares another
-    size), before the decode."""
+    size): before the decode, and after the orientation, when the image is neither as stored nor turned."""
     import contextlib
     import io
 

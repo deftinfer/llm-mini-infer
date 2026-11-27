@@ -46,6 +46,7 @@ def test_a_blocked_stderr_holds_the_writer_and_the_lines_past_the_bound_are_drop
     monkeypatch.setattr(sys, "stderr", gate)
     log = logging.getLogger("test.log_queue")
     pad = "x" * 40
+    writer = None
     try:
         writer = setup_logging("info", "frontend-0", queued=True)
         front = root.handlers[0]
@@ -55,26 +56,25 @@ def test_a_blocked_stderr_holds_the_writer_and_the_lines_past_the_bound_are_drop
         while front.queue.qsize() and time.monotonic() < deadline:  # the writer took it and waits on stderr
             time.sleep(0.001)
         extra = 500
-        slowest = 0.0
         for k in range(1, LOG_QUEUE_LINES + extra + 1):
-            t = time.perf_counter()
             log.info("line %d %s", k, pad)
-            slowest = max(slowest, time.perf_counter() - t)
-        assert slowest < 0.05  # never a wait on stderr
+        assert not gate.opened.is_set() and not gate.lines  # every call returned with stderr shut: none waited on it
         assert front.queue.qsize() == LOG_QUEUE_LINES and front.dropped == extra
         gate.opened.set()
         deadline = time.monotonic() + 10
         while front.queue.qsize() and time.monotonic() < deadline:
             time.sleep(0.001)
         log.info("line %d %s", LOG_QUEUE_LINES + extra + 1, pad)
-        writer.stop()
     finally:
+        gate.opened.set()  # a failure never leaves the writer blocked at the test process's exit
+        if writer is not None:
+            writer.stop()
         root.handlers[:], root.level = saved
     got = [LINE.fullmatch(x) for x in gate.lines]
     note = [i for i, m in enumerate(got) if m is None]
     assert len(note) == 1 and note[0] == LOG_QUEUE_LINES + 1  # after the lines that waited, before the next one
-    assert re.fullmatch(rf"WARNING .* \[frontend-0\] {extra} log lines were dropped: stderr took no more and "
-                        rf"{LOG_QUEUE_LINES} were waiting\n", gate.lines[note[0]])
+    assert re.fullmatch(rf"WARNING .* \[frontend-0\] {extra} log lines were dropped: stderr took none while "
+                        rf"{LOG_QUEUE_LINES} lines were queued\n", gate.lines[note[0]])
     seq = [int(m[2]) for m in got if m is not None]
     assert seq == [*range(LOG_QUEUE_LINES + 1), LOG_QUEUE_LINES + extra + 1]
 
@@ -165,4 +165,67 @@ def test_only_the_frontends_queue_their_log() -> None:
     assert "queued=True" in inspect.getsource(server.frontend_main)
     for mod in (launcher, process, pool):
         assert "queued=True" not in inspect.getsource(mod)
-    assert logutil.LOG_QUEUE_LINES == LOG_QUEUE_LINES
+
+
+def test_lines_dropped_with_nothing_logged_afterwards_are_counted_at_the_writers_stop(monkeypatch) -> None:
+    """The count of dropped lines is written even when nothing is logged after them: the stop queues a note for the
+    lines dropped since the last one, after the lines that waited and before it ends."""
+    root = logging.getLogger()
+    saved = root.handlers[:], root.level
+    gate = Gate()
+    monkeypatch.setattr(sys, "stderr", gate)
+    log = logging.getLogger("test.log_queue")
+    pad = "x" * 40
+    extra = 300
+    writer = None
+    try:
+        writer = setup_logging("info", "frontend-0", queued=True)
+        front = root.handlers[0]
+        assert isinstance(front, Queued) and writer is not None
+        log.info("line %d %s", 0, pad)
+        deadline = time.monotonic() + 5
+        while front.queue.qsize() and time.monotonic() < deadline:
+            time.sleep(0.001)
+        for k in range(1, LOG_QUEUE_LINES + extra + 1):
+            log.info("line %d %s", k, pad)
+        assert front.dropped == extra
+        gate.opened.set()
+        writer.stop()
+        assert front.dropped == 0 and writer._thread is None
+        writer.stop()  # idempotent
+    finally:
+        gate.opened.set()
+        if writer is not None:
+            writer.stop()
+        root.handlers[:], root.level = saved
+    assert re.fullmatch(rf"WARNING .* \[frontend-0\] {extra} log lines were dropped: stderr took none while "
+                        rf"{LOG_QUEUE_LINES} lines were queued\n", gate.lines[-1])
+    got = [LINE.fullmatch(x) for x in gate.lines[:-1]]
+    assert all(m is not None for m in got)
+    assert [int(m[2]) for m in got] == list(range(LOG_QUEUE_LINES + 1))  # the lines before it, in order
+
+
+def test_a_stderr_that_takes_nothing_does_not_hold_the_writers_stop_for_good(monkeypatch) -> None:
+    """With stderr blocked for good, the stop gives up after `LOG_STOP_S` (here 0.3 s) and returns, the process exiting
+    without the lines instead of hanging."""
+    root = logging.getLogger()
+    saved = root.handlers[:], root.level
+    gate = Gate()
+    monkeypatch.setattr(sys, "stderr", gate)
+    monkeypatch.setattr(logutil, "LOG_STOP_S", 0.3)
+    log = logging.getLogger("test.log_queue")
+    writer = None
+    try:
+        writer = setup_logging("info", "frontend-0", queued=True)
+        assert writer is not None
+        for k in range(5):
+            log.info("line %d", k)
+        t = time.monotonic()
+        writer.stop()
+        assert time.monotonic() - t < 1.0
+        assert gate.lines == []
+    finally:
+        gate.opened.set()
+        if writer is not None and writer._thread is not None:
+            writer._thread.join(5)
+        root.handlers[:], root.level = saved

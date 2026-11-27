@@ -93,7 +93,8 @@ class Done(msgspec.Struct, array_like=True, gc=False):
     error: str = ""
     decode_ns: int = 0  # decode, orientation and resize
     write_ns: int = 0  # the copy into the arena and the hash
-    transposed: bool = False  # Pillow turned the image by a quarter: the pixels are the job's target turned
+    transposed: bool = False  # Pillow turned the image by a quarter: the pixels are the job's target turned (a square
+    # target turns into itself: False)
     digest: bytes = b""  # `family.image_digest` of the bytes and the oriented target
 
 
@@ -287,12 +288,14 @@ class Asymmetric(ValueError):
 def oriented(family: Any, header: Any, size: Any, shape: tuple[int, ...]) -> Any:
     """The size of a job's pixels: its target (the image as stored), or that target turned when Pillow turned the image
     (`family`'s module docstring). The frontend sized the span and the arena range from the target, which holds only if
-    the family sizes the turned image as the turned target: checked here, so a family that does not fails the image
-    (`Asymmetric`) instead of writing pixels HF's processors would size otherwise."""
+    the family sizes the turned image as the turned target: checked here for every image that may have turned (a square
+    target of a non-square image included, whose pixels look the same either way), so a family that does not fails the
+    image (`Asymmetric`) instead of writing pixels HF's processors would size otherwise."""
     from .family import transposed
     from .probe import Header
 
-    if shape == (size.height, size.width):
+    ambiguous = size.height == size.width and header.height != header.width
+    if shape == (size.height, size.width) and not ambiguous:
         return size
     turned = transposed(size)
     if shape != (turned.height, turned.width):
@@ -301,7 +304,7 @@ def oriented(family: Any, header: Any, size: Any, shape: tuple[int, ...]) -> Any
     if want != turned:
         raise Asymmetric(f"the image family sizes the turned image {want.width}x{want.height} ({want.tokens} tokens), "
                          f"not {turned.width}x{turned.height} ({turned.tokens}): the frontend sized it as stored")
-    return turned
+    return size if ambiguous else turned
 
 
 def _warm(family: Any, np: Any) -> None:

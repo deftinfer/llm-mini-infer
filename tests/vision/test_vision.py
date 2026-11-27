@@ -111,7 +111,7 @@ def test_a_png_text_chunk_past_pillows_cap_passes_the_probe_and_fails_in_the_poo
 
 def test_a_png_reads_ihdr_only_whatever_follows() -> None:
     """The chunks after IHDR are never read: junk, a text chunk with a compressed body that is not zlib, and a huge
-    compressed one (a few KiB for 64 MiB) all pass with IHDR's size."""
+    compressed one (about 64 KiB for 64 MiB) all pass with IHDR's size."""
     import zlib
 
     plain = encoded(pattern(8, 6, 1), "PNG")
@@ -125,7 +125,7 @@ def test_a_png_reads_ihdr_only_whatever_follows() -> None:
     assert probe(plain[:33]) == Header("png", 8, 6)  # IHDR alone
 
 
-STEPS = 4096  # MAX_JPEG_STEPS
+MARKERS, FILL_MAX = 4096, 1 << 20  # MAX_JPEG_MARKERS, MAX_JPEG_FILL
 
 
 def sof0(width: int = 40, height: int = 30) -> bytes:
@@ -137,41 +137,65 @@ COM, RST, FILL = b"\xff\xfe\x00\x02", b"\xff\xd0", b"\xff"  # a 2-byte COM segme
 
 
 def steps_jpeg(*parts: bytes) -> bytes:
-    """SOI, the parts, a SOF0 of 40 x 30 (the SOF is not a step)."""
+    """SOI, the parts, a SOF0 of 40 x 30 (the SOF is not counted)."""
     return b"\xff\xd8" + b"".join(parts) + sof0()
 
 
-@pytest.mark.parametrize("make", [lambda n: COM * n, lambda n: FILL * n, lambda n: RST * n,
-                                  lambda n: COM * (n // 4) + FILL * (n // 4) + RST * (n // 4) + COM * (n - n // 4 * 3)],
-                         ids=["com", "fill", "rst", "mixed"])
-def test_a_jpeg_holds_exactly_4096_steps_before_its_frame_header(make) -> None:
-    """A step is each marker read before the SOF (a segment, a standalone marker) and each fill byte before a marker's
-    own 0xFF: 4,096 are served, 4,097 refused; the SOF itself is not counted."""
-    ok = probe(steps_jpeg(make(STEPS)))
+MARKERS_TEXT = "more than 4096 markers before the frame header"
+FILL_TEXT = "more than 1 MiB of fill bytes before the frame header"
+
+
+@pytest.mark.parametrize("make", [lambda n: COM * n, lambda n: RST * n, lambda n: COM * (n // 2) + RST * (n - n // 2),
+                                  lambda n: (COM + RST) * (n // 2) + COM * (n % 2)],
+                         ids=["com", "rst", "half", "mixed"])
+def test_a_jpeg_holds_exactly_4096_markers_before_its_frame_header(make) -> None:
+    """A marker is each segment or standalone marker (RSTn) read before the SOF: 4,096 are served, 4,097 refused with
+    the markers' text; the SOF itself is not counted."""
+    ok = probe(steps_jpeg(make(MARKERS)))
     assert (ok.format, ok.width, ok.height) == ("jpeg", 40, 30)
-    assert probe(steps_jpeg(make(STEPS - 1))).width == 40
-    with pytest.raises(ProbeError, match="more than 4096 markers and fill bytes before the frame header"):
-        probe(steps_jpeg(make(STEPS + 1)))
+    assert probe(steps_jpeg(make(MARKERS - 1))).width == 40
+    with pytest.raises(ProbeError, match=MARKERS_TEXT):
+        probe(steps_jpeg(make(MARKERS + 1)))
 
 
-def test_a_jpeg_counts_each_fill_byte_before_a_marker_as_a_step() -> None:
-    """k fill bytes are k + 1 0xFFs before the marker code: the last is the marker's own. Fill after a segment, between
-    two, and before the SOF all count; the count is by bytes, not runs."""
-    assert probe(steps_jpeg(FILL * STEPS)).width == 40  # FF * 4097, then the SOF's C0: 4096 fill bytes
-    assert probe(steps_jpeg(COM + FILL * (STEPS - 1))).width == 40
-    assert probe(steps_jpeg(FILL * 2000 + COM + FILL * 2095)).width == 40  # 2000 + 1 + 2095
-    with pytest.raises(ProbeError, match="4096 markers and fill bytes"):
-        probe(steps_jpeg(FILL * 2000 + COM + FILL * 2096))
+def test_a_jpeg_holds_exactly_1_mib_of_fill_bytes_before_its_frame_header() -> None:
+    """k fill bytes are k + 1 0xFFs before the marker code: the last is the marker's own. Fill in one run, after a
+    segment, between two and before the SOF all count, by bytes: 1 MiB is served, 1 MiB + 1 refused with the fill
+    text, a run or spread over markers."""
+    assert probe(steps_jpeg(FILL * FILL_MAX)).width == 40
+    assert probe(steps_jpeg(FILL * (FILL_MAX - 1))).width == 40
+    assert probe(steps_jpeg(COM + FILL * FILL_MAX)).width == 40
+    assert probe(steps_jpeg(FILL * 500_000 + COM + FILL * (FILL_MAX - 500_000))).width == 40  # spread over two markers
+    assert probe(steps_jpeg(*(FILL * 1000 + COM for _ in range(1000)), FILL * (FILL_MAX - 1_000_000))).width == 40
+    with pytest.raises(ProbeError, match=FILL_TEXT):
+        probe(steps_jpeg(FILL * (FILL_MAX + 1)))
+    with pytest.raises(ProbeError, match=FILL_TEXT):
+        probe(steps_jpeg(FILL * 500_000 + COM + FILL * (FILL_MAX - 500_000 + 1)))
+    with pytest.raises(ProbeError, match=FILL_TEXT):
+        probe(steps_jpeg(*(FILL * 1000 + COM for _ in range(1000)), FILL * (FILL_MAX - 1_000_000 + 1)))
+
+
+def test_fill_bytes_are_not_markers_and_markers_are_not_fill() -> None:
+    """The two counts are separate: 4,096 markers with 4,000 fill bytes before each of several of them (far past 4,096
+    together) are served; 4,096 markers' worth of fill alone is nothing."""
+    parts = [(FILL * 4000 + COM) for _ in range(10)] + [COM] * (MARKERS - 10)
+    assert sum(p.count(COM) for p in parts) == MARKERS
+    assert probe(steps_jpeg(*parts)).width == 40
+    with pytest.raises(ProbeError, match=MARKERS_TEXT):
+        probe(steps_jpeg(*parts, COM))
+    assert probe(steps_jpeg(FILL * 4097)).width == 40
 
 
 def test_a_20_mib_run_of_fill_bytes_before_the_frame_header_is_refused_at_the_bound() -> None:
     """The run is matched up to the remaining budget only (the regex's endpos), not to its end."""
-    with pytest.raises(ProbeError, match="more than 4096 markers and fill bytes before the frame header"):
+    with pytest.raises(ProbeError, match=FILL_TEXT):
         probe(steps_jpeg(FILL * (20 << 20)))
-    with pytest.raises(ProbeError, match="more than 4096 markers and fill bytes before the frame header"):
+    with pytest.raises(ProbeError, match=FILL_TEXT):
         probe(steps_jpeg(COM * 100 + FILL * (20 << 20)))
-    with pytest.raises(ProbeError, match="more than 4096 markers"):
+    with pytest.raises(ProbeError, match=FILL_TEXT):
         probe(steps_jpeg(memoryview(FILL * (20 << 20))))
+    with pytest.raises(ProbeError, match=FILL_TEXT):
+        probe(memoryview(steps_jpeg(FILL * (20 << 20))))
 
 
 def test_a_jpegs_walk_stops_at_its_first_frame_header() -> None:
@@ -380,6 +404,29 @@ def test_data_uris() -> None:
         from_data_uri(url, 10)
     with pytest.raises(FetchError):
         image_url({"detail": "auto"})
+
+
+def test_a_data_uri_holds_at_most_1024_characters_before_its_comma() -> None:
+    """The head (`data:image/png;base64` and any parameters) is bounded before anything is split or decoded: exactly
+    1,024 characters are served, 1,025 refused with the text, a 27 MB run of ';' too; no ',' keeps its own text."""
+    import base64
+
+    data = encoded(pattern(8, 8), "PNG")
+    body = base64.b64encode(data).decode()
+    head = "data:image/png;base64"
+    ok = head + ";" * (1024 - len(head)) + "," + body
+    assert ok.index(",") == 1024 and from_data_uri(ok, 1 << 20) == data
+    text = "malformed data URI: more than 1024 characters before its ','"
+    for bad in (head + ";" * (1025 - len(head)) + "," + body, head + ";" * (27 << 20) + "," + body):
+        with pytest.raises(FetchError) as err:
+            from_data_uri(bad, 1 << 20)
+        assert str(err.value) == text
+    with pytest.raises(FetchError) as err:
+        from_data_uri(head + body, 1 << 20)
+    assert str(err.value) == "malformed data URI: no ','"
+    with pytest.raises(FetchError) as err:
+        from_data_uri("data:image/png;base64" + ";" * (27 << 20), 1 << 20)
+    assert str(err.value) == "malformed data URI: no ','"
 
 
 def test_http_fetch_with_limits() -> None:
@@ -862,6 +909,36 @@ def frontend_inputs(**kw):
     im.pool = RecordingPool()
     im.start()
     return im
+
+
+def test_prepare_yields_to_the_event_loop_between_one_images_probe_and_the_next(monkeypatch) -> None:
+    """Each image's probe after the first runs in a turn of the loop of its own: a callback scheduled during one probe
+    runs before the next image's probe, and no probe runs before the first one's callback."""
+    from llm_mini_infer.api import images as images_mod
+
+    real = images_mod.probe
+    events: list[str] = []
+    loop_ref: list = []
+
+    def recording(data):
+        k = sum(e.startswith("probe") for e in events)
+        events.append(f"probe {k}")
+        loop_ref[0].call_soon(events.append, f"callback {k}")
+        return real(data)
+
+    monkeypatch.setattr(images_mod, "probe", recording)
+
+    async def main() -> None:
+        loop_ref.append(asyncio.get_running_loop())
+        im = frontend_inputs()
+        urls = [uri(encoded(pattern(40 + 8 * k, 30), "JPEG")) for k in range(3)]
+        prep = await im.prepare(urls)
+        assert len(prep.images) == 3 and len(im.pool.jobs) == 3
+        im.discard(prep)
+
+    asyncio.run(main())
+    assert events[0] == "probe 0"
+    assert events.index("callback 0") < events.index("probe 1") and events.index("callback 1") < events.index("probe 2")
 
 
 def test_a_requests_decode_budget_is_vllms() -> None:
@@ -1696,11 +1773,34 @@ def test_oriented_is_the_target_or_its_transpose_and_refuses_an_asymmetric_famil
         oriented(GEMMA70, header, size, (size.height + 1, size.width))
 
 
+def test_oriented_checks_a_square_target_of_a_non_square_image_and_returns_the_target_itself() -> None:
+    """A square target of a stored image that is not square (the pixels look the same turned or not) is checked like a
+    turned image: a lopsided family raises `Asymmetric` whatever the pixels' shape, a symmetric one (Gemma: 400 x 401
+    is a 384 x 384 target) returns the target itself (`is size`, not transposed). A square stored image is not
+    checked, and nor is a non-square target of unturned pixels."""
+    from llm_mini_infer.vision.pool import Asymmetric, oriented
+
+    header = Header("jpeg", 400, 401)  # 400 wide, 401 high
+    size = GEMMA70.size(header)
+    assert (size.height, size.width) == (384, 384)
+    assert oriented(GEMMA70, header, size, (384, 384)) is size
+    bad = lopsided(GEMMA70)  # 400 x 401 has a token fewer than the 401 x 400 it may be turned from
+    target = bad.size(header)
+    assert (target.height, target.width) == (384, 384) and target != transposed(bad.size(Header("jpeg", 401, 400)))
+    for shape in ((384, 384), (target.height, target.width)):
+        with pytest.raises(Asymmetric, match=r"^the image family sizes the turned image"):
+            oriented(bad, header, target, shape)
+    square = Header("jpeg", 400, 400)
+    sq_size = bad.size(square)
+    assert oriented(bad, square, sq_size, (sq_size.height, sq_size.width)) is sq_size  # a square stored image: no check
+
+
 def test_an_asymmetric_family_fails_the_turned_image_before_anything_is_written(tmp_path) -> None:
     """A worker whose family is not symmetric under a transpose answers an EXIF-turned image with an error starting
     "Asymmetric:" and leaves its arena range untouched (a sentinel stays); through `ImageInputs.wait` that is an
     ApiError 400 "image: Asymmetric: ...", never another exception type; an unturned image of the same worker is served
-    and the worker stays up."""
+    and the worker stays up. Both images are 400 x 225, a non-square image with a non-square target, so neither falls
+    in the square-target case that `oriented` checks too (its own test)."""
     import shutil
 
     from llm_mini_infer.api.protocol import ApiError

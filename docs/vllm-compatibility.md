@@ -106,6 +106,7 @@ A `response_format` nested past 64 JSON levels gets the reference's 400, with it
 - a model's image placeholder (Gemma 4's `<|image|>`) in a message's text is a 400 unless it matches an image; the reference accepts it;
 - the content format (a string or parts) is detected from the template's source as the reference detected it before it tracked `namespace(...)` aliases of `messages`;
 - an image whose header declares more than 178,956,970 pixels is a 400 before any decode; the reference answers 500;
+- a JPEG with more than 4,096 markers or 1 MiB of fill bytes before its frame header, and a data URI with more than 1,024 characters before its `,`, are a 400; the reference reads them (real files hold a few hundred markers at most, and no fill to speak of);
 - a schema, the tools' included, of more than `structured_output.max_schema_bytes` (1 MiB) is a 400; the reference has no cap;
 - `logit_bias` is accepted under speculative decoding (the bias applies at every verify position); the reference refuses it there;
 - more than 1,024 `logit_bias` entries is a 400 "Too many logit bias tokens: N. The max size is 1024."; the reference's v2 runner raises that text as an engine error;
@@ -182,7 +183,6 @@ These rules follow the reference too.
 ### Images
 
 - **EXIF** that cannot be read leaves the image as stored.
-- **A JPEG with more than 4,096 markers and fill bytes before its frame header** gets a 400; vLLM decodes it. Real files hold a few hundred at most (an ICC profile takes up to 255 segments).
 - **Transparency** (RGBA, LA, PA, or a `transparency` entry) is composited onto white.
 
 ### Scheduling and start-up

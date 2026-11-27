@@ -143,7 +143,9 @@ class ImageInputs:
         prep.t_fetched = clock()
         fam = self.family
         limit, used = self.max_request_decode_bytes, 0
-        for data in blobs:
+        for k, data in enumerate(blobs):
+            if k:  # each image's probe a turn of the loop of its own (each a bounded walk: `vision.probe`)
+                await asyncio.sleep(0)
             try:
                 header = probe(data)
                 check_source_pixels(header, self.max_source_pixels)

@@ -63,7 +63,8 @@ def test_the_resize_target_is_hfs_exactly() -> None:
 
 
 def test_the_token_count_is_the_processors() -> None:
-    """The family's sizing from a header (after the EXIF orientation) gives the count `Gemma4Processor` expands to."""
+    """The family's sizing from a header (the stored size, as the frontend sizes it) gives the count `Gemma4Processor`
+    expands to."""
     from PIL import Image
 
     proc = Gemma4ImageProcessor()

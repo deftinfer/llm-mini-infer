@@ -5,9 +5,10 @@ vLLM's decode budget and the sizing (`vision.family`). The orientation is the de
 EXIF orientation (`family.decode_rgb`), and the frontend sizes every image as stored, which holds either way round (a
 family's sizing is symmetric under a transpose). The probe runs on the frontend's event loop, so it reads a bounded
 part of the header:
-- **JPEG:** markers up to the first frame header (SOF), at most `MAX_JPEG_STEPS` steps before it: a step is a marker
-  (a segment, or a standalone marker such as RSTn) or a fill byte (an 0xFF before a marker's own). A JPEG past it is a
-  `ProbeError`: real files hold a few dozen markers before their frame header (an ICC profile takes at most 255).
+- **JPEG:** markers up to the first frame header (SOF), at most `MAX_JPEG_MARKERS` before it (a segment, or a
+  standalone marker such as RSTn; the SOF itself is not counted) and `MAX_JPEG_FILL` fill bytes (each 0xFF before a
+  marker's own, skipped a run at a time at C speed). A JPEG past either is a `ProbeError`: real files hold a few hundred
+  markers at most before their frame header (an ICC profile takes up to 255 segments) and no fill to speak of.
 - **PNG:** IHDR, the first chunk. **GIF:** the logical screen. **BMP:** the info header.
 - **WebP:** its first chunk, which must be VP8X (the canvas), VP8 or VP8L (the frame), as Pillow requires.
 
@@ -31,8 +32,10 @@ _FILL = re.compile(rb"\xff+")
 # The most pixels an image may store (images.max_source_pixels' default and bound): Pillow's decompression-bomb bound
 # (2 x Image.MAX_IMAGE_PIXELS)
 MAX_SOURCE_PIXELS = 178_956_970
-# The most markers and fill bytes a JPEG may hold before its frame header (module docstring): about 1 ms of the walk
-MAX_JPEG_STEPS = 4096
+# The most markers and fill bytes a JPEG may hold before its frame header (module docstring): together, under a
+# millisecond of the walk
+MAX_JPEG_MARKERS = 4096
+MAX_JPEG_FILL = 1 << 20
 
 
 class ProbeError(ValueError):
@@ -79,18 +82,22 @@ def check_source_pixels(header: Header, limit: int = MAX_SOURCE_PIXELS) -> None:
 
 
 def _jpeg(b: bytes | memoryview) -> Header:
-    """Markers up to the first SOF, at most `MAX_JPEG_STEPS` markers and fill bytes before it (module docstring)."""
+    """Markers up to the first SOF, at most `MAX_JPEG_MARKERS` markers and `MAX_JPEG_FILL` fill bytes before it (module
+    docstring)."""
     n = len(b)
     i = 2
-    steps = 0
+    markers = fill = 0
     while i + 4 <= n:
         if b[i] != 0xFF:
             raise ProbeError("broken JPEG header: marker expected")
         marker = b[i + 1]
-        if marker == 0xFF:  # fill bytes: the run at once, each a step, the last 0xFF the marker's own
-            end = _FILL.match(b, i + 1, i + 2 + MAX_JPEG_STEPS - steps).end()
-            steps += end - 1 - i
+        if marker == 0xFF:  # fill bytes: the run at once, the last 0xFF the marker's own
+            end = _FILL.match(b, i + 1, i + 2 + MAX_JPEG_FILL - fill).end()
+            fill += end - 1 - i
             i = end - 1
+            if fill > MAX_JPEG_FILL:
+                raise ProbeError(f"broken JPEG header: more than {MAX_JPEG_FILL >> 20} MiB of fill bytes before the "
+                                 "frame header")
         elif marker in _SOF:
             if i + 9 > n:
                 raise ProbeError("broken JPEG header: truncated SOF")
@@ -100,11 +107,10 @@ def _jpeg(b: bytes | memoryview) -> Header:
         elif marker in (0xDA, 0xD9):
             break
         else:
-            steps += 1
+            markers += 1
+            if markers > MAX_JPEG_MARKERS:
+                raise ProbeError(f"broken JPEG header: more than {MAX_JPEG_MARKERS} markers before the frame header")
             i += 2 if marker == 0x01 or 0xD0 <= marker <= 0xD7 else 2 + struct.unpack_from(">H", b, i + 2)[0]
-        if steps > MAX_JPEG_STEPS:
-            raise ProbeError(f"broken JPEG header: more than {MAX_JPEG_STEPS} markers and fill bytes before the frame "
-                             "header")
     raise ProbeError("broken JPEG header: no frame header before the scan")
 
 

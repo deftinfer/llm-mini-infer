@@ -37,6 +37,9 @@ def _b64decode(s: str) -> bytes:
     return _b64.b64decode(s, validate=True)
 
 MAX_REDIRECTS = 5  # SGLang's
+# The most characters a data URI may hold before its ',' (`data:image/png;base64` and any parameters): the frontend's
+# event loop splits and checks them before it decodes anything
+MAX_DATA_URI_HEAD = 1024
 REDIRECTS = frozenset((301, 302, 303, 307, 308))
 MIB = 1 << 20
 log = logging.getLogger(__name__)
@@ -83,9 +86,12 @@ def image_url(part_value: Any) -> str:
 
 def from_data_uri(url: str, max_bytes: int) -> bytes:
     """`data:image/<type>;base64,<data>` → bytes."""
-    head, sep, body = url.partition(",")
-    if not sep:
+    comma = url.find(",")
+    if comma < 0:
         raise FetchError("malformed data URI: no ','")
+    if comma > MAX_DATA_URI_HEAD:
+        raise FetchError(f"malformed data URI: more than {MAX_DATA_URI_HEAD} characters before its ','")
+    head, body = url[:comma], url[comma + 1:]
     meta = head[5:].split(";")
     media = meta[0].strip().lower()
     if media and not media.startswith("image/"):
