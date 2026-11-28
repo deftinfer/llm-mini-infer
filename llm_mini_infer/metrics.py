@@ -371,7 +371,7 @@ class Metrics:
                                         "stop fails the image with a 503 (this frontend's).", base)
         self.image_stage = Histogram("llm_mini_infer:image_stage_seconds",
                                      "Image stages: fetch (all of a request's images), probe (header and sizing, "
-                                     "per request), pool (decode, resize and hash in the image pool, per image), "
+                                     "per request), pool (decode and resize in the image pool, per image), "
                                      "pool_wait (the request's wait for the pool after tokenizing), vit (the "
                                      "encoder's device time per step that encodes images).", base, OVERHEAD,
                                      labels=("stage",))

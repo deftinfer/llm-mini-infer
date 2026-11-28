@@ -5,8 +5,11 @@ Per request (`App.chat`): `prepare` fetches every image concurrently, probes and
 stored size: the orientation is the pool's decode's, `vision.family`), allocates its pixels in this frontend's arena
 partition and submits the pool job; rendering and tokenizing run while the pool decodes. `expand` turns the one
 placeholder token per image of the tokenized prompt into the image's span (its token count does not depend on the
-orientation), and `wait` collects the pool's results: whether the pool turned the image (its size and grid then turn)
-and its digest (`vision.family.image_digest`, `span_key`), which the request's image references need. From the
+orientation), and `wait` collects the pool's results: whether the pool turned the image (its size and grid then turn).
+Meanwhile each image's bytes are hashed (on the fetcher's thread from `OFF_LOOP_BYTES`, `vision.fetch.Fetcher.offload`;
+the hasher passes from that thread to the loop with the future's result, and nothing else touches it), and `wait`
+finishes the digest with the oriented size (`vision.family.image_digest`'s formula, `span_key`), which the request's
+image references need. From the
 moment the AddRequest is sent the engine owns the pixel ranges until it releases the request (`StepOutputs.released`);
 before that, `discard` frees them (after the job finished, if it is still running).
 
@@ -23,16 +26,26 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import struct
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
+import blake3
 import numpy as np
 
 from ..engine.messages import ImageRef
 from ..vision.arena import Allocator
 from ..vision.family import ImageFamily, ImageSize, image_digest, span_key, transposed
-from ..vision.fetch import DownloadBudget, DownloadBudgetError, Fetcher, FetchError, fetch_all, image_url
+from ..vision.fetch import (
+    OFF_LOOP_BYTES,
+    DownloadBudget,
+    DownloadBudgetError,
+    Fetcher,
+    FetchError,
+    fetch_all,
+    image_url,
+)
 from ..vision.pool import CLOSED, UNSERVED, Done, Job, PoolClient, PoolState
 from ..vision.probe import MAX_SOURCE_PIXELS, Header, ProbeError, check_source_pixels, probe
 from .protocol import ApiError, sanitize, validation_error
@@ -48,8 +61,9 @@ class Image:
     header: Header
     size: ImageSize  # as stored until the pool's answer (`ImageInputs.wait`), then as oriented
     nbytes: int  # the uint8 pixels in the arena
-    key: int = 0  # the span key and the full content hash, from the pool's answer (`ImageInputs.wait`)
+    key: int = 0  # the span key and the full content hash, once the pool answered (`ImageInputs.wait`)
     digest: bytes = b""
+    hashed: Any = None  # the bytes' blake3 hasher, or the future of the thread that makes it
     offset: int = -1  # arena offset (-1: not allocated)
     job: asyncio.Future | None = None
     done: Done | None = None
@@ -175,6 +189,9 @@ class ImageInputs:
                                                   out_h=sz.height, out_w=sz.width, grid_t=sz.grid[0],
                                                   grid_h=sz.grid[1], grid_w=sz.grid[2], tokens=sz.tokens,
                                                   offset=im.offset), data)
+                for im, data in zip(prep.images, blobs):  # while the pool decodes
+                    im.hashed = (self.fetcher.offload(blake3.blake3, data) if len(data) >= OFF_LOOP_BYTES
+                                 else blake3.blake3(data))
             except BaseException:
                 self.discard(prep)
                 raise
@@ -199,7 +216,9 @@ class ImageInputs:
             else:
                 if im.done.transposed:
                     im.size = transposed(im.size)
-                self._finish(im, im.done.digest)
+                h = await im.hashed if isinstance(im.hashed, asyncio.Future) else im.hashed
+                h.update(struct.pack("<II", im.size.height, im.size.width))
+                self._finish(im, h.digest())
         if retry:
             raise ApiError(503, f"image: {retry}", kind="ServiceUnavailableError")
         prep.t_pixels = clock()

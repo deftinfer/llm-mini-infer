@@ -25,7 +25,7 @@ from PIL import Image, ImageOps, PngImagePlugin
 from llm_mini_infer.synthetic import pattern  # the host check's synthetic images too
 from llm_mini_infer.vision import arena as px_arena
 from llm_mini_infer.vision.family import ImageSize, Span, image_digest, span_key, transposed
-from llm_mini_infer.vision.fetch import Fetcher, FetchError, from_data_uri, image_url
+from llm_mini_infer.vision.fetch import OFF_LOOP_BYTES, Fetcher, FetchError, from_data_uri, image_url
 from llm_mini_infer.vision.pool import Done
 from llm_mini_infer.vision.probe import Header, ProbeError, probe
 from llm_mini_infer.vision.qwen import QwenVision, smart_resize
@@ -735,7 +735,7 @@ def test_pool_worker_round_trip(tmp_path) -> None:
         assert not ok.error and ok.decode_ns > 0 and bad.error
         view = px_arena.map_readonly(path)
         turned = transposed(size)  # EXIF 6 on a non-square image: the pool's pixels are the target turned
-        assert ok.transposed and ok.digest == image_digest(data, turned)
+        assert ok.transposed
         got = np.frombuffer(view.buf, np.uint8, 3 * turned.height * turned.width, 8192).reshape(
             3, turned.height, turned.width).copy()
         assert np.array_equal(got, FAMILY.pixels(data, header, size).numpy())
@@ -1822,8 +1822,8 @@ def test_an_asymmetric_family_fails_the_turned_image_before_anything_is_written(
         size = bad.size(h)
         n = 3 * size.height * size.width
         failed, ok = run_jobs(ipc, [(turned, h, size, 8192), (plain, probe(plain), bad.size(probe(plain)), 1 << 20)])
-        assert failed.error.startswith("Asymmetric:") and not failed.transposed and failed.digest == b"", failed
-        assert not ok.error and ok.digest
+        assert failed.error.startswith("Asymmetric:") and not failed.transposed, failed
+        assert not ok.error
         view = np.frombuffer(mem.buf, np.uint8)
         assert (view[8192:8192 + 2 * n] == 0xAB).all()  # the range, and room for the turned pixels, untouched
         assert not (view[1 << 20:(1 << 20) + n] == 0xAB).all()  # the control image was written
@@ -1855,11 +1855,13 @@ def test_an_asymmetric_family_fails_the_turned_image_before_anything_is_written(
         shutil.rmtree(ipc, ignore_errors=True)
 
 
-def test_the_pool_hashes_the_image_as_oriented_and_the_frontend_takes_it_from_the_pool(tmp_path) -> None:
-    """The worker's digest is `image_digest(bytes, the oriented size)`: for an unrotated image the frontend's old
-    formula (BLAKE3 of the bytes and the packed height and width), so span keys are unchanged; `Done.transposed` says
-    whether Pillow turned the image (EXIF 6 on a non-square one). Through `ImageInputs.prepare` and `wait` the turned
-    image's size, grid, digest and span key are the turned ones (before the wait: as stored, no digest)."""
+def test_the_frontend_hashes_the_image_as_oriented_once_the_pool_answers(tmp_path) -> None:
+    """`Done.transposed` says whether Pillow turned the image (EXIF 6 on a non-square one); the frontend hashes the
+    bytes while the pool decodes (inline under `OFF_LOOP_BYTES`, on the fetcher's thread from it) and finishes the
+    digest with the oriented size once the pool answered: `image_digest(bytes, the oriented size)`, for an unrotated
+    image the old formula (BLAKE3 of the bytes and the packed height and width), so span keys are unchanged. Before the
+    wait an image is as stored, with no digest; the worker never loads blake3 (it would slow its decode)."""
+    import inspect
     import shutil
 
     import blake3
@@ -1880,11 +1882,16 @@ def test_the_pool_hashes_the_image_as_oriented_and_the_frontend_takes_it_from_th
         size = jobs[0][2]
         h = blake3.blake3(plain)
         h.update(struct.pack("<II", size.height, size.width))  # the frontend's old formula
-        assert not a.transposed and a.digest == h.digest() == image_digest(plain, size)
+        old = h.digest()
+        assert old == image_digest(plain, size) and not a.transposed and b.transposed
         stored = jobs[1][2]
         assert (stored.height, stored.width) == (size.height, size.width) and stored.width > stored.height
-        assert b.transposed and b.digest == image_digest(turned, transposed(stored))
-        assert b.digest != image_digest(turned, stored)
+        from llm_mini_infer.vision import pool as vision_pool
+
+        src = inspect.getsource(vision_pool)
+        assert "import blake3" not in src and "image_digest" not in src
+        big = encoded(Image.fromarray(np.random.default_rng(3).integers(0, 255, (400, 400, 3), np.uint8)), "PNG")
+        assert len(big) >= OFF_LOOP_BYTES
 
         async def main():
             images = image_inputs(GEMMA70, ipc)
@@ -1893,18 +1900,25 @@ def test_the_pool_hashes_the_image_as_oriented_and_the_frontend_takes_it_from_th
                 prep = await images.prepare([data_uri(turned), data_uri(plain)])
                 im, flat = prep.images
                 assert im.size == stored and im.digest == b"" and im.key == 0  # as stored until the pool answers
+                assert not isinstance(flat.hashed, asyncio.Future)  # under OFF_LOOP_BYTES: hashed on the loop
                 await asyncio.wait_for(images.wait(prep), 60)
                 images.discard(prep)
-                return im, flat
+                prep = await images.prepare([data_uri(big)])
+                (large,) = prep.images
+                assert isinstance(large.hashed, asyncio.Future)  # from OFF_LOOP_BYTES: on the fetcher's thread
+                await asyncio.wait_for(images.wait(prep), 60)
+                images.discard(prep)
+                return im, flat, large
             finally:
                 await images.close()
 
-        im, flat = asyncio.run(main())
+        im, flat, large = asyncio.run(main())
         want = transposed(stored)
         assert im.size == want and im.size.grid == (1, stored.grid[2], stored.grid[1])
         assert im.size.tokens == stored.tokens
         assert im.digest == image_digest(turned, want) and im.key == span_key(im.digest)
-        assert flat.size == stored and flat.digest == image_digest(plain, stored) and flat.key == span_key(flat.digest)
+        assert flat.size == stored and flat.digest == old and flat.key == span_key(flat.digest)
+        assert large.digest == image_digest(big, large.size)
     finally:
         if proc is not None:
             proc.kill()

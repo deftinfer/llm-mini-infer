@@ -5,8 +5,9 @@ event loops.
 Each runs one torch thread (`OMP_NUM_THREADS=1` and friends are set before torch is imported), so the pool never
 oversubscribes the cores with default-sized thread pools. A worker binds a ROUTER socket (`ipc://<dir>/pool-<i>.sock`)
 and serves jobs in arrival order: decode, orient and resize the image (the family's `pixels`: Pillow orients it, and
-the target turns with it), write the pixels into the arena at the job's offset, hash the image (`family.image_digest`),
-and answer with whether it turned the image, the digest and the time it took, or with the error.
+the target turns with it), write the pixels into the arena at the job's offset, and answer with whether it turned the
+image and the time it took, or with the error. (The frontend hashes the image meanwhile: a worker never loads blake3,
+which slows a process's decode by a few percent.)
 
 **Clients** (`PoolClient`, one per frontend process) connect a DEALER socket to every worker and send each job to the
 ready worker with the fewest of this frontend's jobs outstanding (several frontends may queue on one worker; jobs take
@@ -92,10 +93,9 @@ class Done(msgspec.Struct, array_like=True, gc=False):
     jid: int
     error: str = ""
     decode_ns: int = 0  # decode, orientation and resize
-    write_ns: int = 0  # the copy into the arena and the hash
+    write_ns: int = 0  # the copy into the arena
     transposed: bool = False  # Pillow turned the image by a quarter: the pixels are the job's target turned (a square
     # target turns into itself: False)
-    digest: bytes = b""  # `family.image_digest` of the bytes and the oriented target
 
 
 class PoolState:
@@ -210,7 +210,7 @@ def worker_main(model_dir: str, min_pixels: int | None, max_pixels: int | None, 
         torch.set_num_interop_threads(1)
     from . import family as fam
     from .arena import map_writable
-    from .family import ImageSize, image_digest
+    from .family import ImageSize
     from .probe import Header, check_source_pixels
 
     family = fam.load(model_dir, min_pixels=min_pixels, max_pixels=max_pixels, max_soft_tokens=max_soft_tokens)
@@ -267,7 +267,7 @@ def worker_main(model_dir: str, min_pixels: int | None, max_pixels: int | None, 
             if job.offset < 0 or job.offset + n > arena.size:
                 raise ValueError(f"arena range [{job.offset}, {job.offset + n}) out of bounds")
             out_view[job.offset:job.offset + n] = px.numpy().reshape(-1)
-            reply.transposed, reply.digest = out is not size, image_digest(data.buffer, out)
+            reply.transposed = out is not size
             reply.decode_ns, reply.write_ns = t1 - t0, time.perf_counter_ns() - t1
         except Exception as exc:  # a corrupt image: the client answers 400
             reply.error = f"{type(exc).__name__}: {exc}"[:500]
@@ -312,7 +312,6 @@ def _warm(family: Any, np: Any) -> None:
 
     from PIL import Image
 
-    from .family import image_digest
     from .probe import probe
 
     for fmt in ("JPEG", "PNG"):
@@ -320,9 +319,7 @@ def _warm(family: Any, np: Any) -> None:
         Image.new("RGB", (64, 48), (10, 20, 30)).save(buf, format=fmt)
         data = buf.getvalue()
         header = probe(data)
-        size = family.size(header)
-        family.pixels(data, header, size)
-        image_digest(data, size)
+        family.pixels(data, header, family.size(header))
 
 
 class PoolClient:

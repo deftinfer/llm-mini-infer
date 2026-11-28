@@ -3,8 +3,7 @@ vision encoder and its cache").
 
 - **Frontend:** the placeholder the chat template renders per image and its token ids, and header-only sizing: the
   resize target and the number of placeholder tokens (`size`), from the stored size.
-- **Image pool:** the exact CPU half, decode, orient and resize to the target into uint8 pixels (`pixels`), and the
-  image's digest (`image_digest`).
+- **Image pool:** the exact CPU half, decode, orient and resize to the target into uint8 pixels (`pixels`).
 
 **The orientation is the decode's.** Pillow reads it in the pool, as vLLM's own decode does, and the frontend never
 does: it sizes the image as stored. A family's `size` is symmetric under a transpose (`size` of the image turned is
@@ -66,7 +65,8 @@ def transposed(size: ImageSize) -> ImageSize:
 
 
 def image_digest(data: Any, size: ImageSize) -> bytes:
-    """An image's content hash: BLAKE3 of its bytes and its oriented target size (the pool's, `vision.pool`)."""
+    """An image's content hash: BLAKE3 of its bytes and its oriented target size (`api.images` makes it in two steps:
+    the bytes while the pool decodes, the size once it answered)."""
     import blake3
 
     h = blake3.blake3(data)
