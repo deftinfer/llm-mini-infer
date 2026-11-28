@@ -831,7 +831,7 @@ class App:
         prep: Prepared | None = None
         if self.images is not None:
             urls = self.images.urls(req.messages)
-            if urls:  # fetched and sized; the pool decodes and hashes them while the prompt renders and tokenizes
+            if urls:  # fetched and sized; decoded by the pool and hashed while the prompt renders and tokenizes
                 prep = await self.images.prepare(urls)
         try:
             if prep is not None:

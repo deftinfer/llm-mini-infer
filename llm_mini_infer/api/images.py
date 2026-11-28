@@ -1,5 +1,5 @@
 """A frontend's image inputs (architecture.md, "Images"): fetch the bytes, probe the header, size the placeholders,
-and have the image pool write the pixels into the arena and hash the image.
+have the image pool write the pixels into the arena, and hash the image meanwhile.
 
 Per request (`App.chat`): `prepare` fetches every image concurrently, probes and sizes each from its header (the
 stored size: the orientation is the pool's decode's, `vision.family`), allocates its pixels in this frontend's arena
@@ -199,10 +199,10 @@ class ImageInputs:
         return prep
 
     async def wait(self, prep: Prepared) -> None:
-        """Until the pool wrote every image's pixels, each image's size then as oriented and its digest as the pool
-        gave them. A failed decode is a 400. An image that the pool could not serve is a 503 (module docstring), unless
-        another image of the request is a 400: an image that may have stopped a worker is never retried. The jobs are
-        shielded: a cancelled request frees its pixels only once their jobs resolve (`discard`)."""
+        """Until the pool wrote every image's pixels; each image's size then as oriented, and its digest finished
+        with that size. A failed decode is a 400. An image that the pool could not serve is a 503 (module docstring),
+        unless another image of the request is a 400: an image that may have stopped a worker is never retried. The jobs
+        are shielded: a cancelled request frees its pixels only once their jobs resolve (`discard`)."""
         t0 = clock()
         retry = ""
         for im in prep.images:

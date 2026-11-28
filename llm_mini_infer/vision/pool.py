@@ -7,7 +7,7 @@ oversubscribes the cores with default-sized thread pools. A worker binds a ROUTE
 and serves jobs in arrival order: decode, orient and resize the image (the family's `pixels`: Pillow orients it, and
 the target turns with it), write the pixels into the arena at the job's offset, and answer with whether it turned the
 image and the time it took, or with the error. (The frontend hashes the image meanwhile: a worker never loads blake3,
-which slows a process's decode by a few percent.)
+which made a process's decode measurably slower.)
 
 **Clients** (`PoolClient`, one per frontend process) connect a DEALER socket to every worker and send each job to the
 ready worker with the fewest of this frontend's jobs outstanding (several frontends may queue on one worker; jobs take

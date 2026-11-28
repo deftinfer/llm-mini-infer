@@ -49,7 +49,7 @@ def test_a_large_data_uri_is_decoded_on_the_fetchers_thread_with_the_same_bytes_
     assert len(small) < OFF_LOOP_CHARS <= len(large)
     for url in (small, large):
         assert asyncio.run(fetch_one(Fetcher(20 << 20, 10.0), url)) == from_data_uri(url, 20 << 20)
-    assert names[0] == threading.current_thread().name and names[1].startswith("image-base64")
+    assert names[0] == threading.current_thread().name and names[1].startswith("image-offload")
     bad = large[:-8] + "!!!!!!!!"  # not base64
     with pytest.raises(FetchError) as inline:
         from_data_uri(bad, 20 << 20)
@@ -88,10 +88,10 @@ def test_a_cancelled_fetch_and_the_fetchers_close_leave_no_decode_running() -> N
     asyncio.run(run())
     deadline = threading.Event()
     for _ in range(200):  # the decode in flight ends on its own: milliseconds
-        if not any(t.name.startswith("image-base64") for t in threading.enumerate()):
+        if not any(t.name.startswith("image-offload") for t in threading.enumerate()):
             break
         deadline.wait(0.05)
-    assert not any(t.name.startswith("image-base64") for t in threading.enumerate())
+    assert not any(t.name.startswith("image-offload") for t in threading.enumerate())
 
 
 @pytest.mark.skipif(fetch._b64.__name__ != "pybase64" or not hasattr(__import__("os"), "sched_setaffinity"),

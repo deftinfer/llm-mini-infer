@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import asyncio
 import binascii
-import contextlib
 import logging
 import os
 from collections.abc import Iterable
@@ -87,8 +86,10 @@ class DownloadBudget:
 def _place(cpus: frozenset[int]) -> None:
     """The calling thread's cores (Linux), when there are any to give it."""
     if cpus:
-        with contextlib.suppress(AttributeError, OSError):
+        try:
             os.sched_setaffinity(0, cpus)
+        except (AttributeError, OSError) as exc:
+            log.warning("could not place the image thread on CPUs %s: %s", sorted(cpus), exc)
 
 
 def image_url(part_value: Any) -> str:
@@ -243,7 +244,7 @@ class Fetcher:
         if self._decoder is None:
             from concurrent.futures import ThreadPoolExecutor
 
-            self._decoder = ThreadPoolExecutor(1, thread_name_prefix="image-base64", initializer=_place,
+            self._decoder = ThreadPoolExecutor(1, thread_name_prefix="image-offload", initializer=_place,
                                                initargs=(self._spare,))
         return asyncio.get_running_loop().run_in_executor(self._decoder, fn, *args)
 

@@ -29,7 +29,7 @@ repeats and the spread (min to max) beside it. The `none` arm's spread is the no
 **stages.** Each image (the three above, and `--files DIR`'s) through the frontend's steps in this process: the body
 joined from 256 KiB reads, parsed (`decode_chat`), the data URI decoded (`vision.fetch.from_data_uri`), the header
 probed (`vision.probe.probe`) and checked against `images.max_source_pixels`, the image sized (`ImageFamily.size`) and
-hashed (BLAKE3 of the bytes and the size, as the image pool does): each one's median time over `--reps`, and the longest
+hashed (BLAKE3 of the bytes and the size, as the frontend does): each one's median time over `--reps`, and the longest
 that another thread waited for the GIL meanwhile, against the step's own time (a step that holds the GIL makes another
 thread wait as long as it runs; one that releases it, about the switch interval at most).
 """
