@@ -77,13 +77,14 @@ class ImageInputs:
                  allowed_networks: list[str] | None = None, allowed_domains: list[str] | None = None,
                  max_source_pixels: int = MAX_SOURCE_PIXELS, pool_state: PoolState | None = None,
                  span_key_bits: int = 62, max_request_decode_bytes: int = DECODE_BYTES,
-                 max_request_download_mb: int = DOWNLOAD_MB):
+                 max_request_download_mb: int = DOWNLOAD_MB, spare: frozenset[int] = frozenset()):
         self.family = family
         self.span_key_bits = span_key_bits
         part = arena_bytes // max(1, num_frontends) // 4096 * 4096
         self.alloc = Allocator(index * part, part)
         self.pool = PoolClient(pool_dir, workers, pool_state, index) if pool_dir else None
-        self.fetcher = Fetcher(max_bytes, fetch_timeout_s, allow_urls, allowed_networks or (), allowed_domains or ())
+        self.fetcher = Fetcher(max_bytes, fetch_timeout_s, allow_urls, allowed_networks or (), allowed_domains or (),
+                               spare=spare)
         self.max_per_request = max_per_request
         self.max_source_pixels = max_source_pixels
         self.max_request_decode_bytes, self.max_request_download_mb = max_request_decode_bytes, max_request_download_mb

@@ -323,7 +323,10 @@ async def respond(send: Callable, status: int, body: bytes, headers: list | None
 
 
 class App:
-    def __init__(self, cfg: Config, index: int, ipc_path: str, pool_state: Any = None):
+    def __init__(self, cfg: Config, index: int, ipc_path: str, pool_state: Any = None,
+                 spare: frozenset[int] = frozenset()):
+        """`spare`: the cores the engine and the frontends leave (Linux, `api.server`), for this frontend's helper
+        threads (a large data URI's decode, `vision.fetch.Fetcher`); empty: they run where the loop does."""
         self.cfg = cfg
         self.index = index
         self.model_name = cfg.model.served_model_name or cfg.model.path
@@ -369,7 +372,7 @@ class App:
                                       allowed_domains=im.allowed_domains, max_source_pixels=im.max_source_pixels,
                                       pool_state=pool_state, span_key_bits=cfg.dev.images.span_key_bits,
                                       max_request_decode_bytes=im.max_request_decode_bytes,
-                                      max_request_download_mb=im.max_request_download_mb)
+                                      max_request_download_mb=im.max_request_download_mb, spare=spare)
             self.client.on_released = self.images.release
             if self.images.pool is not None:
                 self.images.pool.on_done = lambda d: self.metrics.image_stage.observe(

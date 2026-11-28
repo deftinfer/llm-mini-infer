@@ -21,7 +21,9 @@ from __future__ import annotations
 
 import asyncio
 import binascii
+import contextlib
 import logging
+import os
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
@@ -81,6 +83,13 @@ class DownloadBudget:
         self.used = received
 
 
+def _place(cpus: frozenset[int]) -> None:
+    """The calling thread's cores (Linux), when there are any to give it."""
+    if cpus:
+        with contextlib.suppress(AttributeError, OSError):
+            os.sched_setaffinity(0, cpus)
+
+
 def image_url(part_value: Any) -> str:
     """The URL of an `image_url` content part: OpenAI's `{"url": ..., "detail": ...}`, or a bare string."""
     if isinstance(part_value, str):
@@ -121,9 +130,11 @@ class Fetcher:
     """Per frontend process: resolves `image_url` values to bytes."""
 
     def __init__(self, max_bytes: int, timeout_s: float, allow_urls: bool = False,
-                 allowed_networks: Iterable[str] = (), allowed_domains: Iterable[str] = (), resolver: Any = None):
+                 allowed_networks: Iterable[str] = (), allowed_domains: Iterable[str] = (), resolver: Any = None,
+                 spare: frozenset[int] = frozenset()):
         """`allowed_networks`, `allowed_domains`: the settings' (`urlguard.Policy`); `resolver`: the aiohttp resolver
-        whose answers are checked (default: aiohttp's own; the tests' stub names)."""
+        whose answers are checked (default: aiohttp's own; the tests' stub names). `spare`: the cores the decode thread
+        runs on (`fetch`), off the event loop's own (empty: wherever the thread that starts it may run)."""
         self.max_bytes = max_bytes
         self.timeout_s = timeout_s
         self.allow_urls = allow_urls
@@ -131,14 +142,16 @@ class Fetcher:
         self._resolver = resolver
         self._session: Any = None
         self._decoder: ThreadPoolExecutor | None = None  # a large data URI's base64 decode (`fetch`)
+        self._spare = spare
 
     async def fetch(self, url: str, budget: DownloadBudget | None = None) -> bytes:
         """The image's bytes. `budget`: the request's, charged by an http(s) download (a data URI is not counted)."""
         if url.startswith("data:"):
             if len(url) < OFF_LOOP_CHARS or _b64.__name__ != "pybase64":
                 return from_data_uri(url, self.max_bytes)
-            if self._decoder is None:
-                self._decoder = ThreadPoolExecutor(1, thread_name_prefix="image-base64")
+            if self._decoder is None:  # on the spare cores: on the loop's own it would take turns with the loop
+                self._decoder = ThreadPoolExecutor(1, thread_name_prefix="image-base64", initializer=_place,
+                                                   initargs=(self._spare,))
             # off the loop: the decode lets the loop run (a request cancelled meanwhile drops the result)
             return await asyncio.get_running_loop().run_in_executor(self._decoder, from_data_uri, url, self.max_bytes)
         low = url[:8].lower()

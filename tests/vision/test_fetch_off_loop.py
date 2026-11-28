@@ -71,8 +71,8 @@ def test_the_standard_librarys_decode_stays_on_the_loops_thread(monkeypatch) -> 
 
 @pytest.mark.skipif(fetch._b64.__name__ != "pybase64", reason="pybase64 is absent (the images extra)")
 def test_a_cancelled_fetch_and_the_fetchers_close_leave_no_decode_running() -> None:
-    """A request cancelled while its image decodes drops the result; the fetcher's close shuts its thread down, and
-    the decode thread is gone once the decode ends."""
+    """A request cancelled while its image is decoded ends with its cancellation; the fetcher's close shuts its thread
+    down, and no decode thread is left once a decode in flight ends."""
     url = uri(16 << 20)
 
     async def run() -> None:
@@ -92,3 +92,23 @@ def test_a_cancelled_fetch_and_the_fetchers_close_leave_no_decode_running() -> N
             break
         deadline.wait(0.05)
     assert not any(t.name.startswith("image-base64") for t in threading.enumerate())
+
+
+@pytest.mark.skipif(fetch._b64.__name__ != "pybase64" or not hasattr(__import__("os"), "sched_setaffinity"),
+                    reason="pybase64 is absent, or no thread affinity on this platform")
+def test_the_decode_thread_runs_on_the_spare_cores(monkeypatch) -> None:
+    """A frontend gives the fetcher the cores the engine and the frontends leave (`api.server`): its decode thread runs
+    there, not on the event loop's core."""
+    import os
+
+    seen: list[set[int]] = []
+
+    def recording(url: str, max_bytes: int) -> bytes:
+        seen.append(os.sched_getaffinity(0))
+        return from_data_uri(url, max_bytes)
+
+    monkeypatch.setattr(fetch, "from_data_uri", recording)
+    one = frozenset({min(os.sched_getaffinity(0))})
+    url = uri(OFF_LOOP_CHARS + 2000)
+    assert asyncio.run(fetch_one(Fetcher(20 << 20, 10.0, spare=one), url)) == from_data_uri(url, 20 << 20)
+    assert seen == [set(one)]
