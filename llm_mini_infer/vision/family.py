@@ -2,8 +2,15 @@
 vision encoder and its cache").
 
 - **Frontend:** the placeholder the chat template renders per image and its token ids, and header-only sizing: the
-  resize target and the number of placeholder tokens (`size`).
-- **Image pool:** the exact CPU half, decode and resize to the target into uint8 pixels (`pixels`).
+  resize target and the number of placeholder tokens (`size`), from the stored size.
+- **Image pool:** the exact CPU half, decode, orient and resize to the target into uint8 pixels (`pixels`).
+
+**The orientation is the decode's.** Pillow reads it in the pool, as vLLM's own decode does, and the frontend never
+does: it sizes the image as stored. A family's `size` is symmetric under a transpose (`size` of the image turned is
+`transposed` of its `size`: the same tokens and pixel bytes, the height and width and the grid's swapped), so the
+frontend's token count and arena range hold either way, and the pool turns the target when Pillow turned the image
+(`tests/vision/test_image_sites.py` checks both families on their fixtures; the pool checks each image it may have
+turned).
 - **Scheduler:** the positions the model's RoPE takes over a prompt with images (`positions`): None when the family
   uses 1-D positions, else [3, n] and the offset that later tokens add to their sequence index.
 - **Runner:** the vision encoder with the checkpoint's weights (`load_encoder`), which rescales or normalises and
@@ -20,6 +27,7 @@ Gemma 4: `vision.gemma`), or None: no vision tower, `language_model_only`, or a 
 from __future__ import annotations
 
 import json
+import struct
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
@@ -50,6 +58,22 @@ class Span:
     size: ImageSize
 
 
+def transposed(size: ImageSize) -> ImageSize:
+    """The size of the image turned by a quarter: height and width, and the grid's, swapped."""
+    t, h, w = size.grid
+    return ImageSize(size.width, size.height, (t, w, h), size.tokens)
+
+
+def image_digest(data: Any, size: ImageSize) -> bytes:
+    """An image's content hash: BLAKE3 of its bytes and its oriented target size (`api.images` makes it in two steps:
+    the bytes while the pool decodes, the size once it answered)."""
+    import blake3
+
+    h = blake3.blake3(data)
+    h.update(struct.pack("<II", size.height, size.width))
+    return h.digest()
+
+
 def span_key(digest: bytes, bits: int = 62) -> int:
     """The radix-key value of every position of an image's span: 62 bits of the image's digest, in [2^62, 2^63)
     (architecture.md, "The radix tree"). `bits`: fewer force collisions (`dev.images.span_key_bits`, tests)."""
@@ -70,11 +94,13 @@ class ImageFamily(ABC):
 
     @abstractmethod
     def size(self, header: Header) -> ImageSize:
-        """Header-only sizing; ValueError when the model cannot take the image (a 400)."""
+        """Sizing from the stored size alone (the orientation is the decode's: module docstring); ValueError when the
+        model cannot take the image (a 400), the same either way round."""
 
     @abstractmethod
     def pixels(self, data: bytes, header: Header, size: ImageSize) -> Any:
-        """The image pool's exact CPU half: decode, orient and resize to `size`, as uint8 [3, height, width]."""
+        """The image pool's exact CPU half: decode, orient as Pillow does and resize, as uint8 [3, height, width] of
+        `size`, or of `transposed(size)` when Pillow turned the image by a quarter (orientations 5..8)."""
 
     @abstractmethod
     def positions(self, n: int, spans: list[Span]) -> tuple[np.ndarray | None, int]:
@@ -135,8 +161,9 @@ def decode_rgb(data: bytes, header: Header) -> Any:
     image as stored, as vLLM's `normalize_image` does). An image with transparency (RGBA, LA, PA, or a `transparency`
     entry: a PNG tRNS chunk, an RGB one's colour key included, a GIF's transparent index) is pasted onto white through
     its alpha instead, as vLLM's `convert_image_mode` does.
-    Raises ProbeError when the decoded size disagrees with the header: before the decode (a GIF's first frame may
-    extend past the logical screen the probe reads, and Pillow sizes the image by it) and after the orientation."""
+    Raises ProbeError when the decoded size disagrees with the header's stored size (a GIF's first frame may extend past
+    the logical screen the probe reads, and Pillow sizes the image by it; a JPEG's later frame header declares another
+    size): before the decode, and after the orientation, when the image is neither as stored nor turned."""
     import contextlib
     import io
 
@@ -160,10 +187,17 @@ def decode_rgb(data: bytes, header: Header) -> Any:
     elif im.mode != "RGB":
         im = im.convert("RGB")
     img = _rgb(im, torch).permute(2, 0, 1)
-    if tuple(img.shape[1:]) != (header.oriented[1], header.oriented[0]):
+    if tuple(img.shape[1:]) not in ((header.height, header.width), (header.width, header.height)):
         raise ProbeError(f"the decoded image is {img.shape[2]}x{img.shape[1]}, but its header says "
-                         f"{header.oriented[0]}x{header.oriented[1]}")
+                         f"{header.width}x{header.height}")
     return img
+
+
+def target(img: Any, header: Header, size: ImageSize) -> tuple[int, int]:
+    """The resize target (height, width) of a decoded, oriented image: `size`'s, or turned when Pillow turned it."""
+    if header.height != header.width and tuple(img.shape[1:]) == (header.width, header.height):
+        return size.width, size.height
+    return size.height, size.width
 
 
 def _rgb(im: Any, torch: Any) -> Any:

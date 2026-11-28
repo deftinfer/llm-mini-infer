@@ -66,7 +66,8 @@ def free_port() -> int:
 
 
 class Server:
-    def __init__(self, step_ms: float, max_num_seqs: int = 64, extra: dict | None = None):
+    def __init__(self, step_ms: float, max_num_seqs: int = 64, extra: dict | None = None, stderr: Any = None):
+        """`stderr`: the server's (a file or descriptor, as `subprocess.Popen` takes it; default: this process's)."""
         self.port = free_port()
         fake = {"runner": {"fake": {"step_ms": step_ms, "strict": False}}} if RUNNER == "fake" else {}
         # speculative decoding off (a checkpoint with an MTP layer turns it on by default): each decode step then
@@ -88,7 +89,7 @@ class Server:
             env = {k: v for k, v in os.environ.items() if k not in ("LLM_MINI_INFER_API_KEY", "VLLM_API_KEY")}
             self.proc = subprocess.Popen([sys.executable, "-m", "llm_mini_infer.cli", "serve", "--config",
                                           str(self.cfg_path)],
-                                         cwd=ROOT, env=env)
+                                         cwd=ROOT, env=env, stderr=stderr)
             deadline = time.monotonic() + (60 if RUNNER == "fake" else 1200)  # the GPU loads weights, profiles, JITs
             while time.monotonic() < deadline:
                 if self.proc.poll() is not None:

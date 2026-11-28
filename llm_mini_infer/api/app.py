@@ -5,8 +5,8 @@ Routes: POST /v1/chat/completions (streaming and not), POST /tokenize and /detok
 /server_info (the effective configuration with the reason for each derived value, and the runner's capabilities),
 /health (readiness: 200 once warm-up is done, 503 while draining or once the engine stopped; `/ready` and
 `/health?ready=1` are the same), /live (liveness: 200 while the process serves HTTP) and /metrics, with any method;
-/debug/stages, /debug/engine, /debug/images and /debug/reset with `observability.debug_endpoints`. With an API key set,
-every path but /health, /ready, /live and /metrics needs it, and OPTIONS reaches no other handler (`auth`).
+/debug/stages, /debug/engine, /debug/images, /debug/loop and /debug/reset with `observability.debug_endpoints`. With an
+API key set, every path but /health, /ready, /live and /metrics needs it, and OPTIONS reaches no other handler (`auth`).
 
 A request's id is its `X-Request-Id` header when the client sends a usable one (`request_id`); with
 `observability.log_requests` each chat request ends with one INFO line of metadata (`App.log_request`): never prompts,
@@ -98,7 +98,57 @@ BACKLOG_FULL = ("The engine has reached its prefill token backlog limit. Please 
 UNCOUNTED = re.compile("|".join(map(re.escape, ("/metrics", "/health", "/load", "/ping", "/version", "/server_info",
                                                 "/ready", "/live"))))
 POST_ROUTES = frozenset(("/v1/chat/completions", "/tokenize", "/detokenize"))  # every other route takes any method
-DEBUG_ROUTES = frozenset(("/debug/stages", "/debug/engine", "/debug/images", "/debug/reset"))
+DEBUG_ROUTES = frozenset(("/debug/stages", "/debug/engine", "/debug/images", "/debug/loop", "/debug/reset"))
+LAG_INTERVAL_NS = 1_000_000  # `LoopLag`'s timer
+LAG_SAMPLES = 120_000
+
+
+class LoopLag:
+    """The event loop's lag, with `observability.debug_endpoints` (`/debug/loop`): a timer due every `LAG_INTERVAL_NS`
+    records how late it ran, so work that holds the loop shows as the lag every stream of the frontend sees. uvloop's
+    timers have a resolution of a millisecond, so a sample is within about a millisecond of the true lag either way, and
+    a stall shows in full. A ring keeps the last `LAG_SAMPLES` (two minutes or more),
+    each the monotonic time it ran (`time.monotonic_ns`, one clock for every process of the host) and its lag, in ns."""
+
+    def __init__(self, size: int = LAG_SAMPLES):
+        self._t = np.zeros(size, np.int64)
+        self._lag = np.zeros(size, np.int64)
+        self._n = 0  # samples recorded since the last reset
+        self._due = 0
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._timer: asyncio.TimerHandle | None = None
+
+    def start(self) -> None:
+        self._loop = asyncio.get_running_loop()
+        self._due = time.monotonic_ns() + LAG_INTERVAL_NS
+        self._timer = self._loop.call_later(LAG_INTERVAL_NS / 1e9, self._tick)
+
+    def stop(self) -> None:
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+
+    def _tick(self) -> None:
+        now = time.monotonic_ns()
+        i = self._n % len(self._t)
+        self._t[i] = now
+        self._lag[i] = now - self._due
+        self._n += 1
+        self._due = now + LAG_INTERVAL_NS
+        self._timer = self._loop.call_later(LAG_INTERVAL_NS / 1e9, self._tick)
+
+    def samples(self, since: int = 0) -> dict[str, object]:
+        """The samples kept that ran at or after `since` (monotonic ns), oldest first; `lost`: those recorded since the
+        last reset that the ring no longer holds."""
+        size = len(self._t)
+        n = min(self._n, size)
+        order = (np.arange(n) + (self._n - n)) % size
+        t, lag = self._t[order], self._lag[order]
+        keep = t >= since
+        return {"interval_ns": LAG_INTERVAL_NS, "lost": self._n - n, "t": t[keep].tolist(), "lag": lag[keep].tolist()}
+
+    def reset(self) -> None:
+        self._n = 0
 
 
 class ClientGone(Exception):
@@ -273,7 +323,10 @@ async def respond(send: Callable, status: int, body: bytes, headers: list | None
 
 
 class App:
-    def __init__(self, cfg: Config, index: int, ipc_path: str, pool_state: Any = None):
+    def __init__(self, cfg: Config, index: int, ipc_path: str, pool_state: Any = None,
+                 spare: frozenset[int] = frozenset()):
+        """`spare`: the cores the engine and the frontends leave (Linux, `api.server`), for this frontend's helper
+        threads (a large data URI's decode, `vision.fetch.Fetcher`); empty: they run where the loop does."""
         self.cfg = cfg
         self.index = index
         self.model_name = cfg.model.served_model_name or cfg.model.path
@@ -299,6 +352,7 @@ class App:
         debug = cfg.observability.debug_endpoints
         self.client = EngineClient(ipc_path, index, self.metrics, cfg.dev.engine.inline_threshold,
                                    debug_records=100_000 if debug else 0, spin_ms=cfg.dev.server.spin_ms or 0.0)
+        self.loop_lag = LoopLag() if debug else None  # /debug/loop
         self.images: ImageInputs | None = None
         im = cfg.images
         if im.enabled:
@@ -318,7 +372,7 @@ class App:
                                       allowed_domains=im.allowed_domains, max_source_pixels=im.max_source_pixels,
                                       pool_state=pool_state, span_key_bits=cfg.dev.images.span_key_bits,
                                       max_request_decode_bytes=im.max_request_decode_bytes,
-                                      max_request_download_mb=im.max_request_download_mb)
+                                      max_request_download_mb=im.max_request_download_mb, spare=spare)
             self.client.on_released = self.images.release
             if self.images.pool is not None:
                 self.images.pool.on_done = lambda d: self.metrics.image_stage.observe(
@@ -388,10 +442,14 @@ class App:
                 self.client.start()
                 if self.images is not None:
                     self.images.start()
+                if self.loop_lag is not None:
+                    self.loop_lag.start()
                 await send({"type": "lifespan.startup.complete"})
                 if self.on_ready is not None:
                     self.on_ready()
             elif msg["type"] == "lifespan.shutdown":
+                if self.loop_lag is not None:
+                    self.loop_lag.stop()
                 await self.client.close()
                 if self.images is not None:
                     await self.images.close()
@@ -773,7 +831,7 @@ class App:
         prep: Prepared | None = None
         if self.images is not None:
             urls = self.images.urls(req.messages)
-            if urls:  # fetched, sized and hashed; the pool decodes while the prompt renders and tokenizes
+            if urls:  # fetched and sized; decoded by the pool and hashed while the prompt renders and tokenizes
                 prep = await self.images.prepare(urls)
         try:
             if prep is not None:
@@ -1293,7 +1351,12 @@ class App:
                                 "pool_busy": [int(st.since(i) != 0) for i in n],
                                 "pool_failed": pool.failed if pool else 0, "pool_resent": pool.resent if pool else 0,
                                 "pool_hangs": st.hangs if st else 0, "pool_closed": int(st.closed) if st else 0})
+        if path == "/debug/loop":
+            since = re.fullmatch(rb"since=([0-9]{1,20})", query)
+            return _enc.encode(self.loop_lag.samples(int(since[1]) if since else 0))
         if path == "/debug/reset":
+            if self.loop_lag is not None:
+                self.loop_lag.reset()
             if c.records is not None:
                 c.records.clear()
             if c.step_samples is not None:

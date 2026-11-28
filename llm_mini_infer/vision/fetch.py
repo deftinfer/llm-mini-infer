@@ -22,21 +22,32 @@ from __future__ import annotations
 import asyncio
 import binascii
 import logging
+import os
 from collections.abc import Iterable
 from typing import Any
 
 from .urlguard import REFUSED, Blocked, BlockedAddress, Policy, check_url, safe_resolver
 
-try:  # pybase64 (the images extra) decodes faster; the standard library is the fallback
+try:  # pybase64 (the images extra) decodes faster, and lets other threads run meanwhile; the standard library is the
+    # fallback, which holds the GIL throughout
     import pybase64 as _b64
 except ImportError:  # pragma: no cover - depends on the environment
     import base64 as _b64
+# From this many bytes (decoded), work that lets other threads run goes to the fetcher's thread, off the event loop
+# (`Fetcher.offload`): a data URI's base64 decode (with pybase64 only: the standard library's holds the GIL, which would
+# hold the loop as long) and an image's hash (`api.images`); below it the thread's hop (tens of microseconds) costs
+# about what the work does
+OFF_LOOP_BYTES = 256 << 10
+OFF_LOOP_CHARS = OFF_LOOP_BYTES * 4 // 3  # the same, as a data URI's characters
 
 
 def _b64decode(s: str) -> bytes:
     return _b64.b64decode(s, validate=True)
 
 MAX_REDIRECTS = 5  # SGLang's
+# The most characters a data URI may hold before its ',' (`data:image/png;base64` and any parameters): the frontend's
+# event loop splits and checks them before it decodes anything
+MAX_DATA_URI_HEAD = 1024
 REDIRECTS = frozenset((301, 302, 303, 307, 308))
 MIB = 1 << 20
 log = logging.getLogger(__name__)
@@ -72,6 +83,15 @@ class DownloadBudget:
         self.used = received
 
 
+def _place(cpus: frozenset[int]) -> None:
+    """The calling thread's cores (Linux), when there are any to give it."""
+    if cpus:
+        try:
+            os.sched_setaffinity(0, cpus)
+        except (AttributeError, OSError) as exc:
+            log.warning("could not place the image thread on CPUs %s: %s", sorted(cpus), exc)
+
+
 def image_url(part_value: Any) -> str:
     """The URL of an `image_url` content part: OpenAI's `{"url": ..., "detail": ...}`, or a bare string."""
     if isinstance(part_value, str):
@@ -83,17 +103,24 @@ def image_url(part_value: Any) -> str:
 
 def from_data_uri(url: str, max_bytes: int) -> bytes:
     """`data:image/<type>;base64,<data>` → bytes."""
-    head, sep, body = url.partition(",")
-    if not sep:
+    comma = url.find(",")
+    if comma < 0:
         raise FetchError("malformed data URI: no ','")
+    if comma > MAX_DATA_URI_HEAD:
+        raise FetchError(f"malformed data URI: more than {MAX_DATA_URI_HEAD} characters before its ','")
+    head = url[:comma]
     meta = head[5:].split(";")
     media = meta[0].strip().lower()
     if media and not media.startswith("image/"):
         raise FetchError(f"data URI media type {media!r} is not an image")
     if "base64" not in (m.strip().lower() for m in meta[1:]):
         raise FetchError("only base64 data URIs are supported for images")
-    if len(body) * 3 // 4 > max_bytes + 3:
+    if (len(url) - comma - 1) * 3 // 4 > max_bytes + 3:
         raise FetchError(f"image larger than {max_bytes} bytes")
+    if not url.isascii() and head.isascii():  # a character past the ',' outside ASCII: never base64. Refused before
+        # the body's copy and decode, which on a string that wide hold the GIL, on the fetcher's thread too
+        raise FetchError("invalid base64 in data URI: string argument should contain only ASCII characters")
+    body = url[comma + 1:]
     try:
         data = _b64decode(body.strip())
     except (binascii.Error, ValueError) as exc:
@@ -109,20 +136,26 @@ class Fetcher:
     """Per frontend process: resolves `image_url` values to bytes."""
 
     def __init__(self, max_bytes: int, timeout_s: float, allow_urls: bool = False,
-                 allowed_networks: Iterable[str] = (), allowed_domains: Iterable[str] = (), resolver: Any = None):
+                 allowed_networks: Iterable[str] = (), allowed_domains: Iterable[str] = (), resolver: Any = None,
+                 spare: frozenset[int] = frozenset()):
         """`allowed_networks`, `allowed_domains`: the settings' (`urlguard.Policy`); `resolver`: the aiohttp resolver
-        whose answers are checked (default: aiohttp's own; the tests' stub names)."""
+        whose answers are checked (default: aiohttp's own; the tests' stub names). `spare`: the cores the decode thread
+        runs on (`fetch`), off the event loop's own (empty: wherever the thread that starts it may run)."""
         self.max_bytes = max_bytes
         self.timeout_s = timeout_s
         self.allow_urls = allow_urls
         self.policy = Policy(allowed_networks, allowed_domains)
         self._resolver = resolver
         self._session: Any = None
+        self._decoder: Any = None  # the off-loop thread (`offload`)
+        self._spare = spare
 
     async def fetch(self, url: str, budget: DownloadBudget | None = None) -> bytes:
         """The image's bytes. `budget`: the request's, charged by an http(s) download (a data URI is not counted)."""
         if url.startswith("data:"):
-            return from_data_uri(url, self.max_bytes)
+            if len(url) < OFF_LOOP_CHARS or _b64.__name__ != "pybase64":
+                return from_data_uri(url, self.max_bytes)
+            return await self.offload(from_data_uri, url, self.max_bytes)
         low = url[:8].lower()
         if low.startswith("http://") or low.startswith("https://"):
             if not self.allow_urls:
@@ -208,7 +241,21 @@ class Fetcher:
             raise FetchError("empty image")
         return b"".join(chunks)
 
+    def offload(self, fn: Any, *args: Any) -> asyncio.Future:
+        """`fn(*args)` on the fetcher's one thread, off the event loop, on the spare cores (on the loop's own core it
+        would take turns with the loop): for work that lets other threads run. A request cancelled meanwhile drops the
+        result; the thread is started on first use."""
+        if self._decoder is None:
+            from concurrent.futures import ThreadPoolExecutor
+
+            self._decoder = ThreadPoolExecutor(1, thread_name_prefix="image-offload", initializer=_place,
+                                               initargs=(self._spare,))
+        return asyncio.get_running_loop().run_in_executor(self._decoder, fn, *args)
+
     async def close(self) -> None:
+        if self._decoder is not None:  # a decode still running ends on its own (milliseconds); a queued one never runs
+            self._decoder.shutdown(wait=False, cancel_futures=True)
+            self._decoder = None
         if self._session is not None:
             await self._session.close()
             self._session = None

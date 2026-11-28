@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 import torch
 
+from llm_mini_infer.vision.family import transposed
 from llm_mini_infer.vision.gemma import SOFT_TOKENS, GemmaVision, aspect_ratio_size
 from llm_mini_infer.vision.probe import probe
 
@@ -62,7 +63,8 @@ def test_the_resize_target_is_hfs_exactly() -> None:
 
 
 def test_the_token_count_is_the_processors() -> None:
-    """The family's sizing from a header (after the EXIF orientation) gives the count `Gemma4Processor` expands to."""
+    """The family's sizing from a header (the stored size, as the frontend sizes it) gives the count `Gemma4Processor`
+    expands to."""
     from PIL import Image
 
     proc = Gemma4ImageProcessor()
@@ -153,6 +155,8 @@ def _ours(data: bytes, fam: GemmaVision = FAM) -> tuple[np.ndarray, np.ndarray]:
     header = probe(data)
     size = fam.size(header)
     px = fam.pixels(data, header, size)
+    if tuple(px.shape[1:]) != (size.height, size.width):  # Pillow turned a non-square image: the decode decides
+        size = transposed(size)
     assert px.dtype == torch.uint8 and tuple(px.shape) == (3, size.height, size.width)
     patches = GemmaVisionEncoder.patches(enc, px).numpy()
     xs, ys = pool_order(size.grid[1], size.grid[2], 3, torch.device("cpu"))

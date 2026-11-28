@@ -65,8 +65,9 @@ def _level(name: str) -> int:
     return logging.getLevelName(name.upper()) if isinstance(name, str) else int(name)
 
 
-async def _main(cfg: Config, index: int, ipc_path: str, ready: Connection | None, pool_state: Any = None) -> None:
-    app = App(cfg, index, ipc_path, pool_state)
+async def _main(cfg: Config, index: int, ipc_path: str, ready: Connection | None, pool_state: Any = None,
+                spare: frozenset[int] = frozenset()) -> None:
+    app = App(cfg, index, ipc_path, pool_state, spare)
     server = UvicornServer(app, cfg.server.host, cfg.server.port, cfg.observability.log_level, cfg.server.keep_alive_s)
 
     def on_ready() -> None:
@@ -99,16 +100,27 @@ def frontend_main(cfg: Config, index: int, ipc_path: str, ready: Connection | No
     signal.signal(signal.SIGINT, signal.SIG_IGN)  # until `_main` sets its handler: the launcher handles a Ctrl-C
     faulthandler.enable()  # a native crash prints every thread's stack
     faulthandler.register(signal.SIGUSR2, all_threads=True)  # and so does the launcher, for a start that hangs
-    setup_logging(cfg.observability.log_level, f"frontend-{index}", without_messages=True)
+    # queued: a stderr that stops reading blocks the log's writer thread, not the event loop every stream waits on
+    writer = setup_logging(cfg.observability.log_level, f"frontend-{index}", without_messages=True, queued=True)
     cpus = cfg.dev.server.cpus
+    rest: set[int] = set()  # the cores the engine and the frontends leave, for this frontend's helper threads
     if cpus and index < len(cpus):
         try:
-            os.sched_setaffinity(0, {cpus[index]})
+            allowed = os.sched_getaffinity(0)
+            os.sched_setaffinity(0, {cpus[index]})  # this thread (Linux): the event loop's
             log.info("frontend %d pinned to CPU %d", index, cpus[index])
+            rest = allowed - set(cpus) - {cfg.dev.engine.cpu}
         except (AttributeError, OSError) as exc:
             log.warning("could not pin frontend %d to CPU %d: %s", index, cpus[index], exc)
+        # the log's writer thread, started before, on the cores the engine and the frontends leave: on the frontend's
+        # own core it would take turns with the loop and its ZMQ threads on every request
+        if writer is not None and rest:
+            try:
+                writer.place(rest)
+            except (AttributeError, OSError) as exc:
+                log.warning("could not place frontend %d's log writer on CPUs %s: %s", index, sorted(rest), exc)
     import gc
 
     gc.collect()
     gc.freeze()
-    uvloop.run(_main(cfg, index, ipc_path, ready, pool_state))
+    uvloop.run(_main(cfg, index, ipc_path, ready, pool_state, frozenset(rest)))

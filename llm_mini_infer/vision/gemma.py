@@ -33,7 +33,7 @@ from typing import Any
 
 import numpy as np
 
-from .family import ImageFamily, ImageSize, Span, decode_rgb, resize_bicubic
+from .family import ImageFamily, ImageSize, Span, decode_rgb, resize_bicubic, target
 from .probe import Header
 
 SOFT_TOKENS = (70, 140, 280, 560, 1120)  # HF's _SUPPORTED_SOFT_TOKENS
@@ -129,8 +129,7 @@ class GemmaVision(ImageFamily):
     # -- frontend --------------------------------------------------------------------------------------------------
 
     def size(self, header: Header) -> ImageSize:
-        width, height = header.oriented
-        h, w = aspect_ratio_size(height, width, self.patch, self.max_patches, self.pooling)
+        h, w = aspect_ratio_size(header.height, header.width, self.patch, self.max_patches, self.pooling)
         grid = (1, h // self.patch, w // self.patch)
         return ImageSize(height=h, width=w, grid=grid, tokens=grid[1] * grid[2] // self.pooling ** 2)
 
@@ -162,9 +161,10 @@ class GemmaVision(ImageFamily):
 
     def pixels(self, data: bytes, header: Header, size: ImageSize) -> Any:
         img = decode_rgb(data, header)
-        if tuple(img.shape[1:]) == (size.height, size.width):
+        h, w = target(img, header, size)
+        if tuple(img.shape[1:]) == (h, w):
             return img.contiguous()
-        return resize_bicubic(img, size.height, size.width)
+        return resize_bicubic(img, h, w)
 
     # -- scheduler -------------------------------------------------------------------------------------------------
 

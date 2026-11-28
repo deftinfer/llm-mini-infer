@@ -64,7 +64,7 @@ def gemma_dir(tmp_path: Path) -> Path:
 def job_for(data: bytes, offset: int) -> Job:
     h = probe(data)
     size = GEMMA70.size(h)
-    return Job(jid=0, fmt=h.format, width=h.width, height=h.height, orientation=h.orientation,
+    return Job(jid=0, fmt=h.format, width=h.width, height=h.height,
                out_h=size.height, out_w=size.width, grid_t=size.grid[0], grid_h=size.grid[1], grid_w=size.grid[2],
                tokens=size.tokens, offset=offset)
 
@@ -72,7 +72,7 @@ def job_for(data: bytes, offset: int) -> Job:
 def tiny() -> Job:
     """A job for the echo workers, which never decode (a new one for each submit: the client keeps it until it is
     answered, to re-send it)."""
-    return Job(jid=0, fmt="jpeg", width=1, height=1, orientation=1, out_h=1, out_w=1, grid_t=1, grid_h=1,
+    return Job(jid=0, fmt="jpeg", width=1, height=1, out_h=1, out_w=1, grid_t=1, grid_h=1,
                grid_w=1, tokens=1, offset=0)
 
 

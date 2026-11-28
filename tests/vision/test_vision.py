@@ -2,7 +2,7 @@
 transformers' get_rope_index, the pool's pixels vs HF's pixel_values, the pixel arena, fetching, a pool worker end to
 end, the stored-size limit before any decode (images.max_source_pixels against a poison image), and transparency
 composited as vLLM does. All on synthetic images: the test pattern (`llm_mini_infer.synthetic.pattern`) in each
-format, colour mode and EXIF/XMP orientation the probe reads, and random pixels for transparency."""
+format, colour mode and EXIF/XMP orientation the pool applies, and random pixels for transparency."""
 
 from __future__ import annotations
 
@@ -24,14 +24,14 @@ from PIL import Image, ImageOps, PngImagePlugin
 
 from llm_mini_infer.synthetic import pattern  # the host check's synthetic images too
 from llm_mini_infer.vision import arena as px_arena
-from llm_mini_infer.vision.family import ImageSize, Span, span_key
-from llm_mini_infer.vision.fetch import Fetcher, FetchError, from_data_uri, image_url
+from llm_mini_infer.vision.family import ImageSize, Span, image_digest, span_key, transposed
+from llm_mini_infer.vision.fetch import OFF_LOOP_BYTES, Fetcher, FetchError, from_data_uri, image_url
 from llm_mini_infer.vision.pool import Done
 from llm_mini_infer.vision.probe import Header, ProbeError, probe
 from llm_mini_infer.vision.qwen import QwenVision, smart_resize
 
 from ..support.fixtures import QWEN, require_qwen
-from ..support.vision_pool import GEMMA70, POISON, encoded, exif, run_jobs, spawn_pool_worker
+from ..support.vision_pool import GEMMA70, POISON, encoded, exif, lopsided, run_jobs, spawn_pool_worker
 
 FAMILY = QwenVision(start_id=248053, pad_id=248056, end_id=248054, patch=16, merge=2, temporal=2, min_pixels=65536,
                     max_pixels=327680, mean=(0.5,) * 3, std=(0.5,) * 3, rescale=1 / 255, mrope=True)
@@ -63,10 +63,10 @@ def variants() -> list[tuple[str, bytes]]:
 
 @pytest.mark.parametrize(("name", "data"), variants(), ids=[v[0] for v in variants()])
 def test_probe_matches_pillow(name, data) -> None:
+    """The probe's format and stored size are Pillow's (`Image.open`'s, before any orientation)."""
     im = Image.open(io.BytesIO(data))
     h = probe(data)
-    assert (h.width, h.height) == im.size
-    assert h.oriented == ImageOps.exif_transpose(im).size
+    assert (h.format.upper(), h.width, h.height) == (im.format, *im.size)
 
 
 def test_probe_rejects_what_it_cannot_read() -> None:
@@ -75,33 +75,199 @@ def test_probe_rejects_what_it_cannot_read() -> None:
             probe(data)
 
 
-def test_a_png_text_chunk_inflates_at_most_as_far_as_pillow_reads_it() -> None:
-    """The probe runs on the frontend's event loop: a compressed text chunk that inflates past 1 MiB (Pillow's
-    MAX_TEXT_CHUNK) is refused, as Pillow refuses to open the image, instead of inflating about 1,000 times. At the
-    cap both read it."""
+def png_with_chunk(kind: bytes, body: bytes) -> bytes:
+    """A small PNG with one more chunk right after its IHDR."""
     import zlib
 
-    from llm_mini_infer.vision.probe import MAX_TEXT_CHUNK
+    plain = encoded(pattern(8, 6, 1), "PNG")
+    chunk = struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body))
+    return plain[:33] + chunk + plain[33:]
 
-    assert MAX_TEXT_CHUNK == PngImagePlugin.MAX_TEXT_CHUNK
 
-    def png(text: bytes, kind: bytes) -> bytes:
-        plain = encoded(pattern(8, 6, 1), "PNG")
-        body = (b"Raw profile type exif\0\0" + zlib.compress(text) if kind == b"zTXt" else
-                b"XML:com.adobe.xmp\0\x01\0\0\0" + zlib.compress(text))
-        chunk = struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body))
-        return plain[:33] + chunk + plain[33:]  # after IHDR
+def test_a_png_text_chunk_past_pillows_cap_passes_the_probe_and_fails_in_the_pool_with_pillows_error() -> None:
+    """The probe reads IHDR only, so a compressed text chunk that inflates past 1 MiB (Pillow's MAX_TEXT_CHUNK) is
+    the pool's to refuse: Pillow's ValueError, which is a 400 for the client, not a served image or a crash. At the cap
+    Pillow reads it."""
+    import zlib
 
+    from llm_mini_infer.vision.family import decode_rgb
+
+    cap = PngImagePlugin.MAX_TEXT_CHUNK
     for kind in (b"zTXt", b"iTXt"):
-        at_cap = png(b" " * MAX_TEXT_CHUNK, kind)
+        def png(text: bytes, kind: bytes = kind) -> bytes:
+            body = (b"Raw profile type exif\0\0" if kind == b"zTXt" else b"XML:com.adobe.xmp\0\x01\0\0\0")
+            return png_with_chunk(kind, body + zlib.compress(text))
+
+        at_cap = png(b" " * cap)
         h = probe(at_cap)
         assert (h.width, h.height) == Image.open(io.BytesIO(at_cap)).size == (8, 6)
-        bomb = png(b" " * (MAX_TEXT_CHUNK + 1), kind)
+        assert tuple(decode_rgb(at_cap, h).shape) == (3, 6, 8)
+        bomb = png(b" " * (cap + 1))
         assert len(bomb) < 4096  # a few kilobytes that would inflate past the cap
-        with pytest.raises(ProbeError, match="inflates past 1 MiB"):
-            probe(bomb)
+        assert (probe(bomb).width, probe(bomb).height) == (8, 6)
         with pytest.raises(ValueError, match="MAX_TEXT_CHUNK"):
-            Image.open(io.BytesIO(bomb)).load()
+            decode_rgb(bomb, probe(bomb))
+
+
+def test_a_png_reads_ihdr_only_whatever_follows() -> None:
+    """The chunks after IHDR are never read: junk, a text chunk with a compressed body that is not zlib, and a huge
+    compressed one (about 64 KiB for 64 MiB) all pass with IHDR's size."""
+    import zlib
+
+    plain = encoded(pattern(8, 6, 1), "PNG")
+    junk = plain[:33] + b"\xde\xad\xbe\xef" * 8 + plain[33:]
+    assert (probe(junk).width, probe(junk).height) == (8, 6)
+    garbage = png_with_chunk(b"zTXt", b"key\0\0not zlib at all")
+    assert (probe(garbage).width, probe(garbage).height) == (8, 6)
+    huge = png_with_chunk(b"zTXt", b"key\0\0" + zlib.compress(bytes(64 << 20)))
+    assert len(huge) < 1 << 17
+    assert probe(huge) == Header("png", 8, 6)
+    assert probe(plain[:33]) == Header("png", 8, 6)  # IHDR alone
+
+
+MARKERS, FILL_MAX = 4096, 1 << 20  # MAX_JPEG_MARKERS, MAX_JPEG_FILL
+
+
+def sof0(width: int = 40, height: int = 30) -> bytes:
+    """A one-component SOF0 segment (and nothing after it)."""
+    return b"\xff\xc0" + struct.pack(">HBHHB", 11, 8, height, width, 1) + b"\x01\x11\x00"
+
+
+COM, RST, FILL = b"\xff\xfe\x00\x02", b"\xff\xd0", b"\xff"  # a 2-byte COM segment, a standalone RST0, one fill byte
+
+
+def steps_jpeg(*parts: bytes) -> bytes:
+    """SOI, the parts, a SOF0 of 40 x 30 (the SOF is not counted)."""
+    return b"\xff\xd8" + b"".join(parts) + sof0()
+
+
+MARKERS_TEXT = "more than 4096 markers before the frame header"
+FILL_TEXT = "more than 1 MiB of fill bytes before the frame header"
+
+
+@pytest.mark.parametrize("make", [lambda n: COM * n, lambda n: RST * n, lambda n: COM * (n // 2) + RST * (n - n // 2),
+                                  lambda n: (COM + RST) * (n // 2) + COM * (n % 2)],
+                         ids=["com", "rst", "half", "mixed"])
+def test_a_jpeg_holds_exactly_4096_markers_before_its_frame_header(make) -> None:
+    """A marker is each segment or standalone marker (RSTn) read before the SOF: 4,096 are served, 4,097 refused with
+    the markers' text; the SOF itself is not counted."""
+    ok = probe(steps_jpeg(make(MARKERS)))
+    assert (ok.format, ok.width, ok.height) == ("jpeg", 40, 30)
+    assert probe(steps_jpeg(make(MARKERS - 1))).width == 40
+    with pytest.raises(ProbeError, match=MARKERS_TEXT):
+        probe(steps_jpeg(make(MARKERS + 1)))
+
+
+def test_a_jpeg_holds_exactly_1_mib_of_fill_bytes_before_its_frame_header() -> None:
+    """k fill bytes are k + 1 0xFFs before the marker code: the last is the marker's own. Fill in one run, after a
+    segment, between two and before the SOF all count, by bytes: 1 MiB is served, 1 MiB + 1 refused with the fill
+    text, a run or spread over markers."""
+    assert probe(steps_jpeg(FILL * FILL_MAX)).width == 40
+    assert probe(steps_jpeg(FILL * (FILL_MAX - 1))).width == 40
+    assert probe(steps_jpeg(COM + FILL * FILL_MAX)).width == 40
+    assert probe(steps_jpeg(FILL * 500_000 + COM + FILL * (FILL_MAX - 500_000))).width == 40  # spread over two markers
+    assert probe(steps_jpeg(*(FILL * 1000 + COM for _ in range(1000)), FILL * (FILL_MAX - 1_000_000))).width == 40
+    with pytest.raises(ProbeError, match=FILL_TEXT):
+        probe(steps_jpeg(FILL * (FILL_MAX + 1)))
+    with pytest.raises(ProbeError, match=FILL_TEXT):
+        probe(steps_jpeg(FILL * 500_000 + COM + FILL * (FILL_MAX - 500_000 + 1)))
+    with pytest.raises(ProbeError, match=FILL_TEXT):
+        probe(steps_jpeg(*(FILL * 1000 + COM for _ in range(1000)), FILL * (FILL_MAX - 1_000_000 + 1)))
+
+
+def test_fill_bytes_are_not_markers_and_markers_are_not_fill() -> None:
+    """The two counts are separate: 4,096 markers with 4,000 fill bytes before each of several of them (far past 4,096
+    together) are served; 4,096 markers' worth of fill alone is nothing."""
+    parts = [(FILL * 4000 + COM) for _ in range(10)] + [COM] * (MARKERS - 10)
+    assert sum(p.count(COM) for p in parts) == MARKERS
+    assert probe(steps_jpeg(*parts)).width == 40
+    with pytest.raises(ProbeError, match=MARKERS_TEXT):
+        probe(steps_jpeg(*parts, COM))
+    assert probe(steps_jpeg(FILL * 4097)).width == 40
+
+
+def test_a_20_mib_run_of_fill_bytes_before_the_frame_header_is_refused_at_the_bound() -> None:
+    """The run is matched up to the remaining budget only (the regex's endpos), not to its end."""
+    with pytest.raises(ProbeError, match=FILL_TEXT):
+        probe(steps_jpeg(FILL * (20 << 20)))
+    with pytest.raises(ProbeError, match=FILL_TEXT):
+        probe(steps_jpeg(COM * 100 + FILL * (20 << 20)))
+    with pytest.raises(ProbeError, match=FILL_TEXT):
+        probe(steps_jpeg(memoryview(FILL * (20 << 20))))
+    with pytest.raises(ProbeError, match=FILL_TEXT):
+        probe(memoryview(steps_jpeg(FILL * (20 << 20))))
+
+
+def test_a_jpegs_walk_stops_at_its_first_frame_header() -> None:
+    """Whatever follows the first SOF is never read: junk, a second larger SOF, a missing scan."""
+    for tail in (b"\x00junk" * 100, b"no marker here", sof0(4000, 3000), b"\xff\xff\xff\xff" * 8000):
+        h = probe(b"\xff\xd8" + sof0() + tail)
+        assert (h.width, h.height) == (40, 30)
+    real = encoded(pattern(40, 30), "JPEG")
+    at = real.index(b"\xff\xc0")
+    n = struct.unpack_from(">H", real, at + 2)[0] + 2
+    assert probe(real[:at + n] + b"\xff\xff junk" + bytes(100)) == Header("jpeg", 40, 30)
+
+
+def test_a_jpegs_second_frame_header_is_checked_against_pillow_in_the_pool() -> None:
+    """The probe reads the first SOF; Pillow takes the last one it meets at open. A JPEG whose second SOF is larger
+    passes the probe with the first's size and fails the pool's size check before any decode, as a 400."""
+    real = encoded(pattern(40, 30), "JPEG")
+    at = real.index(b"\xff\xc0")
+    end = at + struct.unpack_from(">H", real, at + 2)[0] + 2
+    data = real[:end] + sof0(4000, 3000)[:-3] + real[end - 3:end] + real[end:]
+    h = probe(data)
+    assert (h.width, h.height) == (40, 30)
+    assert Image.open(io.BytesIO(data)).size == (4000, 3000)
+    with pytest.raises(ProbeError, match="the decoded image is 4000x3000, but its header says 40x30"):
+        FAMILY.pixels(data, h, FAMILY.size(h))
+
+
+def riff(*chunks: tuple[bytes, bytes]) -> bytes:
+    """A RIFF WebP of (fourcc, payload) chunks, each padded to even length."""
+    body = b"WEBP" + b"".join(c + struct.pack("<I", len(d)) + d + b"\0" * (len(d) & 1) for c, d in chunks)
+    return b"RIFF" + struct.pack("<I", len(body)) + body
+
+
+def riff_chunks(data: bytes) -> list[tuple[bytes, bytes]]:
+    i, out = 12, []
+    while i < len(data):
+        n = struct.unpack_from("<I", data, i + 4)[0]
+        out.append((data[i:i + 4], data[i + 8:i + 8 + n]))
+        i += 8 + n + (n & 1)
+    return out
+
+
+def test_a_webp_reads_its_first_chunk_which_is_vp8x_vp8_or_vp8l() -> None:
+    """VP8X (the canvas), VP8 and VP8L first are served with Pillow's size."""
+    img = pattern(40, 30)
+    for data, first in ((encoded(img, "WEBP", exif=exif(1)[6:]), b"VP8X"), (encoded(img, "WEBP"), b"VP8 "),
+                        (encoded(img, "WEBP", lossless=True), b"VP8L")):
+        assert riff_chunks(data)[0][0] == first
+        assert probe(data) == Header("webp", 40, 30)
+        assert Image.open(io.BytesIO(data)).size == (40, 30)
+
+
+def test_a_webp_whose_first_chunk_is_another_kind_is_refused_as_pillow_refuses_it() -> None:
+    """EXIF, JUNK or any other chunk before the VP8: a ProbeError, and Pillow cannot identify the file either."""
+    from PIL import UnidentifiedImageError
+
+    vp8 = riff_chunks(encoded(pattern(40, 30), "WEBP"))[0]
+    for kind in (b"EXIF", b"JUNK", b"ICCP", b"ALPH"):
+        data = riff((kind, b"abcd"), vp8)
+        with pytest.raises(ProbeError, match="broken WebP header: no VP8, VP8L or VP8X chunk first"):
+            probe(data)
+        with pytest.raises(UnidentifiedImageError):
+            Image.open(io.BytesIO(data))
+
+
+def test_a_webp_with_a_vp8_chunk_first_is_sized_by_it_not_by_a_later_vp8x() -> None:
+    """The first chunk decides, as in Pillow: a later VP8X canvas does not override the VP8 frame's size."""
+    vp8 = riff_chunks(encoded(pattern(40, 30), "WEBP"))[0]
+    canvas = struct.pack("<I", 0) + (4000 - 1).to_bytes(3, "little") + (3000 - 1).to_bytes(3, "little")
+    data = riff(vp8, (b"VP8X", canvas))
+    assert probe(data) == Header("webp", 40, 30)
+    assert Image.open(io.BytesIO(data)).size == (40, 30)
 
 
 def test_smart_resize_matches_transformers() -> None:
@@ -184,6 +350,8 @@ def test_pool_pixels_are_hfs_pixel_values(name, data) -> None:
     header = probe(data)
     size = FAMILY.size(header)
     px = FAMILY.pixels(data, header, size)
+    if tuple(px.shape[1:]) != (size.height, size.width):  # Pillow turned the image: the decode decides
+        size = transposed(size)
     assert px.dtype == torch.uint8 and tuple(px.shape) == (3, size.height, size.width)
     assert np.array_equal(patches(px), hf_pixel_values(data, FAMILY, model_dir))
 
@@ -236,6 +404,29 @@ def test_data_uris() -> None:
         from_data_uri(url, 10)
     with pytest.raises(FetchError):
         image_url({"detail": "auto"})
+
+
+def test_a_data_uri_holds_at_most_1024_characters_before_its_comma() -> None:
+    """The head (`data:image/png;base64` and any parameters) is bounded before anything is split or decoded: exactly
+    1,024 characters are served, 1,025 refused with the text, a 27 MB run of ';' too; no ',' keeps its own text."""
+    import base64
+
+    data = encoded(pattern(8, 8), "PNG")
+    body = base64.b64encode(data).decode()
+    head = "data:image/png;base64"
+    ok = head + ";" * (1024 - len(head)) + "," + body
+    assert ok.index(",") == 1024 and from_data_uri(ok, 1 << 20) == data
+    text = "malformed data URI: more than 1024 characters before its ','"
+    for bad in (head + ";" * (1025 - len(head)) + "," + body, head + ";" * (27 << 20) + "," + body):
+        with pytest.raises(FetchError) as err:
+            from_data_uri(bad, 1 << 20)
+        assert str(err.value) == text
+    with pytest.raises(FetchError) as err:
+        from_data_uri(head + body, 1 << 20)
+    assert str(err.value) == "malformed data URI: no ','"
+    with pytest.raises(FetchError) as err:
+        from_data_uri("data:image/png;base64" + ";" * (27 << 20), 1 << 20)
+    assert str(err.value) == "malformed data URI: no ','"
 
 
 def test_http_fetch_with_limits() -> None:
@@ -531,9 +722,8 @@ def test_pool_worker_round_trip(tmp_path) -> None:
             client.start()
             try:
                 job = Job(jid=0, fmt=header.format, width=header.width, height=header.height,
-                          orientation=header.orientation, out_h=size.height,
-                          out_w=size.width, grid_t=1, grid_h=size.grid[1], grid_w=size.grid[2], tokens=size.tokens,
-                          offset=8192)
+                          out_h=size.height, out_w=size.width, grid_t=1, grid_h=size.grid[1], grid_w=size.grid[2],
+                          tokens=size.tokens, offset=8192)
                 ok = await asyncio.wait_for(client.submit(job, data), 60)
                 bad = await asyncio.wait_for(client.submit(Job(**{**{f: getattr(job, f) for f in job.__struct_fields__},
                                                                   "fmt": "png"}), b"garbage"), 60)
@@ -544,8 +734,10 @@ def test_pool_worker_round_trip(tmp_path) -> None:
         ok, bad = asyncio.run(main())
         assert not ok.error and ok.decode_ns > 0 and bad.error
         view = px_arena.map_readonly(path)
-        got = np.frombuffer(view.buf, np.uint8, 3 * size.height * size.width, 8192).reshape(3, size.height,
-                                                                                           size.width).copy()
+        turned = transposed(size)  # EXIF 6 on a non-square image: the pool's pixels are the target turned
+        assert ok.transposed
+        got = np.frombuffer(view.buf, np.uint8, 3 * turned.height * turned.width, 8192).reshape(
+            3, turned.height, turned.width).copy()
         assert np.array_equal(got, FAMILY.pixels(data, header, size).numpy())
         view.close()
     finally:
@@ -588,7 +780,7 @@ def test_pool_client_never_loses_a_reply() -> None:
     workers = [threading.Thread(target=echo, args=(i,), daemon=True) for i in range(2)]
     for t in workers:
         t.start()
-    job = Job(jid=0, fmt="jpeg", width=1, height=1, orientation=1, out_h=1, out_w=1, grid_t=1, grid_h=1,
+    job = Job(jid=0, fmt="jpeg", width=1, height=1, out_h=1, out_w=1, grid_t=1, grid_h=1,
               grid_w=1, tokens=1, offset=0)
 
     async def main() -> int:
@@ -717,6 +909,36 @@ def frontend_inputs(**kw):
     im.pool = RecordingPool()
     im.start()
     return im
+
+
+def test_prepare_yields_to_the_event_loop_between_one_images_probe_and_the_next(monkeypatch) -> None:
+    """Each image's probe after the first runs in a turn of the loop of its own: a callback scheduled during one probe
+    runs before the next image's probe, and no probe runs before the first one's callback."""
+    from llm_mini_infer.api import images as images_mod
+
+    real = images_mod.probe
+    events: list[str] = []
+    loop_ref: list = []
+
+    def recording(data):
+        k = sum(e.startswith("probe") for e in events)
+        events.append(f"probe {k}")
+        loop_ref[0].call_soon(events.append, f"callback {k}")
+        return real(data)
+
+    monkeypatch.setattr(images_mod, "probe", recording)
+
+    async def main() -> None:
+        loop_ref.append(asyncio.get_running_loop())
+        im = frontend_inputs()
+        urls = [uri(encoded(pattern(40 + 8 * k, 30), "JPEG")) for k in range(3)]
+        prep = await im.prepare(urls)
+        assert len(prep.images) == 3 and len(im.pool.jobs) == 3
+        im.discard(prep)
+
+    asyncio.run(main())
+    assert events[0] == "probe 0"
+    assert events.index("callback 0") < events.index("probe 1") and events.index("callback 1") < events.index("probe 2")
 
 
 def test_a_requests_decode_budget_is_vllms() -> None:
@@ -866,7 +1088,7 @@ def test_a_gif_frame_larger_than_its_screen_fails_before_decoding(monkeypatch) -
         decode_rgb(gif, header)
 
 
-# -- EXIF orientation as Pillow loads it ------------------------------------------------------------------------------
+# -- EXIF orientation: the pool's decode applies Pillow's, the probe reads the stored size only -----------------------
 
 # Struct codes of the TIFF types (RATIONAL and SRATIONAL: two LONGs)
 TIFF_CODES = {1: "B", 2: "s", 3: "H", 4: "I", 5: "II", 6: "b", 7: "B", 8: "h", 9: "i", 10: "ii", 11: "f", 12: "d",
@@ -893,21 +1115,6 @@ def orientation_entry(typ: int, values: list, big: bool = False, extra: int = 0)
     return ifd0([(0x0112, typ, len(values), struct.pack(e + "I", 26 + extra))], big, bytes(extra) + data)
 
 
-def pillow_orientation(data: bytes) -> tuple[int, bool]:
-    """The orientation `exif_transpose` applies (its lookup on what Pillow reads: 2..8, else 1), and whether it raises
-    after reading one (the image is then served as stored)."""
-    try:
-        v = Image.open(io.BytesIO(data)).getexif().get(274)
-    except Exception:
-        v = None
-    o = int(v) if v in {2, 3, 4, 5, 6, 7, 8} else 1
-    try:
-        ImageOps.exif_transpose(Image.open(io.BytesIO(data)))
-    except Exception:
-        return o, o != 1
-    return o, False
-
-
 ORIENTATIONS = [  # (Orientation entry, the orientation Pillow applies)
     (orientation_entry(3, [6, 6]), 6), (orientation_entry(3, [8, 1, 1]), 8), (orientation_entry(4, [5, 1]), 5),
     (orientation_entry(8, [6]), 6), (orientation_entry(9, [7]), 7), (orientation_entry(13, [6]), 6),
@@ -926,121 +1133,60 @@ ORIENTATIONS = [  # (Orientation entry, the orientation Pillow applies)
 ]
 
 
+def vllm_pixels(data: bytes) -> np.ndarray:
+    """The image as vLLM reads it: Pillow open, `exif_transpose` with errors suppressed, RGB; uint8 [3, H, W]."""
+    im = Image.open(io.BytesIO(data))
+    with contextlib.suppress(Exception):
+        im = ImageOps.exif_transpose(im)
+    return np.asarray(im.convert("RGB")).transpose(2, 0, 1)
+
+
+def pillow_pixels(data: bytes) -> torch.Tensor:
+    """The image as vLLM decodes it (`normalize_image`: `exif_transpose`, the image as stored when it raises), RGB."""
+    return torch.from_numpy(vllm_pixels(data).copy())
+
+
+def pool_pixels(data: bytes) -> torch.Tensor:
+    """The pool's decode of an image, from the probe's header."""
+    from llm_mini_infer.vision.family import decode_rgb
+
+    return decode_rgb(data, probe(data))
+
+
+@pytest.mark.parametrize(("name", "data"), variants(), ids=[v[0] for v in variants()])
+def test_the_pool_orients_as_pillow_does(name, data) -> None:
+    """The pool's decode (`family.decode_rgb`) is Pillow's `exif_transpose` (errors suppressed, as vLLM): the same
+    pixels, so the same size, for every format and EXIF or XMP orientation; the probe's stored size stays the
+    unturned one. The family's pixels are the target or its transpose, by the decode."""
+    got = pool_pixels(data)
+    assert torch.equal(got, pillow_pixels(data))
+    h = probe(data)
+    stored = Image.open(io.BytesIO(data)).size
+    assert (h.width, h.height) == stored
+    turned = tuple(got.shape[1:]) == (stored[0], stored[1]) and stored[0] != stored[1]
+    assert turned == name.endswith(("exif5", "exif6", "exif7", "exif8", "xmp5", "xmp6", "xmp7", "xmp8"))
+    size = FAMILY.size(h)
+    out = FAMILY.pixels(data, h, size)
+    assert tuple(out.shape[1:]) == ((size.width, size.height) if turned else (size.height, size.width))
+
+
 @pytest.mark.parametrize(("tiff", "want"), ORIENTATIONS, ids=[str(i) for i in range(len(ORIENTATIONS))])
-def test_the_probe_reads_the_orientation_pillow_applies(tiff, want) -> None:
+def test_the_pool_orients_as_pillow_does_for_any_orientation_entry(tiff, want) -> None:
     """Any count (its first value), any numeric type (signed, IFD, float, rational: `exif_transpose` compares numbers),
-    in JPEG, PNG and WebP. Once a count other than 1 or a type other than SHORT and LONG counted as 1."""
+    in JPEG, PNG and WebP: the pool's pixels are Pillow's. A turned image (`want` 5..8) is 20 wide and 40 high."""
     img = pattern(40, 20)
     for fmt in ("JPEG", "PNG", "WEBP"):
         data = encoded(img, fmt, exif=b"Exif\x00\x00" + tiff if fmt == "JPEG" else tiff)
-        assert pillow_orientation(data)[0] == want, fmt
-        assert probe(data).orientation == want, fmt
-
-
-def random_ifd0(rng: random.Random) -> tuple[bytes, bool]:
-    """IFD0 with an Orientation entry among 0-3 others, of random types, counts, offsets and trailers (with the
-    orientation's values encoded in its type); and whether Pillow stops reading IFD0 at an earlier entry whose data
-    lies past the block's end (the probe stops there too)."""
-    from PIL import TiffImagePlugin
-
-    big = rng.random() < 0.5
-    e = ">" if big else "<"
-    tags = [0x0112] + [rng.choice([0x010F, 0x0110, 0x0131, 0x8769, 0x8825, 0x0132, 0x011A, 0x9286,
-                                   rng.randint(0, 0xFFFF)]) for _ in range(rng.randint(0, 3))]
-    rng.shuffle(tags)
-    head = 10 + 12 * len(tags) + 4
-    trailer = bytes(rng.randint(0, 24))
-    entries = []
-    for tag in tags:
-        if tag == 0x0112:
-            typ = rng.choice([3, 3, 4, 8, 9, 13, 6, 16, 5, 10, 11, 12, 1, 2, 7, 99])
-            count = rng.choice([1, 1, 1, 2, 3, 4, 0]) if typ != 2 else rng.choice([1, 2])
-            code = TIFF_CODES.get(typ, "I")
-            vals = [rng.choice([6, 8, 5, 7, 3, 2, 1, 0, 9, 100]) for _ in range(count * len(code))]
-            if typ in (5, 10) and vals:
-                vals[1] = rng.choice([1, 1, 2, 0])
-                vals[0] *= vals[1] or 1
-            if typ == 10 and rng.random() < 0.5:
-                vals[:2] = [-v for v in vals[:2]]
-            data = b"6" * count if typ == 2 else struct.pack(e + code[0] * len(vals), *vals) if typ != 99 else b"\6"
-            if len(data) <= 4:
-                field = data.ljust(4, b"\0")
-            else:
-                at = rng.choice([head + len(trailer), head + len(trailer), rng.randint(0, 200)])
-                if at == head + len(trailer):
-                    trailer += data
-                field = struct.pack(e + "I", at)
-        else:
-            typ = rng.choice([3, 3, 4, 1, 2, 5, 7, 9, 10, 11, 12, 13, 0, 99])
-            count = rng.choice([1, 1, 1, 0, 2, 4, 100, 0xFFFFFFFF]) if rng.random() < 0.5 else 1
-            field = struct.pack(e + "I", rng.choice([8, 26, 40, 200, rng.randint(0, 0xFFFFFFFF)]))
-        entries.append((tag, typ, count, field))
-    tiff = ifd0(entries, big, trailer)
-    # Pillow's loop (TiffImagePlugin.ImageFileDirectory_v2.load) up to the orientation: an earlier tag's data past the
-    # block's end stops it
-    stored: set[int] = set()
-    total, stops_early = 0, False
-    for tag, typ, count, field in entries:
-        if tag in stored or typ not in TiffImagePlugin.ImageFileDirectory_v2._load_dispatch:
-            continue
-        size = count * TiffImagePlugin.ImageFileDirectory_v2._load_dispatch[typ][0]
-        if size > 4:
-            total += size
-            if total > len(tiff):
-                continue
-            if struct.unpack(e + "I", field)[0] + size > len(tiff):
-                stops_early = tag != 0x0112
-                break
-        if tag == 0x0112 and size:
-            break
-        if size:
-            stored.add(tag)
-    return tiff, stops_early
-
-
-def entries_of(tiff: bytes) -> list[tuple[int, int, int]]:
-    """IFD0's (tag, type, count) entries of an `ifd0` block."""
-    e = "<" if tiff[:2] == b"II" else ">"
-    return [struct.unpack_from(e + "HHI", tiff, 10 + 12 * k) for k in range(struct.unpack_from(e + "H", tiff, 8)[0])]
-
-
-def test_the_probe_agrees_with_pillow_on_random_ifd0s() -> None:
-    """Random IFD0s in JPEG, PNG and WebP: the probe's orientation is the one `exif_transpose` applies, Pillow stopping
-    at an earlier tag's data past the block's end included, but for one known difference (rare: malformed EXIF):
-    `exif_transpose` raising after it read an orientation (it fails rewriting the EXIF; the image is served as stored,
-    the probe orients it)."""
-    import warnings
-
-    rng = random.Random(1)
-    img = pattern(40, 20)
-    seen = {"agree": 0, "count": 0, "type": 0, "stops early": 0, "raises": 0}
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        for _ in range(1500):
-            fmt = rng.choice(["JPEG", "PNG", "WEBP"])
-            tiff, stops_early = random_ifd0(rng)
-            try:
-                data = encoded(img, fmt, exif=b"Exif\x00\x00" + tiff if fmt == "JPEG" else tiff)
-            except Exception:
-                continue
-            want, raises = pillow_orientation(data)
-            if raises:
-                seen["raises"] += 1
-                continue
-            assert probe(data).orientation == want, (fmt, tiff.hex())
-            seen["agree"] += 1
-            seen["stops early"] += stops_early
-            if want != 1:
-                n, typ = next((c, t) for tag, t, c in entries_of(tiff) if tag == 0x0112 and t != 99 and c)
-                seen["count"] += n != 1
-                seen["type"] += typ not in (3, 4)
-    assert seen["agree"] > 1000 and seen["count"] > 30 and seen["type"] > 30 and seen["stops early"] > 50, seen
+        got = pool_pixels(data)
+        assert torch.equal(got, pillow_pixels(data)), fmt
+        if want in (1, 2, 3, 4):
+            assert tuple(got.shape) == (3, 20, 40), fmt
 
 
 def test_the_pool_serves_malformed_exif_as_stored_and_decodes_the_probed_format_only() -> None:
     """EXIF that `exif_transpose` cannot read (not TIFF, a broken header): the image as stored, not a failed
-    request. A disagreement with the probe still fails it: `exif_transpose` raising after it read orientation 6, which
-    the probe applies. Pillow opens the probed format only."""
+    request. `exif_transpose` raising after it read orientation 6 serves the image as stored too (the decode decides),
+    as vLLM's reading does. Pillow opens the probed format only."""
     from PIL import UnidentifiedImageError
 
     from llm_mini_infer.vision.family import decode_rgb
@@ -1053,16 +1199,16 @@ def test_the_pool_serves_malformed_exif_as_stored_and_decodes_the_probed_format_
             if fmt != "JPEG":  # a JPEG's DPI read at open swallows the error: exif_transpose then finds no EXIF
                 with pytest.raises(Exception):  # noqa: B017 - Pillow's errors vary (SyntaxError, struct.error)
                     ImageOps.exif_transpose(Image.open(io.BytesIO(data)))
-            assert pillow_orientation(data) == (1, False)
-            h = probe(data)
-            assert h.orientation == 1 and tuple(decode_rgb(data, h).shape) == (3, 20, 40), (fmt, junk)
-        data = encoded(img, fmt, exif=prefix + orientation_entry(3, [6, 6]))  # once orientation 1 in the probe
-        assert tuple(decode_rgb(data, probe(data)).shape) == (3, 40, 20)
+            assert tuple(pool_pixels(data).shape) == (3, 20, 40), (fmt, junk)
+        data = encoded(img, fmt, exif=prefix + orientation_entry(3, [6, 6]))  # a count of 2, still orientation 6
+        assert tuple(pool_pixels(data).shape) == (3, 40, 20)
         raises = bytes.fromhex("4d4d002a000000080002010f000a00000004000000080112000300000001000600060000000000")
         data = encoded(img, fmt, exif=prefix + raises + bytes(48))
-        assert pillow_orientation(data) == (6, True) and probe(data).orientation == 6
-        with pytest.raises(ProbeError, match="is 40x20, but its header says 20x40"):
-            decode_rgb(data, probe(data))
+        with pytest.raises(Exception):  # noqa: B017 - it fails rewriting the EXIF after it read orientation 6
+            ImageOps.exif_transpose(Image.open(io.BytesIO(data)))
+        # the decode decides: served as Pillow orients it, which is as stored (vLLM's reading), not a 400
+        assert tuple(pool_pixels(data).shape) == (3, 20, 40)
+        assert np.array_equal(pool_pixels(data).numpy(), vllm_pixels(data))
     gif = encoded(img, "GIF")
     with pytest.raises(UnidentifiedImageError):  # a GIF under a PNG header is not decoded as a GIF
         decode_rgb(gif, Header("png", 40, 20))
@@ -1074,27 +1220,15 @@ def xmp_packet(o: int) -> bytes:
             f"</rdf:RDF></x:xmpmeta>").encode()
 
 
-def pillow_pixels(data: bytes) -> torch.Tensor:
-    """The image as vLLM decodes it (`normalize_image`: `exif_transpose`, the image as stored when it raises), RGB."""
-    im = Image.open(io.BytesIO(data))
-    with contextlib.suppress(Exception):
-        im = ImageOps.exif_transpose(im)
-    return torch.from_numpy(np.asarray(im.convert("RGB")).copy()).permute(2, 0, 1)
+def agrees_with_pillow(data: bytes) -> bool:
+    """Whether the pool's decode turned the image (a 40 x 20 one: 20 x 40 pixels), after checking its pixels are
+    Pillow's."""
+    got = pool_pixels(data)
+    assert torch.equal(got, pillow_pixels(data))
+    return tuple(got.shape) == (3, 40, 20)
 
 
-def agrees_with_pillow(data: bytes) -> int:
-    """The probe's orientation, checked against Pillow's: the orientation it reads, the oriented size, the pixels."""
-    from llm_mini_infer.vision.family import decode_rgb
-
-    h = probe(data)
-    want = pillow_pixels(data)
-    assert h.orientation == pillow_orientation(data)[0]
-    assert h.oriented == (want.shape[2], want.shape[1])
-    assert torch.equal(decode_rgb(data, h), want)
-    return h.orientation
-
-
-def test_a_doubled_exif_prefix_and_junk_exif_beside_xmp_are_read_as_pillow_reads_them() -> None:
+def test_a_doubled_exif_prefix_and_junk_exif_beside_xmp_are_decoded_as_pillow_decodes_them() -> None:
     """#23's two cases, at orientations 2..8: an EXIF block behind two `Exif\\0\\0` prefixes, which Pillow strips
     (JPEG APP1, PNG eXIf, WebP EXIF); and EXIF Pillow cannot parse beside an XMP orientation (JPEG and PNG), where
     getexif raises before it reads the XMP and exif_transpose leaves the image as stored, as vLLM serves it."""
@@ -1106,22 +1240,22 @@ def test_a_doubled_exif_prefix_and_junk_exif_beside_xmp_are_read_as_pillow_reads
                    encoded(img, "WEBP", exif=b"Exif\x00\x00" * 3 + tiff, lossless=True)]  # and the WebP chunk
         for data in doubled:
             assert Image.open(io.BytesIO(data)).info["exif"] == b"Exif\x00\x00" * 2 + tiff
-            assert agrees_with_pillow(data) == o
+            assert agrees_with_pillow(data) == (o >= 5)
         info = PngImagePlugin.PngInfo()
         info.add_itxt("XML:com.adobe.xmp", xmp_packet(o).decode())
         junk = [encoded(img, "JPEG", exif=b"Exif\x00\x00not a tiff header", xmp=xmp_packet(o)),
                 encoded(img, "PNG", exif=b"not a tiff header", pnginfo=info)]
         for data in junk:
-            assert agrees_with_pillow(data) == 1
+            assert not agrees_with_pillow(data)
 
 
 def test_exif_without_an_orientation_falls_back_to_xmp_and_exif_pillow_cannot_parse_is_1() -> None:
-    """An EXIF block beside an XMP orientation of 6, in JPEG, PNG and WebP, read as Pillow's getexif reads it: IFD0's
-    orientation when it has one (a TIFF header of either byte order of 42, or a big-endian 43, which Pillow reads as
-    classic TIFF); the XMP's when Pillow finds none (the block empty once its prefixes are stripped, no Orientation
-    tag, IFD0 or the Orientation's data past the block's end, an entry cut short); 1 when Pillow cannot parse it
-    (shorter than a TIFF header, another byte order, another magic number, a little-endian BigTIFF, a third prefix):
-    getexif raises before it reads the XMP, and the image is served as stored."""
+    """An EXIF block beside an XMP orientation of 6, in JPEG, PNG and WebP, decoded as Pillow's getexif reads it:
+    IFD0's orientation when it has one (a TIFF header of either byte order of 42, or a big-endian 43, which Pillow
+    reads as classic TIFF); the XMP's when Pillow finds none (the block empty once its prefixes are stripped, no
+    Orientation tag, IFD0 or the Orientation's data past the block's end, an entry cut short); the image as stored
+    when Pillow cannot parse it (shorter than a TIFF header, another byte order, another magic number, a little-endian
+    BigTIFF, a third prefix): getexif raises before it reads the XMP."""
     p, o3, o3be = b"Exif\x00\x00", orientation_entry(3, [3]), orientation_entry(3, [3], big=True)
     cases = [(p + o3, 3), (p + o3[:2] + b"\x00\x2a" + o3[4:], 3), (p + o3be[:2] + b"\x2a\x00" + o3be[4:], 3),
              (p + o3be[:2] + b"\x00\x2b" + o3be[4:], 3),
@@ -1135,14 +1269,14 @@ def test_exif_without_an_orientation_falls_back_to_xmp_and_exif_pillow_cannot_pa
     for block, want in cases:
         for data in (encoded(img, "JPEG", exif=block, xmp=xmp_packet(6)), encoded(img, "PNG", exif=block, pnginfo=info),
                      encoded(img, "WEBP", exif=p + block, xmp=xmp_packet(6), lossless=True)):
-            assert agrees_with_pillow(data) == want, (data[:4], block)
+            assert agrees_with_pillow(data) == (want >= 5), (data[:4], block)
 
 
 def test_ifd0_ends_at_the_first_entry_whose_data_lies_past_the_block_as_in_pillow() -> None:
     """Pillow stops reading IFD0 at the first entry whose data lies past the block's end, whatever its tag: an
-    Orientation after it is not read, so an XMP orientation counts, else 1. Data past Pillow's running bound of the
-    block's length is skipped instead, and the Orientation after it is read. JPEG, PNG and WebP at orientations 2 to 8,
-    against Pillow's orientation, size and pixels."""
+    Orientation after it is not read, so an XMP orientation counts, else the image stays as stored. Data past Pillow's
+    running bound of the block's length is skipped instead, and the Orientation after it is read. JPEG, PNG and WebP at
+    orientations 2 to 8, the pool's pixels against Pillow's."""
     img = pattern(40, 20)
     p = b"Exif\x00\x00"
     for o in range(2, 9):
@@ -1156,7 +1290,7 @@ def test_ifd0_ends_at_the_first_entry_whose_data_lies_past_the_block_as_in_pillo
             for data in (encoded(img, "JPEG", exif=p + block, **extra),
                          encoded(img, "PNG", exif=block, **({} if xmp is None else {"pnginfo": info})),
                          encoded(img, "WEBP", exif=p + block, lossless=True, **extra)):
-                assert agrees_with_pillow(data) == want, (o, xmp, data[:4])
+                assert agrees_with_pillow(data) == (want >= 5), (o, xmp, data[:4])
 
 
 # The JPEG cases' file digests (the first 16 hex digits) and the pixels the decoder before Pillow gave them
@@ -1591,3 +1725,279 @@ def test_a_transparent_png_reaches_the_pool_composited(tmp_path) -> None:
             proc.join(10)
         px_arena.remove(arena)
         shutil.rmtree(ipc, ignore_errors=True)
+
+
+# -- the decode decides the orientation: the worker's check, the digests, the sizing-only path -------------------------
+
+
+def gemma_config_dir(tmp_path: Path) -> Path:
+    """A Gemma 4 checkpoint's config.json alone (images of at most 70 soft tokens)."""
+    gemma = tmp_path / "gemma"
+    gemma.mkdir()
+    (gemma / "config.json").write_text(json.dumps({"model_type": "gemma4", "vision_config": {
+        "patch_size": 16, "pooling_kernel_size": 3, "default_output_length": 70}}))
+    return gemma
+
+
+def data_uri(data: bytes) -> str:
+    import base64
+
+    return "data:image/jpeg;base64," + base64.b64encode(data).decode()
+
+
+def image_inputs(family, pool_dir: str, **kw):
+    from llm_mini_infer.api.images import ImageInputs
+
+    return ImageInputs(family, index=0, num_frontends=1, arena_bytes=1 << 22, pool_dir=pool_dir, workers=1,
+                       max_bytes=1 << 20, fetch_timeout_s=1.0, max_per_request=2, **kw)
+
+
+def test_oriented_is_the_target_or_its_transpose_and_refuses_an_asymmetric_family() -> None:
+    """`pool.oriented` gives the job's target for pixels of that shape, its transpose for pixels turned by a quarter,
+    and raises `Asymmetric` (a ValueError, so a 400) when the family sizes the turned image otherwise than the turned
+    target: the frontend sized the span and the arena range from the target as stored, which holds only then. A shape
+    that is neither is a ValueError too."""
+    from llm_mini_infer.vision.pool import Asymmetric, oriented
+
+    header = Header("jpeg", 400, 225)
+    size = GEMMA70.size(header)
+    assert oriented(GEMMA70, header, size, (size.height, size.width)) is size
+    assert oriented(GEMMA70, header, size, (size.width, size.height)) == transposed(size)
+    bad = lopsided(GEMMA70)  # the portrait image has a token fewer than the transpose of its landscape one
+    assert bad.size(Header("jpeg", 225, 400)) != transposed(bad.size(header))
+    assert oriented(bad, header, bad.size(header), (size.height, size.width)) == bad.size(header)  # unturned: no check
+    with pytest.raises(Asymmetric, match=r"^the image family sizes the turned image"):
+        oriented(bad, header, bad.size(header), (size.width, size.height))
+    assert issubclass(Asymmetric, ValueError)
+    with pytest.raises(ValueError, match="the target is"):
+        oriented(GEMMA70, header, size, (size.height + 1, size.width))
+
+
+def test_oriented_checks_a_square_target_of_a_non_square_image_and_returns_the_target_itself() -> None:
+    """A square target of a stored image that is not square (the pixels look the same turned or not) is checked like a
+    turned image: a lopsided family raises `Asymmetric` whatever the pixels' shape, a symmetric one (Gemma: 400 x 401
+    is a 384 x 384 target) returns the target itself (`is size`, not transposed). A square stored image is not
+    checked, and nor is a non-square target of unturned pixels."""
+    from llm_mini_infer.vision.pool import Asymmetric, oriented
+
+    header = Header("jpeg", 400, 401)  # 400 wide, 401 high
+    size = GEMMA70.size(header)
+    assert (size.height, size.width) == (384, 384)
+    assert oriented(GEMMA70, header, size, (384, 384)) is size
+    bad = lopsided(GEMMA70)  # 400 x 401 has a token fewer than the 401 x 400 it may be turned from
+    target = bad.size(header)
+    assert (target.height, target.width) == (384, 384) and target != transposed(bad.size(Header("jpeg", 401, 400)))
+    for shape in ((384, 384), (target.height, target.width)):
+        with pytest.raises(Asymmetric, match=r"^the image family sizes the turned image"):
+            oriented(bad, header, target, shape)
+    square = Header("jpeg", 400, 400)
+    sq_size = bad.size(square)
+    assert oriented(bad, square, sq_size, (sq_size.height, sq_size.width)) is sq_size  # a square stored image: no check
+
+
+def test_an_asymmetric_family_fails_the_turned_image_before_anything_is_written(tmp_path) -> None:
+    """A worker whose family is not symmetric under a transpose answers an EXIF-turned image with an error starting
+    "Asymmetric:" and leaves its arena range untouched (a sentinel stays); through `ImageInputs.wait` that is an
+    ApiError 400 "image: Asymmetric: ...", never another exception type; an unturned image of the same worker is served
+    and the worker stays up. Both images are 400 x 225, a non-square image with a non-square target, so neither falls
+    in the square-target case that `oriented` checks too (its own test)."""
+    import shutil
+
+    from llm_mini_infer.api.protocol import ApiError
+    from llm_mini_infer.engine import ipc as engine_ipc
+
+    ipc = engine_ipc.ipc_dir()
+    arena = str(tmp_path / "arena")
+    px_arena.create(arena, 1 << 22)
+    bad = lopsided(GEMMA70)
+    turned = encoded(pattern(400, 225, 3), "JPEG", exif=exif(6))
+    plain = encoded(pattern(400, 225, 4), "JPEG")
+    mem = px_arena.map_writable(arena)
+    np.frombuffer(mem.buf, np.uint8)[:] = 0xAB  # the sentinel: nothing of the failed image may be written over it
+    proc = view = None
+    try:
+        proc, ready = spawn_pool_worker(gemma_config_dir(tmp_path), None, None, ipc, arena, lopsided=True)
+        assert ready, f"the worker exited before it was ready (exit code {proc.exitcode})"
+        h = probe(turned)
+        size = bad.size(h)
+        n = 3 * size.height * size.width
+        failed, ok = run_jobs(ipc, [(turned, h, size, 8192), (plain, probe(plain), bad.size(probe(plain)), 1 << 20)])
+        assert failed.error.startswith("Asymmetric:") and not failed.transposed, failed
+        assert not ok.error
+        view = np.frombuffer(mem.buf, np.uint8)
+        assert (view[8192:8192 + 2 * n] == 0xAB).all()  # the range, and room for the turned pixels, untouched
+        assert not (view[1 << 20:(1 << 20) + n] == 0xAB).all()  # the control image was written
+
+        async def main() -> None:
+            images = image_inputs(bad, ipc)
+            images.start()
+            try:
+                prep = await images.prepare([data_uri(turned)])
+                with pytest.raises(ApiError) as err:
+                    await asyncio.wait_for(images.wait(prep), 60)
+                assert err.value.status == 400 and err.value.message.startswith("image: Asymmetric:"), err.value
+                images.discard(prep)
+                prep = await images.prepare([data_uri(plain)])
+                await asyncio.wait_for(images.wait(prep), 60)
+                images.discard(prep)
+            finally:
+                await images.close()
+
+        asyncio.run(main())
+        assert proc.is_alive()
+    finally:
+        del view
+        mem.close()
+        if proc is not None:
+            proc.kill()
+            proc.join(10)
+        px_arena.remove(arena)
+        shutil.rmtree(ipc, ignore_errors=True)
+
+
+def test_the_frontend_hashes_the_image_as_oriented_once_the_pool_answers(tmp_path) -> None:
+    """`Done.transposed` says whether Pillow turned the image (EXIF 6 on a non-square one); the frontend hashes the
+    bytes while the pool decodes (inline under `OFF_LOOP_BYTES`, on the fetcher's thread from it) and finishes the
+    digest with the oriented size once the pool answered: `image_digest(bytes, the oriented size)`, for an unrotated
+    image the old formula (BLAKE3 of the bytes and the packed height and width), so span keys are unchanged. Before the
+    wait an image is as stored, with no digest; the worker never loads blake3 (it would slow its decode)."""
+    import inspect
+    import shutil
+
+    import blake3
+
+    from llm_mini_infer.engine import ipc as engine_ipc
+
+    ipc = engine_ipc.ipc_dir()
+    arena = str(tmp_path / "arena")
+    px_arena.create(arena, 1 << 22)
+    plain = encoded(pattern(400, 225, 5), "JPEG")
+    turned = encoded(pattern(400, 225, 6), "JPEG", exif=exif(6))
+    proc = None
+    try:
+        proc, ready = spawn_pool_worker(gemma_config_dir(tmp_path), None, None, ipc, arena)
+        assert ready, f"the worker exited before it was ready (exit code {proc.exitcode})"
+        jobs = [(d, probe(d), GEMMA70.size(probe(d)), off) for d, off in ((plain, 8192), (turned, 1 << 20))]
+        a, b = run_jobs(ipc, jobs)
+        size = jobs[0][2]
+        h = blake3.blake3(plain)
+        h.update(struct.pack("<II", size.height, size.width))  # the frontend's old formula
+        old = h.digest()
+        assert old == image_digest(plain, size) and not a.transposed and b.transposed
+        stored = jobs[1][2]
+        assert (stored.height, stored.width) == (size.height, size.width) and stored.width > stored.height
+        from llm_mini_infer.vision import pool as vision_pool
+
+        src = inspect.getsource(vision_pool)
+        assert "import blake3" not in src and "image_digest" not in src
+        big = encoded(Image.fromarray(np.random.default_rng(3).integers(0, 255, (400, 400, 3), np.uint8)), "PNG")
+        assert len(big) >= OFF_LOOP_BYTES
+
+        async def main():
+            images = image_inputs(GEMMA70, ipc)
+            images.start()
+            try:
+                prep = await images.prepare([data_uri(turned), data_uri(plain)])
+                im, flat = prep.images
+                assert im.size == stored and im.digest == b"" and im.key == 0  # as stored until the pool answers
+                assert not isinstance(flat.hashed, asyncio.Future)  # under OFF_LOOP_BYTES: hashed on the loop
+                await asyncio.wait_for(images.wait(prep), 60)
+                images.discard(prep)
+                prep = await images.prepare([data_uri(big)])
+                (large,) = prep.images
+                assert isinstance(large.hashed, asyncio.Future)  # from OFF_LOOP_BYTES: on the fetcher's thread
+                await asyncio.wait_for(images.wait(prep), 60)
+                images.discard(prep)
+                return im, flat, large
+            finally:
+                await images.close()
+
+        im, flat, large = asyncio.run(main())
+        want = transposed(stored)
+        assert im.size == want and im.size.grid == (1, stored.grid[2], stored.grid[1])
+        assert im.size.tokens == stored.tokens
+        assert im.digest == image_digest(turned, want) and im.key == span_key(im.digest)
+        assert flat.size == stored and flat.digest == old and flat.key == span_key(flat.digest)
+        assert large.digest == image_digest(big, large.size)
+    finally:
+        if proc is not None:
+            proc.kill()
+            proc.join(10)
+        px_arena.remove(arena)
+        shutil.rmtree(ipc, ignore_errors=True)
+
+
+def test_a_discarded_request_drops_its_hashes_still_queued(monkeypatch) -> None:
+    """A request that fails after `prepare` (`App.chat` discards it) cancels its hashes still queued on the fetcher's
+    thread: they never run, so later requests' work does not wait behind them. The pool is a stub that answers at once
+    and holds the fetcher's thread while the hash is queued."""
+    import threading
+
+    from llm_mini_infer.api import images as api_images
+
+    ran: list[int] = []
+    monkeypatch.setattr(api_images, "blake3", types.SimpleNamespace(blake3=lambda data: ran.append(len(data))))
+    big = encoded(Image.fromarray(np.random.default_rng(4).integers(0, 255, (400, 400, 3), np.uint8)), "PNG")
+    assert len(big) >= OFF_LOOP_BYTES
+    gate = threading.Event()
+
+    async def main():
+        images = image_inputs(GEMMA70, "")
+        images.start()
+        loop = asyncio.get_running_loop()
+
+        class Pool:
+            def submit(self, job, data):  # the fetcher's thread held until the hash is queued behind it
+                images.fetcher.offload(gate.wait, 10)
+                fut = loop.create_future()
+                fut.set_result(Done(jid=0))
+                return fut
+
+            def close(self):
+                pass
+
+        async def alloc(n):
+            return 0
+
+        images.pool, images._alloc, images._free = Pool(), alloc, lambda im: None
+        try:
+            prep = await images.prepare([data_uri(big)])
+            (im,) = prep.images
+            assert isinstance(im.hashed, asyncio.Future) and not im.hashed.done()
+            images.discard(prep)
+            assert im.hashed.cancelled()
+            await asyncio.sleep(0)  # the cancel reaches the executor's own future on the loop's next turn
+            gate.set()
+            await images.fetcher.offload(lambda: None)  # everything queued before it has run or been dropped
+        finally:
+            gate.set()
+            await images.close()
+
+    asyncio.run(main())
+    assert ran == []
+
+
+def test_tokenize_sizes_a_turned_image_by_symmetry_with_no_pool_and_no_digest() -> None:
+    """`/tokenize`'s path, `prepare(urls, submit=False)`: an EXIF-6 non-square image has the token count of the same
+    image upright (the frontend sizes it as stored; the family is symmetric under a transpose); no pool is asked
+    (`pool_dir=""`: none exists, no job is set, no pixels allocated) and nothing is hashed."""
+    img = pattern(400, 225, 7)
+    turned = encoded(img, "JPEG", exif=exif(6))
+    upright = encoded(img.transpose(Image.Transpose.ROTATE_270), "JPEG")  # EXIF 6: turned 90 degrees clockwise
+    assert tuple(vllm_pixels(turned).shape) == (3, 400, 225) and tuple(vllm_pixels(upright).shape) == (3, 400, 225)
+
+    async def main():
+        images = image_inputs(GEMMA70, "")
+        images.start()
+        try:
+            assert images.pool is None
+            return await images.prepare([data_uri(turned), data_uri(upright)], submit=False)
+        finally:
+            await images.close()
+
+    prep = asyncio.run(main())
+    a, b = prep.images
+    assert a.size.tokens == b.size.tokens == GEMMA70.size(probe(upright)).tokens
+    assert transposed(a.size) == b.size  # the stored sizes are each other's transpose
+    for im in prep.images:
+        assert im.job is None and im.offset == -1 and im.digest == b"" and im.key == 0

@@ -247,8 +247,8 @@ class ObservabilityConfig(_Group):
     # One line per chat request at INFO, metadata only (id, status, token counts, finish, timings; never prompts,
     # images or outputs): docs/operations.md, "Logging"
     log_requests: bool = True
-    # /debug/stages, /debug/engine, /debug/images and /debug/reset, which need the API key when one is set: raw
-    # per-request and per-step timings, the image pool's workers, and a reset of the timings
+    # /debug/stages, /debug/engine, /debug/images, /debug/loop and /debug/reset, which need the API key when one is
+    # set: raw per-request and per-step timings, the image pool's workers, the event loop's lag, and a reset of them
     debug_endpoints: bool = False
 
 
