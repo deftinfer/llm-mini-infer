@@ -1927,6 +1927,56 @@ def test_the_frontend_hashes_the_image_as_oriented_once_the_pool_answers(tmp_pat
         shutil.rmtree(ipc, ignore_errors=True)
 
 
+def test_a_discarded_request_drops_its_hashes_still_queued(monkeypatch) -> None:
+    """A request that fails after `prepare` (`App.chat` discards it) cancels its hashes still queued on the fetcher's
+    thread: they never run, so later requests' work does not wait behind them. The pool is a stub that answers at once
+    and holds the fetcher's thread while the hash is queued."""
+    import threading
+
+    from llm_mini_infer.api import images as api_images
+
+    ran: list[int] = []
+    monkeypatch.setattr(api_images, "blake3", types.SimpleNamespace(blake3=lambda data: ran.append(len(data))))
+    big = encoded(Image.fromarray(np.random.default_rng(4).integers(0, 255, (400, 400, 3), np.uint8)), "PNG")
+    assert len(big) >= OFF_LOOP_BYTES
+    gate = threading.Event()
+
+    async def main():
+        images = image_inputs(GEMMA70, "")
+        images.start()
+        loop = asyncio.get_running_loop()
+
+        class Pool:
+            def submit(self, job, data):  # the fetcher's thread held until the hash is queued behind it
+                images.fetcher.offload(gate.wait, 10)
+                fut = loop.create_future()
+                fut.set_result(Done(jid=0))
+                return fut
+
+            def close(self):
+                pass
+
+        async def alloc(n):
+            return 0
+
+        images.pool, images._alloc, images._free = Pool(), alloc, lambda im: None
+        try:
+            prep = await images.prepare([data_uri(big)])
+            (im,) = prep.images
+            assert isinstance(im.hashed, asyncio.Future) and not im.hashed.done()
+            images.discard(prep)
+            assert im.hashed.cancelled()
+            await asyncio.sleep(0)  # the cancel reaches the executor's own future on the loop's next turn
+            gate.set()
+            await images.fetcher.offload(lambda: None)  # everything queued before it has run or been dropped
+        finally:
+            gate.set()
+            await images.close()
+
+    asyncio.run(main())
+    assert ran == []
+
+
 def test_tokenize_sizes_a_turned_image_by_symmetry_with_no_pool_and_no_digest() -> None:
     """`/tokenize`'s path, `prepare(urls, submit=False)`: an EXIF-6 non-square image has the token count of the same
     image upright (the frontend sizes it as stored; the family is symmetric under a transpose); no pool is asked

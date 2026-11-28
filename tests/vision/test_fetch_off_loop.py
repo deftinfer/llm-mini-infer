@@ -1,7 +1,7 @@
 """A large data URI's base64 decode off the event loop (`vision.fetch.Fetcher.fetch`, `OFF_LOOP_CHARS`): on the
 fetcher's thread with pybase64, which lets the loop run meanwhile; inline below the threshold and with the standard
-library's decode, which holds the GIL; the same bytes and the same errors either way; nothing left running after a
-cancelled fetch and the fetcher's close."""
+library's decode, which holds the GIL; the same bytes and the same errors either way; a body outside ASCII refused
+before its decode; nothing left running after a cancelled fetch and the fetcher's close."""
 
 from __future__ import annotations
 
@@ -58,6 +58,30 @@ def test_a_large_data_uri_is_decoded_on_the_fetchers_thread_with_the_same_bytes_
     assert str(off.value) == str(inline.value)
     with pytest.raises(FetchError, match="image larger than 1000 bytes"):
         asyncio.run(fetch_one(Fetcher(1000, 10.0), large))
+
+
+def test_a_data_uri_outside_ascii_after_its_comma_is_refused_before_its_decode(monkeypatch) -> None:
+    """A character outside ASCII after the ',' is never base64: the 400 comes before the decode (on a string that wide
+    it holds the GIL, on the fetcher's thread too), with the standard library's text, after the size check as before.
+    One in the header leaves the body to the decode, as before."""
+    calls: list[int] = []
+    monkeypatch.setattr(fetch, "_b64decode", lambda s: calls.append(len(s)) or base64.b64decode(s, validate=True))
+    large = uri(OFF_LOOP_CHARS + 2000)
+    comma = large.index(",")
+    text = "invalid base64 in data URI: string argument should contain only ASCII characters"
+    for ch in ("\U0001f600", "\u00e9", "\u3000"):
+        for url in (large + ch, large[:comma + 8] + ch + large[comma + 8:]):
+            with pytest.raises(FetchError) as exc:
+                from_data_uri(url, 20 << 20)
+            assert str(exc.value) == text
+        with pytest.raises(FetchError, match="image larger than 1000 bytes"):
+            from_data_uri(large + ch, 1000)
+    assert calls == []
+    with pytest.raises(ValueError) as std:
+        base64.b64decode(large[comma + 1:] + "\U0001f600", validate=True)
+    assert text.endswith(str(std.value))
+    named = "data:image/png;name=\u00e9;base64," + large[comma + 1:]
+    assert from_data_uri(named, 20 << 20) == from_data_uri(large, 20 << 20) and len(calls) == 2
 
 
 def test_the_standard_librarys_decode_stays_on_the_loops_thread(monkeypatch) -> None:

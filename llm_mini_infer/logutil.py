@@ -68,8 +68,9 @@ def _types() -> dict[str, type]:
 
         class _Writer(logging.handlers.QueueListener):
             """`Queued`'s writer thread. Its stop (at the process's exit) writes every line queued and the count of any
-            dropped since the last note, within `LOG_STOP_S`: a stderr that takes nothing for that long keeps the rest,
-            and the process exits without them instead of waiting on it for good."""
+            dropped since the last note, within `LOG_STOP_S`, then gives up on the rest. A stderr that never takes
+            them still holds the exit after that (logging's own shutdown waits for the line the thread is writing), as
+            a direct handler holds it, until the launcher kills the process at the end of its stop."""
 
             def __init__(self, q: queue.Queue, handler: logging.Handler, front: Queued):
                 super().__init__(q, handler)
@@ -111,8 +112,8 @@ def setup_logging(level: str, process: str, without_messages: bool = False, queu
     """One format for every process: `INFO 10-03 14:00:00.123 [engine] message`. `without_messages`: logged
     exceptions without their messages (`WithoutMessages`), for the processes that handle requests' contents. `queued`
     (the frontends): the lines go through `Queued` to a writer thread, stopped at the process's exit once it has written
-    every line, within `LOG_STOP_S` (the writer, returned); the other processes write directly (the launcher exits by
-    `os._exit` on a signal and the pool's workers are killed at a stop: a queue would lose their last lines)."""
+    every line or `LOG_STOP_S` has passed (the writer, returned); the other processes write directly (the launcher exits
+    by `os._exit` on a signal and the pool's workers are killed at a stop: a queue would lose their last lines)."""
     handler = logging.StreamHandler(sys.stderr)
     handler.setFormatter(logging.Formatter(f"%(levelname)s %(asctime)s.%(msecs)03d [{process}] %(message)s",
                                            datefmt="%m-%d %H:%M:%S"))

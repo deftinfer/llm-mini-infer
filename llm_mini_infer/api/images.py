@@ -254,8 +254,11 @@ class ImageInputs:
         im.digest, im.key = digest, span_key(digest, self.span_key_bits)
 
     def discard(self, prep: Prepared) -> None:
-        """Free the pixel ranges of a request that never reached the engine (once their jobs finished)."""
+        """Free the pixel ranges of a request that never reached the engine (once their jobs finished), and drop its
+        hashes still queued on the fetcher's thread."""
         for im in prep.images:
+            if isinstance(im.hashed, asyncio.Future):
+                im.hashed.cancel()
             self._free_when_done(im)
         prep.images = []
 

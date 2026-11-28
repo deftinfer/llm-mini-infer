@@ -209,8 +209,9 @@ def test_lines_dropped_with_nothing_logged_afterwards_are_counted_at_the_writers
 
 
 def test_a_stderr_that_takes_nothing_does_not_hold_the_writers_stop_for_good(monkeypatch) -> None:
-    """With stderr blocked for good, the stop gives up after `LOG_STOP_S` (here 0.3 s) and returns, the process exiting
-    without the lines instead of hanging."""
+    """With stderr blocked for good, the stop gives up after `LOG_STOP_S` (here 0.3 s) and returns without the lines.
+    (The exit after it still waits for the line the writer is writing, in logging's own shutdown, as with a direct
+    handler.)"""
     root = logging.getLogger()
     saved = root.handlers[:], root.level
     gate = Gate()

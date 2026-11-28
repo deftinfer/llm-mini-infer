@@ -108,15 +108,19 @@ def from_data_uri(url: str, max_bytes: int) -> bytes:
         raise FetchError("malformed data URI: no ','")
     if comma > MAX_DATA_URI_HEAD:
         raise FetchError(f"malformed data URI: more than {MAX_DATA_URI_HEAD} characters before its ','")
-    head, body = url[:comma], url[comma + 1:]
+    head = url[:comma]
     meta = head[5:].split(";")
     media = meta[0].strip().lower()
     if media and not media.startswith("image/"):
         raise FetchError(f"data URI media type {media!r} is not an image")
     if "base64" not in (m.strip().lower() for m in meta[1:]):
         raise FetchError("only base64 data URIs are supported for images")
-    if len(body) * 3 // 4 > max_bytes + 3:
+    if (len(url) - comma - 1) * 3 // 4 > max_bytes + 3:
         raise FetchError(f"image larger than {max_bytes} bytes")
+    if not url.isascii() and head.isascii():  # a character past the ',' outside ASCII: never base64. Refused before
+        # the body's copy and decode, which on a string that wide hold the GIL, on the fetcher's thread too
+        raise FetchError("invalid base64 in data URI: string argument should contain only ASCII characters")
+    body = url[comma + 1:]
     try:
         data = _b64decode(body.strip())
     except (binascii.Error, ValueError) as exc:
